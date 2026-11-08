@@ -58,7 +58,9 @@ curl --fail --get \
 
 Prometheus 每 5 秒抓取两个示例服务、Worker、node_exporter、cAdvisor 和 Alloy，共 6 个 targets。业务请求指标只有固定路由和状态标签；`demo_service_info` 单独提供与日志一致的实例、版本与环境标签，探活/任意路径不会引入高基数。P95 需要多次业务请求与至少两个抓取点；没有数据不是健康零值。工作台 API 的真实业务指标尚未实现，当前只抓 Worker 心跳。
 
-node_exporter 只读挂载 `/proc` 与 `/sys`，采集 CPU、内存、负载与时间；不挂整个宿主机根目录，宿主机磁盘容量当前不可用，不能输出磁盘根因证据。cAdvisor 仅挂只读 `/sys`，在无 Socket/无 privileged 条件下提供原始 cgroup 内存/CPU；Prometheus 加入 `mapping_status=raw_cgroup_only`，面板明确提示身份映射缺失。不能据此宣称获得镜像、Compose 服务名、容器退出/OOM 事件，更不能宣称 Kubernetes Pod/Node/Eviction 支持。环境若无法提供非根 cgroup 指标，smoke 会失败，需检查 cgroup 权限、rootless 限制和 Docker Desktop 设置，不能用根 cgroup冒充业务容器。
+node_exporter 只读挂载 `/proc` 与 `/sys`，采集 CPU、内存、负载与时间；不挂整个宿主机根目录，宿主机磁盘容量当前不可用，不能输出磁盘根因证据。cAdvisor 仅挂只读 `/sys`，在无 Socket/无 privileged 条件下提供原始 cgroup 内存/CPU；连接器额外尝试查询 OOM 计数和启动时间，但这些指标在当前环境中可能缺失；Prometheus 用 `host_id` 标识逻辑宿主机，并加入 `mapping_status=raw_cgroup_only`。Runtime Connector 会按逻辑主机和原始 cgroup 的摘要区分资源实体，无法可靠映射时保留缺口，不会返回明文 cgroup 路径或推断 Compose 服务名。Loki 中匹配 restart/OOM 关键词的应用日志只作为未验证日志证据，不代表 Docker 生命周期事件；缺少日志或指标不会解释为零或健康。Docker Desktop 的 node_exporter 观测对象是 Linux VM，不是 macOS 宿主机。系统不支持 Kubernetes Pod/Node/Eviction。这次仅提供连接器库与固定模板，尚未接入 API、Agent 或工作台。默认每模板最多 10 条序列、240 个点，七个模板合计不得超过 20,000 点；最终宿主机和 cgroup 结果各不超过请求的 MaxSeries。宿主机筛选在上游截断之后进行，可能遗漏目标主机，不能据此判定其没有运行实例；数据源必须由调用方预先授权，本库不提供项目隔离。存在服务映射、健康 peer 和生命周期事件缺口时始终返回 partial。Delay、Stale 和 LastObservedAt 只描述范围查询返回的求值时间覆盖，不代表 exporter 实际采集延迟或机器健康；实际 scrape 新鲜度未验证，返回 `exporter_scrape_freshness_unavailable`。未来时间戳的启动证据会保留原始样本并标记 clock skew，不生成实例身份。
+
+环境若无法提供非根 cgroup 指标，smoke 会失败，需检查 cgroup 权限、rootless 限制和 Docker Desktop 设置，不能用根 cgroup冒充业务容器。
 
 诊断进程只加入 control/diagnosis 网络，Loki 原始写入只在 observation-backend；读网关仅允许明确 GET 路径，写请求与未登记路径返回 403。只读 Token 与控制面管理 Token 分开；部署发送 Token 与通知通道只在 `.env.example` 留独立 SecretRef 占位，当前不消费。
 

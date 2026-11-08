@@ -57,6 +57,22 @@ func TestResolveTemplatesReturnsLokiDiagnosisTemplates(t *testing.T) {
 	}
 }
 
+func TestResolveTemplatesReturnsRuntimeResourceTemplates(t *testing.T) {
+	templateIDs := []string{
+		"prometheus.runtime.container.cpu.v1",
+		"prometheus.runtime.container.memory.v1",
+		"prometheus.runtime.container.oom_events.v1",
+		"prometheus.runtime.container.start_time.v1",
+		"prometheus.runtime.host.cpu.v1",
+		"prometheus.runtime.host.memory_available.v1",
+		"prometheus.runtime.host.load.v1",
+	}
+	templates, issues := ResolveTemplates(SourcePrometheus, templateIDs)
+	if len(issues) != 0 || len(templates) != len(templateIDs) {
+		t.Fatalf("templates=%#v issues=%#v", templates, issues)
+	}
+}
+
 func TestValidateQueryAcceptsBoundedLokiFilters(t *testing.T) {
 	templates, issues := ResolveTemplates(SourceLoki, []string{"loki.service.errors.v1"})
 	if len(issues) != 0 {

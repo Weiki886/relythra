@@ -147,6 +147,41 @@ var templateRegistry = map[string]Template{
 		Purpose:      "Read bounded host capacity series.",
 		ResultSchema: "metric.series.v1", AllowedParameters: prometheusParameters,
 	},
+	"prometheus.runtime.container.cpu.v1": {
+		ID: "prometheus.runtime.container.cpu.v1", Version: 1, Source: SourcePrometheus,
+		Purpose:      "Read per-cgroup CPU usage with host and mapping metadata.",
+		ResultSchema: "metric.series.v1", AllowedParameters: prometheusParameters,
+	},
+	"prometheus.runtime.container.memory.v1": {
+		ID: "prometheus.runtime.container.memory.v1", Version: 1, Source: SourcePrometheus,
+		Purpose:      "Read per-cgroup memory working set with host and mapping metadata.",
+		ResultSchema: "metric.series.v1", AllowedParameters: prometheusParameters,
+	},
+	"prometheus.runtime.container.oom_events.v1": {
+		ID: "prometheus.runtime.container.oom_events.v1", Version: 1, Source: SourcePrometheus,
+		Purpose:      "Read per-cgroup OOM counter changes with host and mapping metadata.",
+		ResultSchema: "metric.series.v1", AllowedParameters: prometheusParameters,
+	},
+	"prometheus.runtime.container.start_time.v1": {
+		ID: "prometheus.runtime.container.start_time.v1", Version: 1, Source: SourcePrometheus,
+		Purpose:      "Read per-cgroup start time with host and mapping metadata.",
+		ResultSchema: "metric.series.v1", AllowedParameters: prometheusParameters,
+	},
+	"prometheus.runtime.host.cpu.v1": {
+		ID: "prometheus.runtime.host.cpu.v1", Version: 1, Source: SourcePrometheus,
+		Purpose:      "Read host CPU usage by host and scrape instance.",
+		ResultSchema: "metric.series.v1", AllowedParameters: prometheusParameters,
+	},
+	"prometheus.runtime.host.memory_available.v1": {
+		ID: "prometheus.runtime.host.memory_available.v1", Version: 1, Source: SourcePrometheus,
+		Purpose:      "Read host available memory by scrape instance.",
+		ResultSchema: "metric.series.v1", AllowedParameters: prometheusParameters,
+	},
+	"prometheus.runtime.host.load.v1": {
+		ID: "prometheus.runtime.host.load.v1", Version: 1, Source: SourcePrometheus,
+		Purpose:      "Read host one-minute load average by scrape instance.",
+		ResultSchema: "metric.series.v1", AllowedParameters: prometheusParameters,
+	},
 	"loki.service.errors.v1": {
 		ID: "loki.service.errors.v1", Version: 1, Source: SourceLoki,
 		Purpose:      "Read bounded error log entries.",

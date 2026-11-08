@@ -8,9 +8,9 @@ scrape_configs:
   - job_name: demo
     static_configs:
       - targets: [orders:8080]
-        labels: {project: relythra-demo, service: orders, env: demo, host: demo-host, runtime_type: docker-compose}
+        labels: {project: relythra-demo, service: orders, env: demo, host_id: demo-host, runtime_type: docker-compose}
       - targets: [inventory:8080]
-        labels: {project: relythra-demo, service: inventory, env: demo, host: demo-host, runtime_type: docker-compose}
+        labels: {project: relythra-demo, service: inventory, env: demo, host_id: demo-host, runtime_type: docker-compose}
   - job_name: relythra-worker
     static_configs:
       - targets: [worker:8081]
@@ -18,11 +18,11 @@ scrape_configs:
   - job_name: node
     static_configs:
       - targets: [node-exporter:9100]
-        labels: {project: relythra-demo, service: host, env: demo, host: demo-host}
+        labels: {project: relythra-demo, service: host, env: demo, host_id: demo-host}
   - job_name: cadvisor
     static_configs:
       - targets: [cadvisor:8080]
-        labels: {project: relythra-demo, service: runtime, env: demo, host: demo-host, runtime_type: docker-compose, mapping_status: raw_cgroup_only}
+        labels: {project: relythra-demo, service: runtime, env: demo, host_id: demo-host, runtime_type: docker-compose, mapping_status: raw_cgroup_only}
   - job_name: alloy
     static_configs:
       - targets: [alloy:12345]

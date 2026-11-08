@@ -132,6 +132,41 @@ func TestRegisteredTemplatesBuildExpectedPromQLAndUnits(t *testing.T) {
 			query:      `node_memory_MemAvailable_bytes{service="checkout-api",env="prod"}`,
 			unit:       "bytes",
 		},
+		{
+			templateID: "prometheus.runtime.container.cpu.v1",
+			query:      `sum by (id, host_id, mapping_status, container_label_com_docker_compose_service) (rate(container_cpu_usage_seconds_total{service="checkout-api",env="prod"}[5m]))`,
+			unit:       "cores",
+		},
+		{
+			templateID: "prometheus.runtime.container.memory.v1",
+			query:      `sum by (id, host_id, mapping_status, container_label_com_docker_compose_service) (container_memory_working_set_bytes{service="checkout-api",env="prod"})`,
+			unit:       "bytes",
+		},
+		{
+			templateID: "prometheus.runtime.container.oom_events.v1",
+			query:      `sum by (id, host_id, mapping_status, container_label_com_docker_compose_service) (increase(container_oom_events_total{service="checkout-api",env="prod"}[5m]))`,
+			unit:       "events",
+		},
+		{
+			templateID: "prometheus.runtime.container.start_time.v1",
+			query:      `max by (id, host_id, mapping_status, container_label_com_docker_compose_service) (container_start_time_seconds{service="checkout-api",env="prod"})`,
+			unit:       "unix_seconds",
+		},
+		{
+			templateID: "prometheus.runtime.host.cpu.v1",
+			query:      `sum by (host_id, instance) (rate(node_cpu_seconds_total{service="checkout-api",env="prod",mode!="idle"}[5m]))`,
+			unit:       "cores",
+		},
+		{
+			templateID: "prometheus.runtime.host.memory_available.v1",
+			query:      `max by (host_id, instance) (node_memory_MemAvailable_bytes{service="checkout-api",env="prod"})`,
+			unit:       "bytes",
+		},
+		{
+			templateID: "prometheus.runtime.host.load.v1",
+			query:      `max by (host_id, instance) (node_load1{service="checkout-api",env="prod"})`,
+			unit:       "load_average",
+		},
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.templateID, func(t *testing.T) {
@@ -354,5 +389,25 @@ func validQuery(templateID string) datasource.NormalizedQuery {
 		TemplateID: templateID, Version: 1, Service: "checkout-api", Environment: "prod",
 		Start: time.Unix(1793772000, 0).UTC(), End: time.Unix(1793772300, 0).UTC(),
 		Step: 30 * time.Second, MaxSeries: 4, MaxPoints: 16,
+	}
+}
+
+func TestRuntimeQueryUsesGetThroughReadonlyGateway(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "readonly gateway rejects non GET", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.URL.Path != "/api/v1/query_range" || !strings.Contains(r.URL.Query().Get("query"), "container_memory_working_set_bytes") || r.URL.Query().Get("step") != "30s" {
+			t.Errorf("runtime query did not use fixed GET endpoint: %v", r.URL)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, prometheusResponse)
+	}))
+	defer server.Close()
+	connector := newTestConnector(t, server, nil)
+	_, err := connector.Query(context.Background(), Target{Endpoint: server.URL}, validQuery("prometheus.runtime.container.memory.v1"))
+	if err != nil {
+		t.Fatalf("runtime readonly query: %v", err)
 	}
 }

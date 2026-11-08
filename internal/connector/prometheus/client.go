@@ -204,7 +204,15 @@ func (connector *Connector) Query(ctx context.Context, target Target, query data
 		values.Set("end", strconv.FormatFloat(float64(query.End.UnixNano())/float64(time.Second), 'f', 3, 64))
 		values.Set("step", query.Step.String())
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, strings.NewReader(values.Encode()))
+	method := http.MethodPost
+	var bodyReader io.Reader = strings.NewReader(values.Encode())
+	// The demo gateway permits only GET on fixed read endpoints (ADR 0005).
+	if strings.HasPrefix(query.TemplateID, "prometheus.runtime.") {
+		method = http.MethodGet
+		requestURL += "?" + values.Encode()
+		bodyReader = nil
+	}
+	request, err := http.NewRequestWithContext(ctx, method, requestURL, bodyReader)
 	if err != nil {
 		return Result{}, queryError(ErrorInvalidQuery, err)
 	}
@@ -417,6 +425,20 @@ func buildExpression(query datasource.NormalizedQuery) (string, string, error) {
 		return "histogram_quantile(0.95, sum by (le, operation) (rate(db_client_query_duration_seconds_bucket{" + selector + "}[5m])))", "seconds", nil
 	case "prometheus.node.capacity.v1":
 		return "node_memory_MemAvailable_bytes{" + selector + "}", "bytes", nil
+	case "prometheus.runtime.container.cpu.v1":
+		return "sum by (id, host_id, mapping_status, container_label_com_docker_compose_service) (rate(container_cpu_usage_seconds_total{" + selector + "}[5m]))", "cores", nil
+	case "prometheus.runtime.container.memory.v1":
+		return "sum by (id, host_id, mapping_status, container_label_com_docker_compose_service) (container_memory_working_set_bytes{" + selector + "})", "bytes", nil
+	case "prometheus.runtime.container.oom_events.v1":
+		return "sum by (id, host_id, mapping_status, container_label_com_docker_compose_service) (increase(container_oom_events_total{" + selector + "}[5m]))", "events", nil
+	case "prometheus.runtime.container.start_time.v1":
+		return "max by (id, host_id, mapping_status, container_label_com_docker_compose_service) (container_start_time_seconds{" + selector + "})", "unix_seconds", nil
+	case "prometheus.runtime.host.cpu.v1":
+		return "sum by (host_id, instance) (rate(node_cpu_seconds_total{" + selector + ",mode!=\"idle\"}[5m]))", "cores", nil
+	case "prometheus.runtime.host.memory_available.v1":
+		return "max by (host_id, instance) (node_memory_MemAvailable_bytes{" + selector + "})", "bytes", nil
+	case "prometheus.runtime.host.load.v1":
+		return "max by (host_id, instance) (node_load1{" + selector + "})", "load_average", nil
 	default:
 		return "", "", errors.New("template is not registered for Prometheus execution")
 	}
