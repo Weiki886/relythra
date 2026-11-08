@@ -899,7 +899,7 @@ func TestGetInvestigationTimelineRejectsInvalidInputsBeforeDatabaseAccess(t *tes
 	}{
 		{name: "bad ID", id: "bad", limit: 1},
 		{name: "bad source", id: validID, filter: InvestigationTimelineFilter{SourceType: "UNKNOWN"}, limit: 1},
-		{name: "bad completeness", id: validID, filter: InvestigationTimelineFilter{Completeness: "EXPIRED"}, limit: 1},
+		{name: "bad completeness", id: validID, filter: InvestigationTimelineFilter{Completeness: "INVALID"}, limit: 1},
 		{name: "oversized page", id: validID, limit: 101},
 		{name: "negative offset", id: validID, limit: 1, offset: -1},
 		{name: "oversized offset", id: validID, limit: 1, offset: 10001},

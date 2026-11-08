@@ -118,7 +118,7 @@ func ValidateInvestigationTimelineFilter(filter InvestigationTimelineFilter) err
 	}
 	if filter.Completeness != "" {
 		switch filter.Completeness {
-		case "COMPLETE", "PARTIAL", "MISSING":
+		case "COMPLETE", "PARTIAL", "MISSING", "EXPIRED":
 		default:
 			return fmt.Errorf("%w: invalid timeline completeness", ErrInvalidInput)
 		}
