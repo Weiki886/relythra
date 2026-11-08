@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Weiki886/relythra/internal/domain"
+	"github.com/Weiki886/relythra/internal/evidence"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -740,8 +741,10 @@ type Evidence struct {
 	EntityID          *string         `json:"entity_id"`
 	ObservedStart     time.Time       `json:"observed_start"`
 	ObservedEnd       time.Time       `json:"observed_end"`
+	CollectedAt       *time.Time      `json:"collected_at"`
 	QueryText         string          `json:"query_text"`
 	RawReference      string          `json:"raw_reference"`
+	QueryParameters   json.RawMessage `json:"query_parameters"`
 	ValueSummary      json.RawMessage `json:"value_summary"`
 	Completeness      string          `json:"completeness"`
 	FreshnessSeconds  *int            `json:"freshness_seconds"`
@@ -750,6 +753,64 @@ type Evidence struct {
 	SourceTimezone    string          `json:"source_timezone"`
 	SourceTimeText    string          `json:"source_time_text"`
 	CreatedAt         time.Time       `json:"created_at"`
+}
+
+func (repository *Postgres) PersistEvidence(ctx context.Context, record evidence.Record) (Evidence, bool, error) {
+	if err := evidence.Validate(record); err != nil {
+		return Evidence{}, false, fmt.Errorf("%w: invalid normalized evidence", ErrInvalidInput)
+	}
+	if record.ToolCallID != nil {
+		var belongsToInvestigation bool
+		if err := repository.db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM tool_calls WHERE id = $1 AND investigation_id = $2
+			)
+		`, *record.ToolCallID, record.InvestigationID).Scan(&belongsToInvestigation); err != nil {
+			return Evidence{}, false, fmt.Errorf("validate evidence tool call: %w", err)
+		}
+		if !belongsToInvestigation {
+			return Evidence{}, false, fmt.Errorf("%w: tool call belongs to another investigation", ErrInvalidInput)
+		}
+	}
+
+	insert := `
+		INSERT INTO evidence (
+			investigation_id, tool_call_id, source_type, entity_type, entity_id,
+			observed_start, observed_end, collected_at, query_text, raw_reference,
+			query_parameters, value_summary, completeness, freshness_seconds,
+			independence_group, content_hash, source_timezone, source_time_text
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), NULLIF($10, ''), $11::jsonb, $12::jsonb,
+			$13, $14, $15, $16, NULLIF($17, ''), NULLIF($18, '')
+		)
+		ON CONFLICT (investigation_id, source_type, content_hash) DO NOTHING
+		RETURNING ` + evidenceColumns
+	item, err := scanEvidence(repository.db.QueryRowContext(ctx, insert,
+		record.InvestigationID, nullableStringPointer(record.ToolCallID), record.SourceType,
+		record.EntityType, nullableStringPointer(record.EntityID), domain.NormalizeTime(record.ObservedStart),
+		domain.NormalizeTime(record.ObservedEnd), domain.NormalizeTime(record.CollectedAt), record.QueryText,
+		record.RawReference, string(record.QueryParameters), string(record.ValueSummary), record.Completeness,
+		record.FreshnessSeconds, record.IndependenceGroup, record.ContentHash, record.SourceTimezone, record.SourceTimeText,
+	))
+	if err == nil {
+		return item, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Evidence{}, false, fmt.Errorf("persist evidence: %w", err)
+	}
+
+	item, err = scanEvidence(repository.db.QueryRowContext(ctx, `
+		SELECT `+evidenceColumns+`
+		FROM evidence
+		WHERE investigation_id = $1 AND source_type = $2 AND content_hash = $3
+	`, record.InvestigationID, record.SourceType, record.ContentHash))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Evidence{}, false, ErrConflict
+	}
+	if err != nil {
+		return Evidence{}, false, fmt.Errorf("read existing evidence: %w", err)
+	}
+	return item, false, nil
 }
 
 type Report struct {
@@ -1173,8 +1234,10 @@ const evidenceColumns = `
 	entity_id,
 	observed_start,
 	observed_end,
+	collected_at,
 	COALESCE(query_text, ''),
 	COALESCE(raw_reference, ''),
+	query_parameters::text,
 	value_summary::text,
 	completeness,
 	freshness_seconds,
@@ -1190,6 +1253,8 @@ func scanEvidence(row scanner) (Evidence, error) {
 	var toolCallID sql.NullString
 	var entityID sql.NullString
 	var valueSummary string
+	var collectedAt sql.NullTime
+	var queryParameters string
 	var freshnessSeconds sql.NullInt64
 	err := row.Scan(
 		&evidence.ID,
@@ -1200,8 +1265,10 @@ func scanEvidence(row scanner) (Evidence, error) {
 		&entityID,
 		&evidence.ObservedStart,
 		&evidence.ObservedEnd,
+		&collectedAt,
 		&evidence.QueryText,
 		&evidence.RawReference,
+		&queryParameters,
 		&valueSummary,
 		&evidence.Completeness,
 		&freshnessSeconds,
@@ -1217,6 +1284,8 @@ func scanEvidence(row scanner) (Evidence, error) {
 	evidence.ToolCallID = nullStringPointer(toolCallID)
 	evidence.EntityID = nullStringPointer(entityID)
 	evidence.ValueSummary = json.RawMessage(valueSummary)
+	evidence.QueryParameters = json.RawMessage(queryParameters)
+	evidence.CollectedAt = nullTimePointer(collectedAt)
 	if freshnessSeconds.Valid {
 		value := int(freshnessSeconds.Int64)
 		evidence.FreshnessSeconds = &value
@@ -1246,6 +1315,13 @@ func nullableString(value string) any {
 		return nil
 	}
 	return value
+}
+
+func nullableStringPointer(value *string) any {
+	if value == nil {
+		return nil
+	}
+	return *value
 }
 
 func nullStringPointer(value sql.NullString) *string {

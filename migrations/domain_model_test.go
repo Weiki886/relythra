@@ -67,7 +67,12 @@ func TestDomainSchemaMigratesAndRollsBack(t *testing.T) {
 	assertEvaluationColumnsAbsent(t, ctx, db, schema)
 	assertDeploymentIngestionSchema(t, ctx, db, schema)
 	assertGrafanaAlertIngestionSchema(t, ctx, db, schema)
+	assertEvidenceObservationSchema(t, ctx, db, schema)
 
+	if err := goose.DownContext(ctx, db, "."); err != nil {
+		t.Fatalf("roll back Evidence observation metadata migration: %v", err)
+	}
+	assertEvidenceObservationRolledBack(t, ctx, db, schema)
 	if err := goose.DownContext(ctx, db, "."); err != nil {
 		t.Fatalf("roll back Grafana alert ingestion migration: %v", err)
 	}
@@ -168,6 +173,9 @@ func TestDomainSchemaMigratesAndRollsBack(t *testing.T) {
 	var count int
 
 	if err := goose.DownContext(ctx, db, "."); err != nil {
+		t.Fatalf("roll back Evidence observation metadata migration: %v", err)
+	}
+	if err := goose.DownContext(ctx, db, "."); err != nil {
 		t.Fatalf("roll back Grafana alert ingestion migration: %v", err)
 	}
 	if err := goose.DownContext(ctx, db, "."); err != nil {
@@ -249,6 +257,74 @@ func TestDomainSchemaMigratesAndRollsBack(t *testing.T) {
 
 	if err := goose.UpContext(ctx, db, "."); err != nil {
 		t.Fatalf("reapply domain migration: %v", err)
+	}
+}
+
+func assertEvidenceObservationSchema(t *testing.T, ctx context.Context, db *sql.DB, schema string) {
+	t.Helper()
+	var count int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = 'evidence'
+		  AND column_name IN ('collected_at', 'query_parameters')
+	`, schema).Scan(&count); err != nil {
+		t.Fatalf("check Evidence observation columns: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("Evidence observation columns = %d, want 2", count)
+	}
+	var collectedAtNullable string
+	if err := db.QueryRowContext(ctx, `
+		SELECT is_nullable FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = 'evidence' AND column_name = 'collected_at'
+	`, schema).Scan(&collectedAtNullable); err != nil {
+		t.Fatalf("read collected_at nullability: %v", err)
+	}
+	if collectedAtNullable != "YES" {
+		t.Fatalf("collected_at is nullable = %q, want YES to preserve unknown historical collection time", collectedAtNullable)
+	}
+	var definition string
+	if err := db.QueryRowContext(ctx, `
+		SELECT pg_get_constraintdef(constraint_row.oid)
+		FROM pg_constraint constraint_row
+		JOIN pg_class relation ON relation.oid = constraint_row.conrelid
+	JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+		WHERE namespace.nspname = $1 AND relation.relname = 'evidence'
+		  AND constraint_row.conname = 'evidence_completeness_check'
+	`, schema).Scan(&definition); err != nil {
+		t.Fatalf("read Evidence completeness constraint: %v", err)
+	}
+	if !strings.Contains(definition, "EXPIRED") {
+		t.Fatalf("EXPIRED is missing from Evidence completeness constraint: %s", definition)
+	}
+}
+
+func assertEvidenceObservationRolledBack(t *testing.T, ctx context.Context, db *sql.DB, schema string) {
+	t.Helper()
+	var count int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = 'evidence'
+		  AND column_name IN ('collected_at', 'query_parameters')
+	`, schema).Scan(&count); err != nil {
+		t.Fatalf("check Evidence observation rollback: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("Evidence observation columns after rollback = %d, want 0", count)
+	}
+	var definition string
+	if err := db.QueryRowContext(ctx, `
+		SELECT pg_get_constraintdef(constraint_row.oid)
+		FROM pg_constraint constraint_row
+		JOIN pg_class relation ON relation.oid = constraint_row.conrelid
+		JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+		WHERE namespace.nspname = $1 AND relation.relname = 'evidence'
+		  AND constraint_row.conname = 'evidence_completeness_check'
+	`, schema).Scan(&definition); err != nil {
+		t.Fatalf("read rolled-back Evidence completeness constraint: %v", err)
+	}
+	if strings.Contains(definition, "EXPIRED") {
+		t.Fatalf("EXPIRED remains after Evidence migration rollback: %s", definition)
 	}
 }
 

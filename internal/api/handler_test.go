@@ -208,7 +208,7 @@ func TestInvestigationTimelinePassesValidatedFiltersAndPagination(t *testing.T) 
 	response := serve(
 		NewHandler(reader, discardLogger()),
 		http.MethodGet,
-		"/api/v1/investigations/"+investigationID+"/timeline?source_type=LOKI&entity_id=service%3Aorders&completeness=PARTIAL&limit=10&offset=5",
+		"/api/v1/investigations/"+investigationID+"/timeline?source_type=LOKI&entity_id=service%3Aorders&completeness=EXPIRED&limit=10&offset=5",
 	)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
@@ -217,7 +217,7 @@ func TestInvestigationTimelinePassesValidatedFiltersAndPagination(t *testing.T) 
 		t.Fatalf("reader call = %d for %q", reader.calls, reader.timelineID)
 	}
 	if reader.filter != (store.InvestigationTimelineFilter{
-		SourceType: "LOKI", EntityID: "service:orders", Completeness: "PARTIAL",
+		SourceType: "LOKI", EntityID: "service:orders", Completeness: "EXPIRED",
 	}) {
 		t.Fatalf("filter = %#v", reader.filter)
 	}
@@ -247,7 +247,7 @@ func TestInvestigationTimelineRejectsInvalidQueryBeforeStore(t *testing.T) {
 	const investigationID = "44444444-4444-4444-8444-444444444444"
 	for _, query := range []string{
 		"source_type=UNKNOWN",
-		"completeness=EXPIRED",
+		"completeness=INVALID",
 		"entity_id=%20",
 		"limit=101",
 		"offset=10001",
