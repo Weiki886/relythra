@@ -27,7 +27,9 @@ Relythra 是一个面向发布后异常排查的只读诊断系统：关联发�
 
 - Web：<http://127.0.0.1:5173>
 - API readiness：<http://127.0.0.1:8080/health/ready>
-- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/deployments/{id}`
+- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/deployments/{id}`
+
+`GET /api/v1/investigations/{id}/timeline` 返回该 Investigation 已持久化的 Evidence，支持 `source_type`、`entity_id`、`completeness`、`limit` 和 `offset`。默认 `limit=50`，最大 `100`，`offset` 最大 `10000`；按事件开始/结束时间及来源、实体、内容摘要和 ID 稳定排序，计数与当前页在同一只读数据库快照中读取。不存在的 Investigation 返回 `404`，存在但没有匹配证据时返回空 `items`。此端点不合成尚未持久化的查询失败或缺口。
 - Worker metrics：<http://127.0.0.1:8081/metrics>
 
 按 `Ctrl+C` 会停止脚本启动的全部进程。默认连接 `postgres://$USER@127.0.0.1:5432/relythra?sslmode=disable`。连接凭据也可以从绝对路径文件注入，避免把密码写进仓库或命令行：
@@ -87,7 +89,7 @@ docker compose --file deploy/compose/compose.yaml up --build
 - Web：<http://localhost:3000>
 - API liveness：<http://localhost:8080/health/live>
 - API readiness：<http://localhost:8080/health/ready>
-- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/deployments/{id}`
+- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/deployments/{id}`
 - API 数据源映射：<http://localhost:8080/api/v1/data-source-mappings>
 - Worker metrics：<http://localhost:8081/metrics>
 
