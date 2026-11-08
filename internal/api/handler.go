@@ -15,6 +15,13 @@ import (
 type Reader interface {
 	GetReport(context.Context, string) (store.Report, error)
 	GetEvidence(context.Context, string) (store.Evidence, error)
+	GetInvestigationTimeline(
+		context.Context,
+		string,
+		store.InvestigationTimelineFilter,
+		int,
+		int,
+	) (store.InvestigationTimeline, error)
 	GetDeploymentEvent(context.Context, string) (store.DeploymentEvent, error)
 }
 
@@ -81,6 +88,7 @@ func NewHandlerWithDependencies(
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/reports/{id}", apiHandler.getReport)
 	mux.HandleFunc("/api/v1/evidence/{id}", apiHandler.getEvidence)
+	mux.HandleFunc("/api/v1/investigations/{id}/timeline", apiHandler.getInvestigationTimeline)
 	mux.HandleFunc("/api/v1/deployments/{id}", apiHandler.getDeployment)
 	mux.HandleFunc("/api/v1/deployment-events/webhook", apiHandler.receiveDeploymentWebhook)
 	mux.HandleFunc("/api/v1/deployment-events", apiHandler.manageDeploymentCollection)

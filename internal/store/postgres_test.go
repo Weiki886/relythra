@@ -817,6 +817,104 @@ func TestReportReadsTraceableEvidenceAndDeployments(t *testing.T) {
 	}
 }
 
+func TestGetInvestigationTimelineFiltersAndPaginatesDeterministically(t *testing.T) {
+	db := openStoreTestDB(t)
+	ctx := context.Background()
+	fixture := insertStoreFixture(t, ctx, db, "investigation-timeline")
+	base := fixture.startedAt.UTC().Truncate(time.Second)
+	for _, item := range []struct {
+		source       string
+		entityType   string
+		entityID     string
+		observedAt   time.Time
+		completeness string
+		hash         string
+	}{
+		{"LOKI", "service", fixture.serviceID, base.Add(time.Minute), "PARTIAL", strings.Repeat("a", 64)},
+		{"PROMETHEUS", "service", fixture.serviceID, base.Add(time.Minute), "COMPLETE", strings.Repeat("b", 64)},
+		{"GITHUB", "release", fixture.releaseID, base.Add(2 * time.Minute), "COMPLETE", strings.Repeat("c", 64)},
+	} {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO evidence (
+				investigation_id, source_type, entity_type, entity_id,
+				observed_start, observed_end, value_summary, completeness,
+				independence_group, content_hash
+			) VALUES ($1, $2, $3, $4, $5::timestamptz, $5::timestamptz + interval '30 seconds',
+				'{}'::jsonb, $6, 'shared-source', $7)
+		`, fixture.investigationID, item.source, item.entityType, item.entityID,
+			item.observedAt, item.completeness, item.hash); err != nil {
+			t.Fatalf("insert %s timeline evidence: %v", item.source, err)
+		}
+	}
+
+	repository := NewPostgres(db)
+	first, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID, InvestigationTimelineFilter{}, 2, 0)
+	if err != nil {
+		t.Fatalf("get first timeline page: %v", err)
+	}
+	if first.Total != 3 || len(first.Items) != 2 || !first.HasMore ||
+		first.Items[0].SourceType != "LOKI" || first.Items[1].SourceType != "PROMETHEUS" {
+		t.Fatalf("first page = %#v", first)
+	}
+	second, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID, InvestigationTimelineFilter{}, 2, 2)
+	if err != nil {
+		t.Fatalf("get second timeline page: %v", err)
+	}
+	if second.Total != 3 || len(second.Items) != 1 || second.HasMore || second.Items[0].SourceType != "GITHUB" {
+		t.Fatalf("second page = %#v", second)
+	}
+
+	filtered, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID, InvestigationTimelineFilter{
+		SourceType: "LOKI", EntityID: fixture.serviceID, Completeness: "PARTIAL",
+	}, 20, 0)
+	if err != nil {
+		t.Fatalf("get filtered timeline: %v", err)
+	}
+	if filtered.Total != 1 || len(filtered.Items) != 1 || filtered.Items[0].SourceType != "LOKI" {
+		t.Fatalf("filtered timeline = %#v", filtered)
+	}
+
+	empty, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID, InvestigationTimelineFilter{
+		SourceType: "RUNTIME",
+	}, 20, 0)
+	if err != nil || empty.Total != 0 || empty.Items == nil || empty.HasMore {
+		t.Fatalf("empty timeline = %#v, err=%v", empty, err)
+	}
+	if _, err := repository.GetInvestigationTimeline(ctx,
+		"ffffffff-ffff-4fff-8fff-ffffffffffff", InvestigationTimelineFilter{}, 20, 0,
+	); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing investigation error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetInvestigationTimelineRejectsInvalidInputsBeforeDatabaseAccess(t *testing.T) {
+	repository := NewPostgres(nil)
+	validID := "44444444-4444-4444-8444-444444444444"
+	for _, testCase := range []struct {
+		name   string
+		id     string
+		filter InvestigationTimelineFilter
+		limit  int
+		offset int
+	}{
+		{name: "bad ID", id: "bad", limit: 1},
+		{name: "bad source", id: validID, filter: InvestigationTimelineFilter{SourceType: "UNKNOWN"}, limit: 1},
+		{name: "bad completeness", id: validID, filter: InvestigationTimelineFilter{Completeness: "EXPIRED"}, limit: 1},
+		{name: "oversized page", id: validID, limit: 101},
+		{name: "negative offset", id: validID, limit: 1, offset: -1},
+		{name: "oversized offset", id: validID, limit: 1, offset: 10001},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := repository.GetInvestigationTimeline(
+				context.Background(), testCase.id, testCase.filter, testCase.limit, testCase.offset,
+			)
+			if !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("error = %v, want ErrInvalidInput", err)
+			}
+		})
+	}
+}
+
 type storeFixture struct {
 	projectID       string
 	serviceID       string

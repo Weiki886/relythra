@@ -25,6 +25,11 @@ const (
 type fakeReader struct {
 	report     store.Report
 	evidence   store.Evidence
+	timeline   store.InvestigationTimeline
+	timelineID string
+	filter     store.InvestigationTimelineFilter
+	limit      int
+	offset     int
 	deployment store.DeploymentEvent
 	err        error
 	calls      int
@@ -38,6 +43,21 @@ func (reader *fakeReader) GetReport(context.Context, string) (store.Report, erro
 func (reader *fakeReader) GetEvidence(context.Context, string) (store.Evidence, error) {
 	reader.calls++
 	return reader.evidence, reader.err
+}
+
+func (reader *fakeReader) GetInvestigationTimeline(
+	_ context.Context,
+	id string,
+	filter store.InvestigationTimelineFilter,
+	limit int,
+	offset int,
+) (store.InvestigationTimeline, error) {
+	reader.calls++
+	reader.timelineID = id
+	reader.filter = filter
+	reader.limit = limit
+	reader.offset = offset
+	return reader.timeline, reader.err
 }
 
 func (reader *fakeReader) GetDeploymentEvent(
@@ -173,6 +193,104 @@ func TestReadEndpointsReturnStableErrors(t *testing.T) {
 		)
 		assertErrorResponse(t, response, http.StatusNotFound, "not_found")
 	})
+}
+
+func TestInvestigationTimelinePassesValidatedFiltersAndPagination(t *testing.T) {
+	const investigationID = "44444444-4444-4444-8444-444444444444"
+	reader := &fakeReader{timeline: store.InvestigationTimeline{
+		InvestigationID: investigationID,
+		Items:           []store.Evidence{},
+		Total:           23,
+		Limit:           10,
+		Offset:          5,
+		HasMore:         true,
+	}}
+	response := serve(
+		NewHandler(reader, discardLogger()),
+		http.MethodGet,
+		"/api/v1/investigations/"+investigationID+"/timeline?source_type=LOKI&entity_id=service%3Aorders&completeness=PARTIAL&limit=10&offset=5",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if reader.calls != 1 || reader.timelineID != investigationID {
+		t.Fatalf("reader call = %d for %q", reader.calls, reader.timelineID)
+	}
+	if reader.filter != (store.InvestigationTimelineFilter{
+		SourceType: "LOKI", EntityID: "service:orders", Completeness: "PARTIAL",
+	}) {
+		t.Fatalf("filter = %#v", reader.filter)
+	}
+	if reader.limit != 10 || reader.offset != 5 {
+		t.Fatalf("page = %d/%d", reader.limit, reader.offset)
+	}
+	var envelope struct {
+		Data struct {
+			InvestigationID string           `json:"investigation_id"`
+			Items           []store.Evidence `json:"items"`
+			Total           int              `json:"total"`
+			Limit           int              `json:"limit"`
+			Offset          int              `json:"offset"`
+			HasMore         bool             `json:"has_more"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode timeline: %v", err)
+	}
+	if envelope.Data.InvestigationID != investigationID || envelope.Data.Total != 23 ||
+		envelope.Data.Limit != 10 || envelope.Data.Offset != 5 || !envelope.Data.HasMore {
+		t.Fatalf("timeline response = %#v", envelope.Data)
+	}
+}
+
+func TestInvestigationTimelineRejectsInvalidQueryBeforeStore(t *testing.T) {
+	const investigationID = "44444444-4444-4444-8444-444444444444"
+	for _, query := range []string{
+		"source_type=UNKNOWN",
+		"completeness=EXPIRED",
+		"entity_id=%20",
+		"limit=101",
+		"offset=10001",
+		"limit=1&limit=2",
+		"unknown=value",
+	} {
+		t.Run(query, func(t *testing.T) {
+			reader := &fakeReader{}
+			response := serve(
+				NewHandler(reader, discardLogger()),
+				http.MethodGet,
+				"/api/v1/investigations/"+investigationID+"/timeline?"+query,
+			)
+			assertErrorResponse(t, response, http.StatusBadRequest, "invalid_request")
+			if reader.calls != 0 {
+				t.Fatalf("store calls = %d, want 0", reader.calls)
+			}
+		})
+	}
+}
+
+func TestInvestigationTimelineUsesDefaultPageAndMapsMissingResource(t *testing.T) {
+	const investigationID = "44444444-4444-4444-8444-444444444444"
+	reader := &fakeReader{timeline: store.InvestigationTimeline{
+		InvestigationID: investigationID,
+		Items:           []store.Evidence{},
+		Limit:           defaultTimelinePageSize,
+	}}
+	response := serve(
+		NewHandler(reader, discardLogger()),
+		http.MethodGet,
+		"/api/v1/investigations/"+investigationID+"/timeline",
+	)
+	if response.Code != http.StatusOK || reader.limit != defaultTimelinePageSize || reader.offset != 0 {
+		t.Fatalf("default page response=%d page=%d/%d body=%s", response.Code, reader.limit, reader.offset, response.Body.String())
+	}
+
+	response = serve(
+		NewHandler(&fakeReader{err: store.ErrNotFound}, discardLogger()),
+		http.MethodGet,
+		"/api/v1/investigations/"+investigationID+"/timeline",
+	)
+	assertErrorResponse(t, response, http.StatusNotFound, "not_found")
 }
 
 func TestDependencyErrorsAreRedactedInResponseAndLogs(t *testing.T) {
