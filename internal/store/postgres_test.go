@@ -900,6 +900,7 @@ func TestGetInvestigationTimelineRejectsInvalidInputsBeforeDatabaseAccess(t *tes
 		{name: "bad ID", id: "bad", limit: 1},
 		{name: "bad source", id: validID, filter: InvestigationTimelineFilter{SourceType: "UNKNOWN"}, limit: 1},
 		{name: "bad completeness", id: validID, filter: InvestigationTimelineFilter{Completeness: "INVALID"}, limit: 1},
+		{name: "bad stance", id: validID, filter: InvestigationTimelineFilter{Stance: "INVALID"}, limit: 1},
 		{name: "oversized page", id: validID, limit: 101},
 		{name: "negative offset", id: validID, limit: 1, offset: -1},
 		{name: "oversized offset", id: validID, limit: 1, offset: 10001},
@@ -912,6 +913,75 @@ func TestGetInvestigationTimelineRejectsInvalidInputsBeforeDatabaseAccess(t *tes
 				t.Fatalf("error = %v, want ErrInvalidInput", err)
 			}
 		})
+	}
+}
+
+func TestTimelineStanceFiltersRelationsWithoutDuplicates(t *testing.T) {
+	db := openStoreTestDB(t)
+	ctx := context.Background()
+	fixture := insertStoreFixture(t, ctx, db, "timeline-stance")
+	other := insertStoreFixture(t, ctx, db, "timeline-stance-other")
+	insertEvidence := func(owner storeFixture, source, hash string) string {
+		var id string
+		err := db.QueryRowContext(ctx, `INSERT INTO evidence
+			(investigation_id, source_type, entity_type, entity_id, observed_start, observed_end,
+			 value_summary, completeness, independence_group, content_hash)
+			VALUES ($1, $2, 'service', $3, $4, $4, '{}', 'COMPLETE', 'test', $5) RETURNING id::text`,
+			owner.investigationID, source, owner.serviceID, owner.startedAt, strings.Repeat(hash, 64)).Scan(&id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	insertHypothesis := func(owner storeFixture, rank int) string {
+		var id string
+		err := db.QueryRowContext(ctx, `INSERT INTO hypotheses
+			(investigation_id, rank, entity, fault_type, mechanism, affected_scope, confidence, summary)
+			VALUES ($1, $2, 'service', 'fault', 'mechanism', 'scope', 'LOW', 'summary') RETURNING id::text`,
+			owner.investigationID, rank).Scan(&id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	link := func(owner storeFixture, hypothesis, item, stance string) {
+		_, err := db.ExecContext(ctx, `INSERT INTO hypothesis_evidence
+			(investigation_id, hypothesis_id, evidence_id, stance) VALUES ($1, $2, $3, $4)`,
+			owner.investigationID, hypothesis, item, stance)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := insertEvidence(fixture, "LOKI", "a")
+	second := insertEvidence(fixture, "PROMETHEUS", "b")
+	third := insertEvidence(fixture, "SYSTEM", "d")
+	insertEvidence(fixture, "RUNTIME", "e")
+	foreign := insertEvidence(other, "LOKI", "c")
+	h1, h2 := insertHypothesis(fixture, 1), insertHypothesis(fixture, 2)
+	link(fixture, h1, first, "SUPPORTS")
+	link(fixture, h2, first, "SUPPORTS")
+	link(fixture, h1, second, "CONTRADICTS")
+	link(fixture, h2, third, "SUPPORTS")
+	link(other, insertHypothesis(other, 1), foreign, "SUPPORTS")
+	repository := NewPostgres(db)
+	for _, tc := range []struct{ stance, source, want string }{
+		{"CONTRADICTS", "", second}, {"SUPPORTS", "LOKI", first},
+	} {
+		got, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID,
+			InvestigationTimelineFilter{Stance: tc.stance, SourceType: tc.source}, 1, 0)
+		if err != nil || got.Total != 1 || len(got.Items) != 1 || got.Items[0].ID != tc.want || got.HasMore {
+			t.Fatalf("stance %s source %s: got %+v, err %v", tc.stance, tc.source, got, err)
+		}
+	}
+	page, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID,
+		InvestigationTimelineFilter{Stance: "SUPPORTS"}, 1, 0)
+	if err != nil || page.Total != 2 || len(page.Items) != 1 || page.Items[0].ID != first || !page.HasMore {
+		t.Fatalf("first page: got %+v, err %v", page, err)
+	}
+	page, err = repository.GetInvestigationTimeline(ctx, fixture.investigationID,
+		InvestigationTimelineFilter{Stance: "SUPPORTS"}, 1, 1)
+	if err != nil || page.Total != 2 || len(page.Items) != 1 || page.Items[0].ID != third || page.HasMore {
+		t.Fatalf("second page: got %+v, err %v", page, err)
 	}
 }
 

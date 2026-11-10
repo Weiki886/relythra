@@ -30,7 +30,7 @@ func (handler *handler) getInvestigationTimeline(w http.ResponseWriter, r *http.
 	}
 	for key := range values {
 		switch key {
-		case "source_type", "entity_id", "completeness", "limit", "offset":
+		case "source_type", "entity_id", "completeness", "stance", "limit", "offset":
 		default:
 			writeError(w, r, http.StatusBadRequest, "invalid_request", "timeline query is invalid")
 			return
@@ -66,6 +66,7 @@ func parseInvestigationTimelineFilter(values url.Values) (store.InvestigationTim
 		"source_type":  &filter.SourceType,
 		"entity_id":    &filter.EntityID,
 		"completeness": &filter.Completeness,
+		"stance":       &filter.Stance,
 	} {
 		items, exists := values[key]
 		if !exists {
