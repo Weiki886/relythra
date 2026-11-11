@@ -199,11 +199,14 @@ func TestInvestigationTimelinePassesValidatedFiltersAndPagination(t *testing.T) 
 	const investigationID = "44444444-4444-4444-8444-444444444444"
 	reader := &fakeReader{timeline: store.InvestigationTimeline{
 		InvestigationID: investigationID,
-		Items:           []store.Evidence{},
-		Total:           23,
-		Limit:           10,
-		Offset:          5,
-		HasMore:         true,
+		Items: []store.InvestigationTimelineItem{{
+			Evidence:  store.Evidence{ID: "55555555-5555-4555-8555-555555555555"},
+			Relations: []store.EvidenceRelation{{HypothesisID: "66666666-6666-4666-8666-666666666666", Stance: "SUPPORTS"}},
+		}},
+		Total:   23,
+		Limit:   10,
+		Offset:  5,
+		HasMore: true,
 	}}
 	response := serve(
 		NewHandler(reader, discardLogger()),
@@ -226,12 +229,12 @@ func TestInvestigationTimelinePassesValidatedFiltersAndPagination(t *testing.T) 
 	}
 	var envelope struct {
 		Data struct {
-			InvestigationID string           `json:"investigation_id"`
-			Items           []store.Evidence `json:"items"`
-			Total           int              `json:"total"`
-			Limit           int              `json:"limit"`
-			Offset          int              `json:"offset"`
-			HasMore         bool             `json:"has_more"`
+			InvestigationID string                            `json:"investigation_id"`
+			Items           []store.InvestigationTimelineItem `json:"items"`
+			Total           int                               `json:"total"`
+			Limit           int                               `json:"limit"`
+			Offset          int                               `json:"offset"`
+			HasMore         bool                              `json:"has_more"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
@@ -240,6 +243,11 @@ func TestInvestigationTimelinePassesValidatedFiltersAndPagination(t *testing.T) 
 	if envelope.Data.InvestigationID != investigationID || envelope.Data.Total != 23 ||
 		envelope.Data.Limit != 10 || envelope.Data.Offset != 5 || !envelope.Data.HasMore {
 		t.Fatalf("timeline response = %#v", envelope.Data)
+	}
+	if len(envelope.Data.Items) != 1 || envelope.Data.Items[0].ID != "55555555-5555-4555-8555-555555555555" ||
+		len(envelope.Data.Items[0].Relations) != 1 ||
+		envelope.Data.Items[0].Relations[0].HypothesisID != "66666666-6666-4666-8666-666666666666" {
+		t.Fatalf("timeline item relations = %#v", envelope.Data.Items)
 	}
 }
 
@@ -276,7 +284,7 @@ func TestInvestigationTimelineUsesDefaultPageAndMapsMissingResource(t *testing.T
 	const investigationID = "44444444-4444-4444-8444-444444444444"
 	reader := &fakeReader{timeline: store.InvestigationTimeline{
 		InvestigationID: investigationID,
-		Items:           []store.Evidence{},
+		Items:           []store.InvestigationTimelineItem{},
 		Limit:           defaultTimelinePageSize,
 	}}
 	response := serve(
