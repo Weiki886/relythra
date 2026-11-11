@@ -955,22 +955,31 @@ func TestTimelineStanceFiltersRelationsWithoutDuplicates(t *testing.T) {
 	first := insertEvidence(fixture, "LOKI", "a")
 	second := insertEvidence(fixture, "PROMETHEUS", "b")
 	third := insertEvidence(fixture, "SYSTEM", "d")
-	insertEvidence(fixture, "RUNTIME", "e")
+	unlinked := insertEvidence(fixture, "RUNTIME", "e")
 	foreign := insertEvidence(other, "LOKI", "c")
 	h1, h2 := insertHypothesis(fixture, 1), insertHypothesis(fixture, 2)
 	link(fixture, h1, first, "SUPPORTS")
-	link(fixture, h2, first, "SUPPORTS")
+	link(fixture, h2, first, "CONTRADICTS")
 	link(fixture, h1, second, "CONTRADICTS")
 	link(fixture, h2, third, "SUPPORTS")
 	link(other, insertHypothesis(other, 1), foreign, "SUPPORTS")
 	repository := NewPostgres(db)
 	for _, tc := range []struct{ stance, source, want string }{
-		{"CONTRADICTS", "", second}, {"SUPPORTS", "LOKI", first},
+		{"CONTRADICTS", "PROMETHEUS", second}, {"CONTRADICTS", "LOKI", first}, {"SUPPORTS", "LOKI", first},
 	} {
 		got, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID,
 			InvestigationTimelineFilter{Stance: tc.stance, SourceType: tc.source}, 1, 0)
 		if err != nil || got.Total != 1 || len(got.Items) != 1 || got.Items[0].ID != tc.want || got.HasMore {
 			t.Fatalf("stance %s source %s: got %+v, err %v", tc.stance, tc.source, got, err)
+		}
+		if got.Items[0].ID == first {
+			relations := make(map[string]string, len(got.Items[0].Relations))
+			for _, relation := range got.Items[0].Relations {
+				relations[relation.HypothesisID] = relation.Stance
+			}
+			if len(relations) != 2 || relations[h1] != "SUPPORTS" || relations[h2] != "CONTRADICTS" {
+				t.Fatalf("relations for %s = %#v", tc.stance, got.Items[0].Relations)
+			}
 		}
 	}
 	page, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID,
@@ -982,6 +991,16 @@ func TestTimelineStanceFiltersRelationsWithoutDuplicates(t *testing.T) {
 		InvestigationTimelineFilter{Stance: "SUPPORTS"}, 1, 1)
 	if err != nil || page.Total != 2 || len(page.Items) != 1 || page.Items[0].ID != third || page.HasMore {
 		t.Fatalf("second page: got %+v, err %v", page, err)
+	}
+	page, err = repository.GetInvestigationTimeline(ctx, fixture.investigationID,
+		InvestigationTimelineFilter{}, 10, 0)
+	if err != nil || page.Total != 4 {
+		t.Fatalf("unfiltered page: got %+v, err %v", page, err)
+	}
+	for _, item := range page.Items {
+		if item.ID == unlinked && (item.Relations == nil || len(item.Relations) != 0) {
+			t.Fatalf("unlinked evidence relations = %#v, want empty array", item.Relations)
+		}
 	}
 }
 

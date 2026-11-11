@@ -23,12 +23,22 @@ type InvestigationTimelineFilter struct {
 }
 
 type InvestigationTimeline struct {
-	InvestigationID string     `json:"investigation_id"`
-	Items           []Evidence `json:"items"`
-	Total           int        `json:"total"`
-	Limit           int        `json:"limit"`
-	Offset          int        `json:"offset"`
-	HasMore         bool       `json:"has_more"`
+	InvestigationID string                      `json:"investigation_id"`
+	Items           []InvestigationTimelineItem `json:"items"`
+	Total           int                         `json:"total"`
+	Limit           int                         `json:"limit"`
+	Offset          int                         `json:"offset"`
+	HasMore         bool                        `json:"has_more"`
+}
+
+type InvestigationTimelineItem struct {
+	Evidence
+	Relations []EvidenceRelation `json:"relations"`
+}
+
+type EvidenceRelation struct {
+	HypothesisID string `json:"hypothesis_id"`
+	Stance       string `json:"stance"`
 }
 
 func (repository *Postgres) GetInvestigationTimeline(
@@ -82,19 +92,22 @@ func (repository *Postgres) GetInvestigationTimeline(
 	}
 	defer rows.Close()
 
-	items := make([]Evidence, 0, limit)
+	items := make([]InvestigationTimelineItem, 0, limit)
 	for rows.Next() {
-		evidence, err := scanEvidence(rows)
+		item, err := scanEvidence(rows)
 		if err != nil {
 			return InvestigationTimeline{}, fmt.Errorf("scan investigation timeline evidence: %w", err)
 		}
-		items = append(items, evidence)
+		items = append(items, InvestigationTimelineItem{Evidence: item})
 	}
 	if err := rows.Err(); err != nil {
 		return InvestigationTimeline{}, fmt.Errorf("iterate investigation timeline evidence: %w", err)
 	}
 	if err := rows.Close(); err != nil {
 		return InvestigationTimeline{}, fmt.Errorf("close investigation timeline evidence: %w", err)
+	}
+	if err := loadTimelineEvidenceRelations(ctx, tx, investigationID, items); err != nil {
+		return InvestigationTimeline{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return InvestigationTimeline{}, fmt.Errorf("commit investigation timeline read: %w", err)
@@ -107,6 +120,53 @@ func (repository *Postgres) GetInvestigationTimeline(
 		Offset:          offset,
 		HasMore:         offset+len(items) < total,
 	}, nil
+}
+
+func loadTimelineEvidenceRelations(
+	ctx context.Context,
+	tx *sql.Tx,
+	investigationID string,
+	items []InvestigationTimelineItem,
+) error {
+	if len(items) == 0 {
+		return nil
+	}
+	arguments := make([]any, 1, len(items)+1)
+	arguments[0] = investigationID
+	placeholders := make([]string, 0, len(items))
+	relationsByEvidence := make(map[string][]EvidenceRelation, len(items))
+	for index, item := range items {
+		arguments = append(arguments, item.ID)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", index+2))
+		relationsByEvidence[item.ID] = []EvidenceRelation{}
+	}
+	query := `SELECT evidence_id::text, hypothesis_id::text, stance
+		FROM hypothesis_evidence
+		WHERE investigation_id = $1 AND evidence_id IN (` + strings.Join(placeholders, ", ") + `)
+		ORDER BY evidence_id, hypothesis_id, stance`
+	rows, err := tx.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return fmt.Errorf("read investigation timeline evidence relations: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var evidenceID string
+		var relation EvidenceRelation
+		if err := rows.Scan(&evidenceID, &relation.HypothesisID, &relation.Stance); err != nil {
+			return fmt.Errorf("scan investigation timeline evidence relation: %w", err)
+		}
+		relationsByEvidence[evidenceID] = append(relationsByEvidence[evidenceID], relation)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate investigation timeline evidence relations: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close investigation timeline evidence relations: %w", err)
+	}
+	for index := range items {
+		items[index].Relations = relationsByEvidence[items[index].ID]
+	}
+	return nil
 }
 
 func ValidateInvestigationTimelineFilter(filter InvestigationTimelineFilter) error {
