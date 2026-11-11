@@ -27,6 +27,7 @@ type runtimeQueryParameters struct {
 	Service          string                 `json:"service"`
 	Environment      string                 `json:"environment"`
 	HostID           string                 `json:"host_id"`
+	MappingVersion   int                    `json:"mapping_version"`
 	TemplateID       string                 `json:"template_id"`
 	TemplateVersion  int                    `json:"template_version"`
 	UnderlyingSource string                 `json:"underlying_source"`
@@ -34,15 +35,16 @@ type runtimeQueryParameters struct {
 }
 
 type runtimeMeasurementObservation struct {
-	EntityType    string                       `json:"entity_type"`
-	EntityID      string                       `json:"entity_id"`
-	HostID        string                       `json:"host_id"`
-	Instance      string                       `json:"instance,omitempty"`
-	InstanceID    string                       `json:"instance_id,omitempty"`
-	Service       string                       `json:"service,omitempty"`
-	MappingStatus string                       `json:"mapping_status,omitempty"`
-	StartTime     *time.Time                   `json:"start_time,omitempty"`
-	Measurement   runtimeconnector.Measurement `json:"measurement"`
+	EntityType     string                       `json:"entity_type"`
+	EntityID       string                       `json:"entity_id"`
+	HostID         string                       `json:"host_id"`
+	Instance       string                       `json:"instance,omitempty"`
+	InstanceID     string                       `json:"instance_id,omitempty"`
+	Service        string                       `json:"service,omitempty"`
+	MappingStatus  string                       `json:"mapping_status,omitempty"`
+	MappingVersion int                          `json:"mapping_version,omitempty"`
+	StartTime      *time.Time                   `json:"start_time,omitempty"`
+	Measurement    runtimeconnector.Measurement `json:"measurement"`
 }
 
 type runtimeValueSummary struct {
@@ -66,7 +68,7 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 	}
 	if result.Runtime != datasource.RuntimeDockerCompose || strings.TrimSpace(result.HostID) == "" ||
 		strings.TrimSpace(result.Service) == "" || strings.TrimSpace(result.Environment) == "" ||
-		result.Start.IsZero() || result.End.IsZero() || !result.End.After(result.Start) ||
+		result.MappingVersion < 0 || result.Start.IsZero() || result.End.IsZero() || !result.End.After(result.Start) ||
 		result.End.Sub(result.Start) > runtimeconnector.MaxQueryWindow || result.Duration < 0 {
 		return nil, ErrInvalidInput
 	}
@@ -91,9 +93,22 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 		if container.HostID != result.HostID || strings.TrimSpace(container.ID) == "" || (container.StartTime != nil && container.StartTime.IsZero()) {
 			return nil, ErrInvalidInput
 		}
+		switch container.MappingStatus {
+		case "explicit_mapping":
+			if result.MappingVersion < 1 || container.MappingVersion != result.MappingVersion || container.Service != result.Service {
+				return nil, ErrInvalidInput
+			}
+		case "raw_cgroup_only":
+			if container.MappingVersion != 0 || container.Service != "" {
+				return nil, ErrInvalidInput
+			}
+		default:
+			return nil, ErrInvalidInput
+		}
 		for i, measurement := range []runtimeconnector.Measurement{container.CPU, container.Memory, container.OOMEvents, container.StartEvidence} {
 			observation := runtimeMeasurementObservation{EntityType: "CONTAINER", EntityID: container.ID, HostID: container.HostID,
-				InstanceID: container.InstanceID, Service: container.Service, MappingStatus: container.MappingStatus, Measurement: measurement}
+				InstanceID: container.InstanceID, Service: container.Service, MappingStatus: container.MappingStatus,
+				MappingVersion: container.MappingVersion, Measurement: measurement}
 			if i == 3 && container.StartTime != nil {
 				started := container.StartTime.UTC()
 				observation.StartTime = &started
@@ -154,7 +169,7 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 		}
 		summary.SourceReferenceAvailable = reference != ""
 		parameters, err := json.Marshal(runtimeQueryParameters{Runtime: result.Runtime, Service: result.Service, Environment: result.Environment,
-			HostID: result.HostID, TemplateID: template, TemplateVersion: 1, UnderlyingSource: origin, TimeBasis: basis})
+			HostID: result.HostID, MappingVersion: result.MappingVersion, TemplateID: template, TemplateVersion: 1, UnderlyingSource: origin, TimeBasis: basis})
 		if err != nil {
 			return nil, ErrInvalidInput
 		}

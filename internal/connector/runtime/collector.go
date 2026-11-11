@@ -50,17 +50,19 @@ type Target struct {
 }
 
 type Request struct {
-	Runtime     datasource.RuntimeType
-	Action      string
-	Service     string
-	Environment string
-	HostID      string
-	Start       time.Time
-	End         time.Time
-	Step        time.Duration
-	MaxSeries   int
-	MaxPoints   int
-	MaxLogLines int
+	Runtime           datasource.RuntimeType
+	Action            string
+	Service           string
+	Environment       string
+	HostID            string
+	MappingVersion    int
+	ContainerMappings []datasource.RuntimeContainerMapping
+	Start             time.Time
+	End               time.Time
+	Step              time.Duration
+	MaxSeries         int
+	MaxPoints         int
+	MaxLogLines       int
 }
 
 // Measurement timestamps are query evaluation times. Delay and Stale describe
@@ -90,6 +92,7 @@ type Container struct {
 	HostID           string      `json:"host_id"`
 	Service          string      `json:"service,omitempty"`
 	MappingStatus    string      `json:"mapping_status"`
+	MappingVersion   int         `json:"mapping_version,omitempty"`
 	StartTime        *time.Time  `json:"start_time,omitempty"`
 	StartEvidence    Measurement `json:"start_evidence"`
 	CPU              Measurement `json:"cpu"`
@@ -112,18 +115,19 @@ type Event struct {
 }
 
 type Result struct {
-	Runtime     datasource.RuntimeType `json:"runtime"`
-	Service     string                 `json:"service"`
-	Environment string                 `json:"environment"`
-	HostID      string                 `json:"host_id"`
-	Start       time.Time              `json:"start"`
-	End         time.Time              `json:"end"`
-	Duration    time.Duration          `json:"duration"`
-	Hosts       []Host                 `json:"hosts"`
-	Containers  []Container            `json:"containers"`
-	Events      []Event                `json:"events"`
-	Gaps        []string               `json:"gaps"`
-	Partial     bool                   `json:"partial"`
+	Runtime        datasource.RuntimeType `json:"runtime"`
+	Service        string                 `json:"service"`
+	Environment    string                 `json:"environment"`
+	HostID         string                 `json:"host_id"`
+	MappingVersion int                    `json:"mapping_version,omitempty"`
+	Start          time.Time              `json:"start"`
+	End            time.Time              `json:"end"`
+	Duration       time.Duration          `json:"duration"`
+	Hosts          []Host                 `json:"hosts"`
+	Containers     []Container            `json:"containers"`
+	Events         []Event                `json:"events"`
+	Gaps           []string               `json:"gaps"`
+	Partial        bool                   `json:"partial"`
 }
 
 type Collector struct {
@@ -165,7 +169,8 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 	}
 	result := Result{
 		Runtime: request.Runtime, Service: request.Service, Environment: request.Environment, HostID: request.HostID,
-		Start: request.Start, End: request.End,
+		MappingVersion: request.MappingVersion,
+		Start:          request.Start, End: request.End,
 		Hosts: []Host{}, Containers: []Container{}, Events: []Event{}, Gaps: []string{},
 	}
 
@@ -246,7 +251,11 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 		result.Gaps = append(result.Gaps, "container_resource_metrics_missing")
 		result.Partial = true
 	}
-	if len(result.Containers) > 0 {
+	unmappedContainers := false
+	for _, container := range result.Containers {
+		unmappedContainers = unmappedContainers || container.MappingStatus != "explicit_mapping"
+	}
+	if unmappedContainers {
 		result.Gaps = append(result.Gaps, "container_service_mapping_unavailable")
 		result.Partial = true
 	}
@@ -254,7 +263,7 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 		return Result{}, err
 	}
 	result.Partial = true
-	result.Gaps = append(result.Gaps, "container_service_mapping_unavailable", "healthy_peer_evidence_unavailable", "exporter_scrape_freshness_unavailable")
+	result.Gaps = append(result.Gaps, "healthy_peer_evidence_unavailable", "exporter_scrape_freshness_unavailable")
 	sort.Strings(result.Gaps)
 	result.Gaps = compactGaps(result.Gaps)
 	result.Duration = time.Since(started)
@@ -276,6 +285,11 @@ var runtimeMetricTemplates = []metricTemplate{
 func normalizeRequest(request Request) (Request, error) {
 	if !hostIDPattern.MatchString(request.HostID) {
 		return Request{}, errors.New("host ID is invalid")
+	}
+	if request.MappingVersion < 0 ||
+		(len(request.ContainerMappings) > 0 && request.MappingVersion < 1) ||
+		len(datasource.ValidateRuntimeContainerMappings(request.ContainerMappings)) > 0 {
+		return Request{}, errors.New("runtime container mappings or version are invalid")
 	}
 	if request.Start.IsZero() || request.End.IsZero() || !request.End.After(request.Start) || request.End.Sub(request.Start) > MaxQueryWindow {
 		return Request{}, errors.New("time window must be positive and no longer than two hours")
@@ -408,6 +422,10 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 		{"prometheus.runtime.container.oom_events.v1", func(container *Container, value Measurement) { container.OOMEvents = value }},
 	}
 	containers := make(map[string]*Container)
+	explicitMappings := make(map[string]struct{}, len(request.ContainerMappings))
+	for _, mapping := range request.ContainerMappings {
+		explicitMappings[mapping.CgroupID+"\x00"+mapping.HostID] = struct{}{}
+	}
 	for _, metricType := range types {
 		metricResult, exists := results[metricType.id]
 		if !exists {
@@ -422,10 +440,14 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 			key := rawID + "\x00" + hostID
 			container := containers[key]
 			if container == nil {
+				mappingStatus, service, mappingVersion := "raw_cgroup_only", "", 0
+				if _, mapped := explicitMappings[rawID+"\x00"+hostID]; mapped {
+					mappingStatus, service, mappingVersion = "explicit_mapping", request.Service, request.MappingVersion
+				}
 				container = &Container{
-					ID: opaqueIdentity(hostID + "\x00" + rawID), HostID: hostID,
-					MappingStatus: "raw_cgroup_only",
-					CPU:           emptyMeasurement(), Memory: emptyMeasurement(), OOMEvents: emptyMeasurement(), StartEvidence: emptyMeasurement(),
+					ID: opaqueIdentity(hostID + "\x00" + rawID), HostID: hostID, Service: service,
+					MappingStatus: mappingStatus, MappingVersion: mappingVersion,
+					CPU: emptyMeasurement(), Memory: emptyMeasurement(), OOMEvents: emptyMeasurement(), StartEvidence: emptyMeasurement(),
 					PeerContainerIDs: []string{},
 				}
 				containers[key] = container

@@ -126,6 +126,32 @@ func TestFromRuntimePreservesPrimaryObservations(t *testing.T) {
 	}
 }
 
+func TestFromRuntimePreservesContainerMappingVersion(t *testing.T) {
+	result, meta := runtimeObservation()
+	result.MappingVersion = 7
+	result.Containers[0].MappingStatus = "explicit_mapping"
+	result.Containers[0].MappingVersion = 7
+	result.Containers[0].Service = result.Service
+	filter, _ := redact.NewFilter()
+	records, err := FromRuntimeResult(context.Background(), result, meta, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records {
+		var parameters map[string]any
+		if err := json.Unmarshal(record.QueryParameters, &parameters); err != nil {
+			t.Fatal(err)
+		}
+		if parameters["mapping_version"] != float64(7) {
+			t.Fatalf("mapping version missing from query provenance: %s", record.QueryParameters)
+		}
+		if strings.Contains(string(record.ValueSummary), `"mapping_status":"explicit_mapping"`) &&
+			!strings.Contains(string(record.ValueSummary), `"mapping_version":7`) {
+			t.Fatalf("container mapping version missing from evidence: %s", record.ValueSummary)
+		}
+	}
+}
+
 func TestFromRuntimeCompletenessAndGaps(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -400,13 +426,16 @@ func TestFromRuntimePreservesScopeAndMissingComponents(t *testing.T) {
 	if summary.Measurements[0].Service != "" {
 		t.Fatal("request scope was promoted to verified container service")
 	}
-	result.Containers[0].Service = "source-reported-service"
+	result.MappingVersion = 7
+	result.Containers[0].MappingStatus = "explicit_mapping"
+	result.Containers[0].MappingVersion = 7
+	result.Containers[0].Service = result.Service
 	changed, err := FromRuntimeResult(nil, result, meta, filter)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(changed[3].ValueSummary), `"service":"source-reported-service"`) {
-		t.Fatal("source-reported container service lost")
+	if !strings.Contains(string(changed[3].ValueSummary), `"service":"checkout"`) {
+		t.Fatal("explicitly mapped container service lost")
 	}
 }
 

@@ -15,6 +15,10 @@ Prometheus 与 Loki 原始接口不发布到宿主机，存储网络与诊断网
 
 node_exporter 只读挂载 proc/sys，不启用额外 collectors。cAdvisor 不挂 Socket、不 privileged，使用只读 sys 和宿主机 cgroup namespace，输出原始 cgroup 指标。没有 Docker 元数据时，无法保证名称、镜像、Compose 标签和退出/OOM 事件，统一标记 `mapping_status=raw_cgroup_only`。宿主机标签 `demo-host` 是管理员声明的逻辑主机标识；Docker Desktop 采到的是 Linux VM，不能将它当作 macOS 宿主机。未来 #13 必须在映射与时效验证后才把 cgroup 证据关联服务；Kubernetes 不在范围内。
 
+### Issue #13：显式容器身份映射
+
+容器归属只接受管理员在版本化 Runtime 数据源映射中维护的精确 `(host_id, cgroup_id)` 项；项目、服务和环境继承该数据源映射的作用域。映射更新使用现有 `expected_version` 乐观并发契约，采集结果和 Evidence 查询参数记录实际使用的映射版本。未配置、未命中或超出所选 host 的 cgroup 继续保持 `raw_cgroup_only` 并产生数据缺口；日志中的容器 ID 不用于补全映射。该规则不证明容器健康，也不提供 Docker 实例列表、退出状态或经验证的健康 peer。
+
 ## 取舍
 
 - 不引入 Docker API 或 privileged 来换取完整的容器身份信息；保留证据缺口，避免越权和错误关联。
