@@ -755,13 +755,66 @@ type Evidence struct {
 	CreatedAt         time.Time       `json:"created_at"`
 }
 
+const maxEvidenceBatchSize = 100
+
+type evidenceQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 func (repository *Postgres) PersistEvidence(ctx context.Context, record evidence.Record) (Evidence, bool, error) {
 	if err := evidence.Validate(record); err != nil {
 		return Evidence{}, false, fmt.Errorf("%w: invalid normalized evidence", ErrInvalidInput)
 	}
+	return persistValidatedEvidence(ctx, repository.db, record)
+}
+
+func (repository *Postgres) PersistEvidenceBatch(
+	ctx context.Context,
+	records []evidence.Record,
+) ([]Evidence, []bool, error) {
+	if len(records) > maxEvidenceBatchSize {
+		return nil, nil, fmt.Errorf("%w: evidence batch exceeds %d records", ErrInvalidInput, maxEvidenceBatchSize)
+	}
+	if len(records) == 0 {
+		return []Evidence{}, []bool{}, nil
+	}
+
+	investigationID := records[0].InvestigationID
+	for _, record := range records {
+		if err := evidence.Validate(record); err != nil {
+			return nil, nil, fmt.Errorf("%w: invalid normalized evidence", ErrInvalidInput)
+		}
+		if record.InvestigationID != investigationID {
+			return nil, nil, fmt.Errorf("%w: evidence batch spans multiple investigations", ErrInvalidInput)
+		}
+	}
+
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin evidence batch: %w", err)
+	}
+	defer tx.Rollback()
+
+	items := make([]Evidence, 0, len(records))
+	created := make([]bool, 0, len(records))
+	for _, record := range records {
+		item, inserted, err := persistValidatedEvidence(ctx, tx, record)
+		if err != nil {
+			return nil, nil, err
+		}
+		items = append(items, item)
+		created = append(created, inserted)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, fmt.Errorf("commit evidence batch: %w", err)
+	}
+	return items, created, nil
+}
+
+func persistValidatedEvidence(ctx context.Context, queryer evidenceQueryer, record evidence.Record) (Evidence, bool, error) {
 	if record.ToolCallID != nil {
 		var belongsToInvestigation bool
-		if err := repository.db.QueryRowContext(ctx, `
+		if err := queryer.QueryRowContext(ctx, `
 			SELECT EXISTS (
 				SELECT 1 FROM tool_calls WHERE id = $1 AND investigation_id = $2
 			)
@@ -785,7 +838,7 @@ func (repository *Postgres) PersistEvidence(ctx context.Context, record evidence
 		)
 		ON CONFLICT (investigation_id, source_type, content_hash) DO NOTHING
 		RETURNING ` + evidenceColumns
-	item, err := scanEvidence(repository.db.QueryRowContext(ctx, insert,
+	item, err := scanEvidence(queryer.QueryRowContext(ctx, insert,
 		record.InvestigationID, nullableStringPointer(record.ToolCallID), record.SourceType,
 		record.EntityType, nullableStringPointer(record.EntityID), domain.NormalizeTime(record.ObservedStart),
 		domain.NormalizeTime(record.ObservedEnd), domain.NormalizeTime(record.CollectedAt), record.QueryText,
@@ -799,7 +852,7 @@ func (repository *Postgres) PersistEvidence(ctx context.Context, record evidence
 		return Evidence{}, false, fmt.Errorf("persist evidence: %w", err)
 	}
 
-	item, err = scanEvidence(repository.db.QueryRowContext(ctx, `
+	item, err = scanEvidence(queryer.QueryRowContext(ctx, `
 		SELECT `+evidenceColumns+`
 		FROM evidence
 		WHERE investigation_id = $1 AND source_type = $2 AND content_hash = $3
