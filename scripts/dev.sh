@@ -5,8 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
 TMP_ROOT="${TMPDIR:-/tmp}"
-RUN_DIR="${TMP_ROOT%/}/relythra-dev-$(id -u)"
-LOG_DIR="${RUN_DIR}/logs"
+RUN_DIR=""
+LOG_DIR=""
 DB_NAME="${RELYTHRA_DATABASE_NAME:-relythra}"
 DB_HOST="${RELYTHRA_DATABASE_HOST:-${PGHOST:-127.0.0.1}}"
 DB_PORT="${RELYTHRA_DATABASE_PORT:-${PGPORT:-5432}}"
@@ -208,7 +208,6 @@ print_configuration() {
   printf 'API=%s\n' "${API_URL}"
   printf 'WORKER=%s\n' "${WORKER_URL}"
   printf 'WEB=%s\n' "${WEB_URL}"
-  printf 'LOGS=%s\n' "${LOG_DIR}"
 }
 
 show_logs() {
@@ -299,7 +298,8 @@ ensure_port_free API 8080
 ensure_port_free worker 8081
 ensure_port_free web 5173
 
-rm -rf "${RUN_DIR}"
+RUN_DIR="$(mktemp -d "${TMP_ROOT%/}/relythra-dev-$(id -u).XXXXXX")"
+LOG_DIR="${RUN_DIR}/logs"
 mkdir -p "${LOG_DIR}"
 trap cleanup EXIT
 trap 'exit 130' INT

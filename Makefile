@@ -2,7 +2,7 @@ GO_PACKAGES := ./cmd/... ./internal/... ./migrations/...
 GO_FILES := $$(find cmd internal migrations -type f -name '*.go')
 COMPOSE := docker compose --file deploy/compose/compose.yaml
 
-.PHONY: fmt fmt-check vet test build web-install web-check case-check compose-config smoke demo-smoke check
+.PHONY: fmt fmt-check vet test build web-install web-check case-check compose-config smoke demo-smoke dev-script-check check
 
 fmt:
 	gofmt -w $(GO_FILES)
@@ -44,4 +44,8 @@ smoke:
 demo-smoke:
 	./scripts/demo-smoke.sh
 
-check: fmt-check vet test build web-check case-check compose-config
+dev-script-check:
+	bash -n scripts/dev.sh scripts/dev_test.sh
+	bash scripts/dev_test.sh
+
+check: fmt-check vet test build web-check case-check compose-config dev-script-check
