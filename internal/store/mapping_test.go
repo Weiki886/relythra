@@ -24,6 +24,9 @@ func TestCreateDataSourceMappingAllowsDraftWithMissingRuntimeLabels(t *testing.T
 		RuntimeType: datasource.RuntimeDockerCompose,
 		PublicSettings: datasource.PublicSettings{
 			Endpoint: "http://cadvisor:8080",
+			ContainerMappings: []datasource.RuntimeContainerMapping{{
+				HostID: "demo-host", CgroupID: "docker/cgroup-a",
+			}},
 		},
 		TemplateIDs: []string{"runtime.containers.v1"},
 		SecretRef:   "env:RUNTIME_TOKEN",
@@ -39,6 +42,24 @@ func TestCreateDataSourceMappingAllowsDraftWithMissingRuntimeLabels(t *testing.T
 	}
 	if mapping.SecretRef != "env:RUNTIME_TOKEN" {
 		t.Fatalf("secret reference was not persisted")
+	}
+	if len(mapping.PublicSettings.ContainerMappings) != 1 || mapping.PublicSettings.ContainerMappings[0].HostID != "demo-host" || mapping.PublicSettings.ContainerMappings[0].CgroupID != "docker/cgroup-a" {
+		t.Fatalf("runtime container mappings were not persisted: %+v", mapping.PublicSettings.ContainerMappings)
+	}
+	updated, _, err := repository.UpdateDataSourceMapping(ctx, UpdateDataSourceMappingInput{
+		ID: mapping.ID, ExpectedVersion: mapping.Version, ProjectID: fixture.projectID, ServiceID: fixture.serviceID,
+		Environment: "prod", SourceType: datasource.SourceRuntime, RuntimeType: datasource.RuntimeDockerCompose,
+		PublicSettings: datasource.PublicSettings{
+			Endpoint:          "http://cadvisor:8080",
+			ContainerMappings: []datasource.RuntimeContainerMapping{{HostID: "demo-host", CgroupID: "docker/cgroup-b"}},
+		},
+		TemplateIDs: []string{"runtime.containers.v1"}, SecretRef: "env:RUNTIME_TOKEN",
+	})
+	if err != nil {
+		t.Fatalf("update runtime mapping: %v", err)
+	}
+	if updated.Version != 2 || len(updated.PublicSettings.ContainerMappings) != 1 || updated.PublicSettings.ContainerMappings[0].CgroupID != "docker/cgroup-b" {
+		t.Fatalf("updated versioned mapping = %+v", updated)
 	}
 }
 

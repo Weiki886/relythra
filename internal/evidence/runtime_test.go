@@ -126,6 +126,54 @@ func TestFromRuntimePreservesPrimaryObservations(t *testing.T) {
 	}
 }
 
+func TestFromRuntimePreservesContainerMappingVersion(t *testing.T) {
+	result, meta := runtimeObservation()
+	result.MappingVersion = 7
+	result.Containers[0].MappingStatus = "explicit_mapping"
+	result.Containers[0].MappingVersion = 7
+	result.Containers[0].Service = result.Service
+	filter, _ := redact.NewFilter()
+	records, err := FromRuntimeResult(context.Background(), result, meta, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records {
+		var parameters map[string]any
+		if err := json.Unmarshal(record.QueryParameters, &parameters); err != nil {
+			t.Fatal(err)
+		}
+		if parameters["mapping_version"] != float64(7) {
+			t.Fatalf("mapping version missing from query provenance: %s", record.QueryParameters)
+		}
+		if strings.Contains(string(record.ValueSummary), `"mapping_status":"explicit_mapping"`) &&
+			!strings.Contains(string(record.ValueSummary), `"mapping_version":7`) {
+			t.Fatalf("container mapping version missing from evidence: %s", record.ValueSummary)
+		}
+	}
+}
+
+func TestFromRuntimeAcceptsLifecycleEventForMappedContainer(t *testing.T) {
+	result, meta := runtimeObservation()
+	result.MappingVersion = 7
+	result.Containers[0].MappingStatus = "explicit_mapping"
+	result.Containers[0].MappingVersion = 7
+	result.Containers[0].Service = result.Service
+	result.Events[0].ContainerID = result.Containers[0].ID
+	result.Events[0].MappingVersion = 7
+	filter, _ := redact.NewFilter()
+	records, err := FromRuntimeResult(context.Background(), result, meta, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var summary runtimeValueSummary
+	if err := json.Unmarshal(records[7].ValueSummary, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Events) != 1 || summary.Events[0].ContainerID != result.Containers[0].ID || summary.Events[0].MappingVersion != 7 || summary.Events[0].Classification != "unverified_log_match" {
+		t.Fatalf("mapped lifecycle event was not preserved safely: %+v", summary.Events)
+	}
+}
+
 func TestFromRuntimeCompletenessAndGaps(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -308,6 +356,17 @@ func TestFromRuntimeRejectsInvalidAndUnsafeInput(t *testing.T) {
 			r.Events[0].Classification = "verified_restart"
 		}},
 		{"container association", func(r *runtimeconnector.Result, _ *RuntimeEvidenceContext) { r.Events[0].ContainerID = "made-up" }},
+		{"unmapped container association", func(r *runtimeconnector.Result, _ *RuntimeEvidenceContext) {
+			r.Events[0].ContainerID = r.Containers[0].ID
+		}},
+		{"container mapping version", func(r *runtimeconnector.Result, _ *RuntimeEvidenceContext) {
+			r.MappingVersion = 7
+			r.Containers[0].MappingStatus = "explicit_mapping"
+			r.Containers[0].MappingVersion = 7
+			r.Containers[0].Service = r.Service
+			r.Events[0].ContainerID = r.Containers[0].ID
+			r.Events[0].MappingVersion = 8
+		}},
 		{"oversized log", func(r *runtimeconnector.Result, _ *RuntimeEvidenceContext) {
 			r.Events[0].Line.Content = strings.Repeat("x", maxJSONBytes)
 		}},
@@ -400,13 +459,16 @@ func TestFromRuntimePreservesScopeAndMissingComponents(t *testing.T) {
 	if summary.Measurements[0].Service != "" {
 		t.Fatal("request scope was promoted to verified container service")
 	}
-	result.Containers[0].Service = "source-reported-service"
+	result.MappingVersion = 7
+	result.Containers[0].MappingStatus = "explicit_mapping"
+	result.Containers[0].MappingVersion = 7
+	result.Containers[0].Service = result.Service
 	changed, err := FromRuntimeResult(nil, result, meta, filter)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(changed[3].ValueSummary), `"service":"source-reported-service"`) {
-		t.Fatal("source-reported container service lost")
+	if !strings.Contains(string(changed[3].ValueSummary), `"service":"checkout"`) {
+		t.Fatal("explicitly mapped container service lost")
 	}
 }
 

@@ -40,6 +40,45 @@ func TestValidateRuntimeLabelsMarksKubernetesUnsupported(t *testing.T) {
 	if !hasIssue(issues, "runtime_type", "unsupported_runtime") {
 		t.Fatalf("issues = %#v", issues)
 	}
+	issues = ValidateMapping(SourceRuntime, RuntimeKubernetes, PublicSettings{
+		Endpoint:          "https://cadvisor.example.test",
+		ContainerMappings: []RuntimeContainerMapping{{HostID: "host-a", CgroupID: "cgroup-a"}},
+	}, []string{"runtime.containers.v1"}, nil)
+	if !hasIssue(issues, "public_settings.container_mappings", "unsupported_runtime") {
+		t.Fatalf("Kubernetes container mapping issues = %#v", issues)
+	}
+}
+
+func TestValidateRuntimeContainerMappingsRequiresUniqueHostAndCgroupIdentity(t *testing.T) {
+	settings := PublicSettings{
+		Endpoint: "https://prometheus.example.test",
+		RuntimeLabels: map[string]string{
+			"project": "relythra", "service": "checkout", "env": "demo",
+			"host_id": "host-a", "container_id": "container-id",
+		},
+		ContainerMappings: []RuntimeContainerMapping{
+			{HostID: "host-a", CgroupID: "cgroup-a"},
+			{HostID: "host-a", CgroupID: "cgroup-a"},
+		},
+	}
+	issues := ValidateMapping(SourceRuntime, RuntimeDockerCompose, settings, []string{"runtime.containers.v1"}, nil)
+	if !hasIssue(issues, "public_settings.container_mappings[1]", "duplicate_identity") {
+		t.Fatalf("duplicate mapping issues = %#v", issues)
+	}
+
+	settings.ContainerMappings = []RuntimeContainerMapping{{HostID: "host-a", CgroupID: "/"}}
+	issues = ValidateMapping(SourceRuntime, RuntimeDockerCompose, settings, []string{"runtime.containers.v1"}, nil)
+	if !hasIssue(issues, "public_settings.container_mappings[0].cgroup_id", "invalid_identity") {
+		t.Fatalf("invalid cgroup issues = %#v", issues)
+	}
+
+	issues = ValidateMapping(SourcePrometheus, "", PublicSettings{
+		Endpoint:          "https://prometheus.example.test",
+		ContainerMappings: []RuntimeContainerMapping{{HostID: "host-a", CgroupID: "cgroup-a"}},
+	}, []string{"prometheus.service.latency.v1"}, nil)
+	if !hasIssue(issues, "public_settings.container_mappings", "not_applicable") {
+		t.Fatalf("non-runtime mapping issues = %#v", issues)
+	}
 }
 
 func TestValidateMappingRequiresGitHubRepository(t *testing.T) {

@@ -87,6 +87,136 @@ func TestQueryKeepsContainerInstancesSeparateAndMarksUnmappedEvidence(t *testing
 	}
 }
 
+func TestQueryMapsOnlyExactHostAndCgroupUsingVersionedAdminMapping(t *testing.T) {
+	metrics := &fakeMetrics{series: map[string][]prometheus.Series{
+		"prometheus.runtime.container.cpu.v1": {
+			metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1.5),
+			metricSeries("cgroup-a", "host-b", "raw_cgroup_only", 0.5),
+			metricSeries("cgroup-b", "host-a", "raw_cgroup_only", 0.25),
+		},
+		"prometheus.runtime.container.memory.v1": {
+			metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 4096),
+			metricSeries("cgroup-a", "host-b", "raw_cgroup_only", 1024),
+			metricSeries("cgroup-b", "host-a", "raw_cgroup_only", 2048),
+		},
+		"prometheus.runtime.container.start_time.v1": {
+			metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1793772000),
+			metricSeries("cgroup-a", "host-b", "raw_cgroup_only", 1793772000),
+			metricSeries("cgroup-b", "host-a", "raw_cgroup_only", 1793772060),
+		},
+		"prometheus.runtime.container.oom_events.v1":  {},
+		"prometheus.runtime.host.cpu.v1":              {hostSeries("host-a", 2.5)},
+		"prometheus.runtime.host.memory_available.v1": {hostSeries("host-a", 8192)},
+		"prometheus.runtime.host.load.v1":             {hostSeries("host-a", 0.5)},
+	}}
+	collector, err := NewCollector(metrics, &fakeLogs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validRequest(nil)
+	request.MappingVersion = 7
+	request.ContainerMappings = []datasource.RuntimeContainerMapping{
+		{HostID: "host-a", CgroupID: "cgroup-a"},
+		{HostID: "host-b", CgroupID: "cgroup-a"},
+	}
+	result, err := collector.Query(context.Background(), Target{}, request)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if result.MappingVersion != 7 || len(result.Containers) != 2 {
+		t.Fatalf("mapping version or instances = version %d, containers %+v", result.MappingVersion, result.Containers)
+	}
+	var mapped, unmapped *Container
+	for index := range result.Containers {
+		container := &result.Containers[index]
+		if container.MappingStatus == "explicit_mapping" {
+			mapped = container
+		} else {
+			unmapped = container
+		}
+	}
+	if mapped == nil || mapped.Service != "checkout-api" || mapped.ID == "cgroup-a" || mapped.MappingVersion != 7 {
+		t.Fatalf("exact mapping not recorded: %+v", mapped)
+	}
+	if unmapped == nil || unmapped.Service != "" || unmapped.MappingStatus != "raw_cgroup_only" {
+		t.Fatalf("unmapped cgroup was attributed: %+v", unmapped)
+	}
+	if !result.Partial || !containsGap(result.Gaps, "container_service_mapping_unavailable") {
+		t.Fatalf("unmapped evidence gap missing: %+v", result)
+	}
+}
+
+func TestQueryDoesNotReportServiceMappingGapWhenAllContainersAreExplicitlyMapped(t *testing.T) {
+	metrics := &fakeMetrics{series: map[string][]prometheus.Series{
+		"prometheus.runtime.container.cpu.v1":         {metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1)},
+		"prometheus.runtime.container.memory.v1":      {metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1024)},
+		"prometheus.runtime.container.start_time.v1":  {metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1793772000)},
+		"prometheus.runtime.container.oom_events.v1":  {},
+		"prometheus.runtime.host.cpu.v1":              {hostSeries("host-a", 2.5)},
+		"prometheus.runtime.host.memory_available.v1": {hostSeries("host-a", 8192)},
+		"prometheus.runtime.host.load.v1":             {hostSeries("host-a", 0.5)},
+	}}
+	collector, err := NewCollector(metrics, &fakeLogs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validRequest(nil)
+	request.MappingVersion = 2
+	request.ContainerMappings = []datasource.RuntimeContainerMapping{{HostID: "host-a", CgroupID: "cgroup-a"}}
+	result, err := collector.Query(context.Background(), Target{}, request)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(result.Containers) != 1 || result.Containers[0].MappingStatus != "explicit_mapping" || containsGap(result.Gaps, "container_service_mapping_unavailable") {
+		t.Fatalf("mapped result still reports missing mapping: %+v", result)
+	}
+}
+
+func TestQueryRejectsContainerMappingWithoutVersionBeforeSourceCalls(t *testing.T) {
+	metrics := &fakeMetrics{}
+	logs := &fakeLogs{}
+	collector, err := NewCollector(metrics, logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validRequest(nil)
+	request.ContainerMappings = []datasource.RuntimeContainerMapping{{HostID: "host-a", CgroupID: "cgroup-a"}}
+	if _, err := collector.Query(context.Background(), Target{}, request); !errors.Is(err, ErrInvalidQuery) {
+		t.Fatalf("error = %v, want ErrInvalidQuery", err)
+	}
+	if metrics.calls != 0 || logs.calls != 0 {
+		t.Fatalf("invalid mapping reached sources: metrics=%d logs=%d", metrics.calls, logs.calls)
+	}
+}
+
+func TestQueryAllowsVersionedRuntimeMappingWithoutContainerBindings(t *testing.T) {
+	metrics := &fakeMetrics{series: map[string][]prometheus.Series{
+		"prometheus.runtime.container.cpu.v1":         {metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1)},
+		"prometheus.runtime.container.memory.v1":      {metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1024)},
+		"prometheus.runtime.container.start_time.v1":  {metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1793772000)},
+		"prometheus.runtime.container.oom_events.v1":  {},
+		"prometheus.runtime.host.cpu.v1":              {hostSeries("host-a", 2.5)},
+		"prometheus.runtime.host.memory_available.v1": {hostSeries("host-a", 8192)},
+		"prometheus.runtime.host.load.v1":             {hostSeries("host-a", 0.5)},
+	}}
+	collector, err := NewCollector(metrics, &fakeLogs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validRequest(nil)
+	request.MappingVersion = 3
+	result, err := collector.Query(context.Background(), Target{}, request)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if result.MappingVersion != 3 || len(result.Containers) != 1 || result.Containers[0].MappingStatus != "raw_cgroup_only" || result.Containers[0].Service != "" {
+		t.Fatalf("unconfigured container mapping should remain raw: %+v", result)
+	}
+	if !containsGap(result.Gaps, "container_service_mapping_unavailable") {
+		t.Fatalf("missing mapping gap absent: %+v", result.Gaps)
+	}
+}
+
 func TestQueryRejectsInvalidWindowBeforeSourceCalls(t *testing.T) {
 	metrics := &fakeMetrics{}
 	logs := &fakeLogs{}
@@ -266,6 +396,46 @@ func TestQueryNeverJoinsLogContainerIDToRawCgroup(t *testing.T) {
 	}
 	if len(result.Events) != 1 || result.Events[0].ContainerID != "" || !containsGap(result.Gaps, "container_lifecycle_events_unverified") {
 		t.Fatalf("log match was falsely correlated: %+v", result)
+	}
+}
+
+func TestQueryCorrelatesLifecycleEventOnlyByExplicitCgroupMapping(t *testing.T) {
+	logs := &fakeLogs{entries: []loki.Entry{
+		{Labels: map[string]string{"host_id": "host-a", "service": "checkout-api", "env": "prod", "cgroup_id": "cgroup-a"}},
+		{Labels: map[string]string{"host_id": "host-a", "service": "checkout-api", "env": "prod", "cgroup_id": "cgroup-b"}},
+		{Labels: map[string]string{"host_id": "host-a", "service": "checkout-api", "env": "prod", "container_id": "cgroup-a"}},
+		{Labels: map[string]string{"host_id": "host-b", "service": "checkout-api", "env": "prod", "cgroup_id": "cgroup-a"}},
+		{Labels: map[string]string{"host_id": "host-a", "service": "other-service", "env": "prod", "cgroup_id": "cgroup-a"}},
+	}}
+	metrics := &fakeMetrics{series: map[string][]prometheus.Series{
+		"prometheus.runtime.container.cpu.v1": {metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1)},
+	}}
+	collector, _ := NewCollector(metrics, logs)
+	result, err := collector.Query(context.Background(), Target{}, validRequest(func(request *Request) {
+		request.MappingVersion = 7
+		request.ContainerMappings = []datasource.RuntimeContainerMapping{
+			{HostID: "host-a", CgroupID: "cgroup-a"},
+			{HostID: "host-a", CgroupID: "cgroup-b"},
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 3 {
+		t.Fatalf("events = %+v", result.Events)
+	}
+	if result.Events[0].ContainerID != result.Containers[0].ID || result.Events[0].MappingVersion != 7 || result.Events[0].Classification != "unverified_log_match" {
+		t.Fatalf("exact mapped event correlation = %+v", result.Events[0])
+	}
+	for _, event := range result.Events[1:] {
+		if event.ContainerID != "" || event.MappingVersion != 0 {
+			t.Fatalf("unmapped log labels were correlated: %+v", event)
+		}
+	}
+	for _, event := range result.Events {
+		if event.ContainerID == "cgroup-a" || event.ContainerID == "cgroup-b" {
+			t.Fatalf("raw cgroup identifier escaped in event: %+v", event)
+		}
 	}
 }
 
