@@ -399,6 +399,46 @@ func TestQueryNeverJoinsLogContainerIDToRawCgroup(t *testing.T) {
 	}
 }
 
+func TestQueryCorrelatesLifecycleEventOnlyByExplicitCgroupMapping(t *testing.T) {
+	logs := &fakeLogs{entries: []loki.Entry{
+		{Labels: map[string]string{"host_id": "host-a", "service": "checkout-api", "env": "prod", "cgroup_id": "cgroup-a"}},
+		{Labels: map[string]string{"host_id": "host-a", "service": "checkout-api", "env": "prod", "cgroup_id": "cgroup-b"}},
+		{Labels: map[string]string{"host_id": "host-a", "service": "checkout-api", "env": "prod", "container_id": "cgroup-a"}},
+		{Labels: map[string]string{"host_id": "host-b", "service": "checkout-api", "env": "prod", "cgroup_id": "cgroup-a"}},
+		{Labels: map[string]string{"host_id": "host-a", "service": "other-service", "env": "prod", "cgroup_id": "cgroup-a"}},
+	}}
+	metrics := &fakeMetrics{series: map[string][]prometheus.Series{
+		"prometheus.runtime.container.cpu.v1": {metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1)},
+	}}
+	collector, _ := NewCollector(metrics, logs)
+	result, err := collector.Query(context.Background(), Target{}, validRequest(func(request *Request) {
+		request.MappingVersion = 7
+		request.ContainerMappings = []datasource.RuntimeContainerMapping{
+			{HostID: "host-a", CgroupID: "cgroup-a"},
+			{HostID: "host-a", CgroupID: "cgroup-b"},
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 3 {
+		t.Fatalf("events = %+v", result.Events)
+	}
+	if result.Events[0].ContainerID != result.Containers[0].ID || result.Events[0].MappingVersion != 7 || result.Events[0].Classification != "unverified_log_match" {
+		t.Fatalf("exact mapped event correlation = %+v", result.Events[0])
+	}
+	for _, event := range result.Events[1:] {
+		if event.ContainerID != "" || event.MappingVersion != 0 {
+			t.Fatalf("unmapped log labels were correlated: %+v", event)
+		}
+	}
+	for _, event := range result.Events {
+		if event.ContainerID == "cgroup-a" || event.ContainerID == "cgroup-b" {
+			t.Fatalf("raw cgroup identifier escaped in event: %+v", event)
+		}
+	}
+}
+
 func TestQueryIdentitiesIncludeHostAndAmbiguousStartDoesNotInventInstance(t *testing.T) {
 	var ids []string
 	for _, host := range []string{"host-a", "host-b"} {

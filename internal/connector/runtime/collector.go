@@ -108,6 +108,7 @@ type Container struct {
 type Event struct {
 	Timestamp         time.Time            `json:"timestamp"`
 	ContainerID       string               `json:"container_id,omitempty"`
+	MappingVersion    int                  `json:"mapping_version,omitempty"`
 	Classification    string               `json:"classification"`
 	OutsideTimeWindow bool                 `json:"outside_time_window,omitempty"`
 	SourceReference   string               `json:"source_reference,omitempty"`
@@ -233,7 +234,7 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 		result.Partial = true
 		result.Gaps = append(result.Gaps, "container_lifecycle_events_unavailable")
 	} else {
-		result.Events = normalizeEvents(logResult, request)
+		result.Events = normalizeEvents(logResult, request, result.Containers)
 		result.Partial = true
 		result.Gaps = append(result.Gaps, "container_lifecycle_events_unverified")
 		if logResult.Partial || logResult.TimeSkew || logResult.Empty {
@@ -533,8 +534,18 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 	return ordered
 }
 
-func normalizeEvents(result loki.Result, request Request) []Event {
+func normalizeEvents(result loki.Result, request Request, containers []Container) []Event {
 	events := make([]Event, 0, min(len(result.Entries), request.MaxLogLines))
+	explicitMappings := make(map[string]struct{}, len(request.ContainerMappings))
+	for _, mapping := range request.ContainerMappings {
+		explicitMappings[mapping.HostID+"\x00"+mapping.CgroupID] = struct{}{}
+	}
+	returnedContainers := make(map[string]struct{}, len(containers))
+	for _, container := range containers {
+		if container.MappingStatus == "explicit_mapping" && container.MappingVersion == request.MappingVersion {
+			returnedContainers[container.ID] = struct{}{}
+		}
+	}
 	for _, entry := range result.Entries {
 		hostID, legacyHost := entry.Labels["host_id"], entry.Labels["host"]
 		if hostID != "" && legacyHost != "" && hostID != legacyHost {
@@ -549,11 +560,21 @@ func normalizeEvents(result loki.Result, request Request) []Event {
 		if len(events) >= request.MaxLogLines {
 			break
 		}
-		events = append(events, Event{
+		event := Event{
 			Timestamp:      entry.Timestamp.UTC(),
 			Classification: "unverified_log_match", SourceReference: result.SourceReference,
 			OutsideTimeWindow: entry.OutsideTimeWindow || entry.Timestamp.Before(request.Start) || entry.Timestamp.After(request.End), Line: entry.Line,
-		})
+		}
+		if cgroupID := entry.Labels["cgroup_id"]; cgroupID != "" {
+			if _, mapped := explicitMappings[hostID+"\x00"+cgroupID]; mapped {
+				containerID := opaqueIdentity(hostID + "\x00" + cgroupID)
+				if _, returned := returnedContainers[containerID]; returned {
+					event.ContainerID = containerID
+					event.MappingVersion = request.MappingVersion
+				}
+			}
+		}
+		events = append(events, event)
 	}
 	return events
 }

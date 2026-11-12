@@ -81,6 +81,7 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 	for i := range buckets {
 		buckets[i] = []runtimeMeasurementObservation{}
 	}
+	explicitlyMappedContainers := make(map[string]struct{}, len(result.Containers))
 	for _, host := range result.Hosts {
 		if host.HostID != result.HostID {
 			return nil, ErrInvalidInput
@@ -98,6 +99,7 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 			if result.MappingVersion < 1 || container.MappingVersion != result.MappingVersion || container.Service != result.Service {
 				return nil, ErrInvalidInput
 			}
+			explicitlyMappedContainers[container.ID] = struct{}{}
 		case "raw_cgroup_only":
 			if container.MappingVersion != 0 || container.Service != "" {
 				return nil, ErrInvalidInput
@@ -144,8 +146,17 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 			origin, prefix, basis = SourceLoki, "loki:", "unverified_log_time"
 			for _, event := range result.Events {
 				if event.Timestamp.IsZero() || event.Line.Trust != "untrusted_data" || event.Line.Source != "loki" ||
-					event.Classification != "unverified_log_match" || event.ContainerID != "" || strings.TrimSpace(event.SourceReference) == "" ||
+					event.Classification != "unverified_log_match" || strings.TrimSpace(event.SourceReference) == "" ||
 					!mergeRuntimeReference(&reference, event.SourceReference) {
+					return nil, ErrInvalidInput
+				}
+				if event.ContainerID == "" {
+					if event.MappingVersion != 0 {
+						return nil, ErrInvalidInput
+					}
+				} else if event.MappingVersion != result.MappingVersion || result.MappingVersion < 1 {
+					return nil, ErrInvalidInput
+				} else if _, mapped := explicitlyMappedContainers[event.ContainerID]; !mapped {
 					return nil, ErrInvalidInput
 				}
 				event.Timestamp = event.Timestamp.UTC()
