@@ -48,11 +48,12 @@ type runtimeMeasurementObservation struct {
 }
 
 type runtimeValueSummary struct {
-	Measurements             []runtimeMeasurementObservation `json:"measurements"`
-	Events                   []runtimeconnector.Event        `json:"events"`
-	Gaps                     []string                        `json:"gaps"`
-	Partial                  bool                            `json:"partial"`
-	SourceReferenceAvailable bool                            `json:"source_reference_available"`
+	OOMWindowObservations    []runtimeconnector.OOMWindowObservation `json:"oom_window_observations,omitempty"`
+	Measurements             []runtimeMeasurementObservation         `json:"measurements"`
+	Events                   []runtimeconnector.Event                `json:"events"`
+	Gaps                     []string                                `json:"gaps"`
+	Partial                  bool                                    `json:"partial"`
+	SourceReferenceAvailable bool                                    `json:"source_reference_available"`
 }
 
 // FromRuntimeResult emits one record for each of the collector's seven metric
@@ -82,6 +83,7 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 		buckets[i] = []runtimeMeasurementObservation{}
 	}
 	explicitlyMappedContainers := make(map[string]struct{}, len(result.Containers))
+	oomWindows := []runtimeconnector.OOMWindowObservation{}
 	for _, host := range result.Hosts {
 		if host.HostID != result.HostID {
 			return nil, ErrInvalidInput
@@ -107,6 +109,11 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 		default:
 			return nil, ErrInvalidInput
 		}
+		windows, err := canonicalRuntimeOOMWindows(container, result.Start, result.End)
+		if err != nil {
+			return nil, err
+		}
+		oomWindows = append(oomWindows, windows...)
 		for i, measurement := range []runtimeconnector.Measurement{container.CPU, container.Memory, container.OOMEvents, container.StartEvidence} {
 			observation := runtimeMeasurementObservation{EntityType: "CONTAINER", EntityID: container.ID, HostID: container.HostID,
 				InstanceID: container.InstanceID, Service: container.Service, MappingStatus: container.MappingStatus,
@@ -118,11 +125,17 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 			buckets[i+3] = append(buckets[i+3], observation)
 		}
 	}
+	if err := sortRuntimeObservations(oomWindows); err != nil {
+		return nil, err
+	}
 	gaps := append([]string{}, result.Gaps...)
 	sort.Strings(gaps)
 	records := make([]Record, 0, len(templates))
 	for i, template := range templates {
 		summary := runtimeValueSummary{Measurements: buckets[i], Events: []runtimeconnector.Event{}, Gaps: gaps, Partial: result.Partial}
+		if template == "prometheus.runtime.container.oom_events.v1" {
+			summary.OOMWindowObservations = oomWindows
+		}
 		partial := result.Partial || len(gaps) > 0
 		hasData, hasEmpty := false, false
 		reference := ""
