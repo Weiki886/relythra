@@ -88,6 +88,19 @@ func (repository *Postgres) PersistGrafanaAlertEvidence(ctx context.Context, ale
 		return Evidence{}, false, fmt.Errorf("begin Grafana evidence: %w", err)
 	}
 	defer tx.Rollback()
+	item, created, err := persistGrafanaAlertEvidence(ctx, tx, alertID, meta, filter)
+	if err != nil {
+		return Evidence{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Evidence{}, false, fmt.Errorf("commit Grafana evidence: %w", err)
+	}
+	return item, created, nil
+}
+
+// persistGrafanaAlertEvidence shares ownership validation with ingestion and remapping.
+// The caller owns the transaction so alert changes and evidence commit together.
+func persistGrafanaAlertEvidence(ctx context.Context, tx *sql.Tx, alertID string, meta GrafanaAlertEvidenceContext, filter *redact.Filter) (Evidence, bool, error) {
 	// Use the ingestion lock order: alert first, then its incident/investigation.
 	// Shared locks keep the facts and their ownership stable until persistence commits.
 	alert, err := scanAlert(tx.QueryRowContext(ctx, `SELECT `+alertColumns+` FROM alerts WHERE id=$1 FOR SHARE`, alertID))
@@ -123,9 +136,6 @@ func (repository *Postgres) PersistGrafanaAlertEvidence(ctx context.Context, ale
 	item, created, err := persistValidatedEvidence(ctx, tx, record)
 	if err != nil {
 		return Evidence{}, false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return Evidence{}, false, fmt.Errorf("commit Grafana evidence: %w", err)
 	}
 	return item, created, nil
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Weiki886/relythra/internal/security/audit"
+	"github.com/Weiki886/relythra/internal/security/redact"
 	"github.com/Weiki886/relythra/internal/security/secrets"
 	"github.com/Weiki886/relythra/internal/store"
 )
@@ -37,6 +38,7 @@ type fakeDeploymentRepository struct {
 	claimed          map[string]bool
 	claimCalls       int
 	grafanaInputs    []store.GrafanaAlertInput
+	grafanaFilter    *redact.Filter
 	grafanaRequestID string
 	grafanaResults   []store.GrafanaAlertResult
 }
@@ -45,7 +47,9 @@ func (repository *fakeDeploymentRepository) IngestGrafanaAlerts(
 	_ context.Context,
 	inputs []store.GrafanaAlertInput,
 	requestID string,
+	filter *redact.Filter,
 ) ([]store.GrafanaAlertResult, error) {
+	repository.grafanaFilter = filter
 	repository.grafanaInputs = inputs
 	repository.grafanaRequestID = requestID
 	return repository.grafanaResults, repository.err
@@ -57,7 +61,9 @@ func (repository *fakeDeploymentRepository) RemapGrafanaAlert(
 	expectedVersion int64,
 	serviceID string,
 	environment string,
+	filter *redact.Filter,
 ) (store.GrafanaAlertResult, error) {
+	repository.grafanaFilter = filter
 	return store.GrafanaAlertResult{
 		Alert:      store.Alert{ID: alertID, EventVersion: expectedVersion + 1},
 		IncidentID: "incident-id", MatchState: "MATCHED",
@@ -298,6 +304,7 @@ func newDeploymentTestHandler(
 	repository *fakeDeploymentRepository,
 	webhookSecret string,
 	recorder *capturingAuditRecorder,
+	filters ...*redact.Filter,
 ) http.Handler {
 	t.Helper()
 	var secret secrets.Secret
@@ -317,7 +324,7 @@ func newDeploymentTestHandler(
 		DeploymentWebhookSource: "github-actions",
 		GrafanaWebhookSecret:    secret,
 		ManagementActor:         "local-operator",
-	}, discardLogger())
+	}, discardLogger(), filters...)
 }
 
 func validDeploymentRequestBody() string {

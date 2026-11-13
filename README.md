@@ -31,7 +31,7 @@ Relythra 是一个面向发布后异常排查的只读诊断系统：关联发�
 
 `GET /api/v1/investigations/{id}/timeline` 返回该 Investigation 已持久化的 Evidence，支持 `source_type`、`entity_id`、`completeness`、`stance`、`limit` 和 `offset`。`stance=SUPPORTS` 或 `stance=CONTRADICTS` 筛选与该调查中任意假设存在对应立场关联的证据；多次关联仅返回一次，当前不支持指定假设筛选。每个时间线项的 `relations` 返回所有关联假设 ID 与立场，包括筛选条件相反的关系；无关系时为空数组。关联本身不代表根因已确定。完整度包括 `COMPLETE`、`PARTIAL`、`MISSING` 和 `EXPIRED`；Evidence 会分别保留 UTC 事件区间、来源原始时间/时区和采集时间，无法追溯的历史记录 `collected_at` 为空；新采集记录还保存经过脱敏的查询文本、参数快照与来源引用。默认 `limit=50`，最大 `100`，`offset` 最大 `10000`；按事件开始/结束时间及来源、实体、内容摘要和 ID 稳定排序，计数与当前页在同一只读数据库快照中读取。不存在的 Investigation 返回 `404`，存在但没有匹配证据时返回空 `items`。此端点不合成尚未持久化的查询失败或缺口。
 
-时间线支持 `source_type=GRAFANA`。后端提供 `PersistGrafanaAlertEvidence`，将数据库中与调查所属事件关联的规范告警保存为不可变、脱敏的证据快照；持续触发的告警以触发时间为点事件，恢复后追加结束时间已知的区间快照，同一告警的状态快照共享独立性分组。未映射、缺来源引用或恢复时间未知时标记为 `PARTIAL`。此入口尚未接入 Webhook/Worker 自动采集，接收告警不会自动产生这些快照。部署该能力前先执行迁移 `000009`；存在 `GRAFANA` 历史证据时，该迁移拒绝降级以保留数据，回滚应用可以保留扩展后的数据库约束。
+时间线支持 `source_type=GRAFANA`。后端提供 `PersistGrafanaAlertEvidence`，将数据库中与调查所属事件关联的规范告警保存为不可变、脱敏的证据快照；持续触发的告警以触发时间为点事件，恢复后追加结束时间已知的区间快照，同一告警的状态快照共享独立性分组。未映射、缺来源引用或恢复时间未知时标记为 `PARTIAL`。Webhook 接收已映射且关联 Investigation 的告警时会自动采集快照；同批触发/恢复逐项追加，重复投递复用已有证据及采集时间。人工映射 FIRING 告警时同步采集，RESOLVED 只复用已有 Investigation 采集并校验归属；未映射或仅收到恢复消息且没有 Investigation 时不创建证据。快照与告警、事件、调查在同一事务提交，采集失败会回滚整批业务写入或人工映射。该流程尚不启动 Agent 或 Worker 外部查询。部署该能力前先执行迁移 `000009`；存在 `GRAFANA` 历史证据时，该迁移拒绝降级以保留数据，回滚应用可以保留扩展后的数据库约束。
 
 - Worker metrics：<http://127.0.0.1:8081/metrics>
 
@@ -208,6 +208,8 @@ API 不接受原始 PromQL、LogQL、SQL、shell、任意 Header 或任意 HTTP 
 配置专用 `RELYTHRA_GRAFANA_WEBHOOK_SECRET_REF` 后，Grafana 通用 Webhook contact point 向 `POST /api/v1/alerts/grafana` 发送 JSON，并附带 `X-Relythra-Timestamp`、`X-Relythra-Signature` 两个由发送端按 HMAC-SHA256 规则生成的 Header。签名覆盖 Unix 秒时间戳和原始 body，验证窗口为 ±5 分钟；重复签名、超大 body、非法 schema 均在业务写入前拒绝。Webhook 支持最多 100 条 alert，标签、annotation、`values` 数量与字段长度均有限制。告警时间统一按 UTC 比较，同时保留来源 RFC3339 时间文本和时区偏移。
 
 告警通过 `project`、`service`、`env` 标签精确匹配 Project slug、Service slug 和环境。缺少/不匹配 Service 或环境时会记录待映射 Alert/Incident，不猜测服务、不创建 Investigation，也不启动 Agent。缺少有效 Project slug 时返回 `422 needs_mapping`，不写入业务对象。缺失 fingerprint 时使用排序标签和告警开始时间派生版本化 SHA-256 指纹。
+
+已映射并关联 Investigation 的每条输入会在事务内追加 Grafana Evidence 快照，时间线可立即读取；同一批次的 FIRING → RESOLVED 保留两个状态。相同快照重复投递不会新增 Evidence。采集失败时整批业务写入回滚；签名领取仍是独立事务，重试必须生成新的有效签名。已有 Investigation 与新映射冲突时拒绝并回滚，避免移动历史证据。
 
 相同 fingerprint 在 ±5 分钟窗口中复用 Alert、Incident 和 Investigation；每次接收仍会保留一条经过脱敏的 `alert_deliveries`。resolved 通知更新既有 Alert/Incident，不重新开启诊断。人工映射使用 `POST /api/v1/alerts/{id}/remap`，必须提供 `expected_version`、`service_id` 和 `environment`，并写入管理审计。服务名只接受精确 slug，不能按展示名模糊推断。更详细的边界见 [Issue #9 实施计划](docs/plans/issue-9-grafana-webhook.md) 与 [ADR 0008](docs/adr/0008-grafana-alert-ingestion.md)。
 

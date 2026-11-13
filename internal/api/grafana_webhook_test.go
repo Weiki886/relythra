@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Weiki886/relythra/internal/security/audit"
+	"github.com/Weiki886/relythra/internal/security/redact"
 	"github.com/Weiki886/relythra/internal/security/secrets"
 	"github.com/Weiki886/relythra/internal/store"
 )
@@ -78,9 +79,13 @@ func TestGrafanaWebhookRequiresValidSignatureAndRejectsReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	filter, err := redact.NewFilter("configured-ingestion-canary")
+	if err != nil {
+		t.Fatal(err)
+	}
 	handler := NewHandlerWithDependencies(Dependencies{
 		GrafanaWebhookSecret: secret, GrafanaAlerts: repository, AuditRecorder: recorder,
-	}, discardLogger())
+	}, discardLogger(), filter)
 	body := `{"receiver":"relythra","status":"firing","alerts":[{"status":"firing","labels":{"project":"store","service":"checkout-api","env":"prod","alertname":"HighLatency"},"annotations":{"summary":"high"},"startsAt":"2026-11-05T20:00:00.123+08:00"}]}`
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 	signature := SignDeploymentRequest([]byte("grafana-secret"), timestamp, []byte(body))
@@ -109,6 +114,9 @@ func TestGrafanaWebhookRequiresValidSignatureAndRejectsReplay(t *testing.T) {
 		repository.grafanaInputs[0].StartsAt.Format(time.RFC3339Nano) != "2026-11-05T12:00:00.123Z" {
 		t.Fatalf("Grafana source/normalized times = %q / %q / %s", repository.grafanaInputs[0].SourceTimeText,
 			repository.grafanaInputs[0].SourceTimezone, repository.grafanaInputs[0].StartsAt.Format(time.RFC3339Nano))
+	}
+	if repository.grafanaFilter != filter {
+		t.Fatal("configured filter did not reach ingestion")
 	}
 	second := request(signature)
 	assertErrorResponse(t, second, http.StatusConflict, "replayed_signature")
@@ -175,7 +183,11 @@ func TestGrafanaWebhookRejectsNonJSONMediaTypePrefix(t *testing.T) {
 func TestGrafanaAlertManualRemappingRequiresManagementAuthAndExpectedVersion(t *testing.T) {
 	repository := &fakeDeploymentRepository{}
 	recorder := &capturingAuditRecorder{}
-	handler := newDeploymentTestHandler(t, repository, "grafana-secret", recorder)
+	filter, err := redact.NewFilter("configured-remapping-canary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newDeploymentTestHandler(t, repository, "grafana-secret", recorder, filter)
 	body := `{"expected_version":1,"service_id":"` + deploymentServiceID + `","environment":"prod"}`
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/alerts/33333333-3333-4333-8333-333333333333/remap", strings.NewReader(body))
 	request.Header.Set("Authorization", "Bearer management-token")
@@ -184,6 +196,9 @@ func TestGrafanaAlertManualRemappingRequiresManagementAuthAndExpectedVersion(t *
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("remap status = %d: %s", response.Code, response.Body.String())
+	}
+	if repository.grafanaFilter != filter {
+		t.Fatal("configured filter did not reach remapping")
 	}
 	if recorder.eventCount() != 1 || recorder.lastEvent(t).Action != audit.ActionAlertMappingChanged {
 		t.Fatalf("remap audit = %+v", recorder.lastEvent(t))

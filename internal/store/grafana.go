@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Weiki886/relythra/internal/domain"
+	"github.com/Weiki886/relythra/internal/security/redact"
 )
 
 type GrafanaAlertInput struct {
@@ -45,8 +46,8 @@ type GrafanaAlertResult struct {
 
 type GrafanaAlertRepository interface {
 	ClaimDeploymentWebhookSignature(context.Context, []byte, time.Time) (bool, error)
-	IngestGrafanaAlerts(context.Context, []GrafanaAlertInput, string) ([]GrafanaAlertResult, error)
-	RemapGrafanaAlert(context.Context, string, int64, string, string) (GrafanaAlertResult, error)
+	IngestGrafanaAlerts(context.Context, []GrafanaAlertInput, string, *redact.Filter) ([]GrafanaAlertResult, error)
+	RemapGrafanaAlert(context.Context, string, int64, string, string, *redact.Filter) (GrafanaAlertResult, error)
 }
 
 func (repository *Postgres) RemapGrafanaAlert(
@@ -55,7 +56,11 @@ func (repository *Postgres) RemapGrafanaAlert(
 	expectedVersion int64,
 	serviceID string,
 	environment string,
+	filter *redact.Filter,
 ) (GrafanaAlertResult, error) {
+	if filter == nil {
+		return GrafanaAlertResult{}, redact.ErrUnsafeOutput
+	}
 	if !domain.IsID(alertID) || !domain.IsID(serviceID) || expectedVersion < 1 || !validGrafanaEnvironment(environment) {
 		return GrafanaAlertResult{}, ErrInvalidInput
 	}
@@ -136,6 +141,18 @@ func (repository *Postgres) RemapGrafanaAlert(
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM deployment_candidates WHERE incident_id = $1`, incidentID).Scan(&result.DeploymentCount); err != nil {
 			return GrafanaAlertResult{}, fmt.Errorf("count remapped deployment candidates: %w", err)
 		}
+	} else {
+		// Reuse an existing investigation for resolved alerts, but never create one.
+		// Snapshot validation also prevents remapping its historical evidence to another entity.
+		err := tx.QueryRowContext(ctx, `SELECT id::text FROM investigations WHERE incident_id = $1 ORDER BY attempt DESC LIMIT 1`, incidentID).Scan(&result.InvestigationID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return GrafanaAlertResult{}, fmt.Errorf("read resolved Grafana investigation: %w", err)
+		}
+	}
+	if result.InvestigationID != "" {
+		if _, _, err := persistGrafanaAlertEvidence(ctx, tx, result.Alert.ID, GrafanaAlertEvidenceContext{InvestigationID: result.InvestigationID, CollectedAt: time.Now().UTC()}, filter); err != nil {
+			return GrafanaAlertResult{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return GrafanaAlertResult{}, fmt.Errorf("commit Grafana alert remapping: %w", err)
@@ -147,7 +164,11 @@ func (repository *Postgres) IngestGrafanaAlerts(
 	ctx context.Context,
 	inputs []GrafanaAlertInput,
 	requestID string,
+	filter *redact.Filter,
 ) ([]GrafanaAlertResult, error) {
+	if filter == nil {
+		return nil, redact.ErrUnsafeOutput
+	}
 	if len(inputs) == 0 || len(inputs) > 100 || !validRequestID(requestID) {
 		return nil, ErrInvalidInput
 	}
@@ -161,6 +182,12 @@ func (repository *Postgres) IngestGrafanaAlerts(
 		result, err := ingestOneGrafanaAlert(ctx, tx, input, requestID)
 		if err != nil {
 			return nil, err
+		}
+		// Snapshot each item before a later alert in this batch changes its canonical state.
+		if result.InvestigationID != "" {
+			if _, _, err := persistGrafanaAlertEvidence(ctx, tx, result.Alert.ID, GrafanaAlertEvidenceContext{InvestigationID: result.InvestigationID, CollectedAt: time.Now().UTC()}, filter); err != nil {
+				return nil, err
+			}
 		}
 		results = append(results, result)
 	}
