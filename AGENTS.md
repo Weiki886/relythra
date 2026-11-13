@@ -102,7 +102,7 @@ Relythra 面向发布后异常排查，关联发布、代码变更、指标、�
 
 ### Issue
 
-非机械性的新增、修复、重构、测试和基础设施变更必须先有关联 Issue。Issue 标题使用英文，正文可以使用中文，并至少包含：
+非机械性的新增、修复、重构、测试和基础设施变更必须先有关联 Issue。Issue 标题和说明正文必须使用中文，并至少包含：
 
 - 背景、目标、非目标和明确的范围边界。
 - 可验证的验收标准与验证计划。
@@ -115,7 +115,13 @@ Relythra 面向发布后异常排查，关联发布、代码变更、指标、�
 - `standard`：边界清晰、可独立回滚的一般功能或缺陷修复。
 - `high`：涉及凭据、安全、数据迁移、公开 API、基础设施、供应链或较大影响面。
 
-每个 Issue/PR 至少包含一个 `type:*` 标签和一个风险标签，并按影响范围添加适用的 `area:*` 标签。当前类型包括 `type:feature`、`type:test`、`type:infra`、`type:docs`、`type:proposal`；范围包括 backend、frontend、data、connector、agent、infra、security、qa、docs。需要用户或维护者决策时添加 `status:needs-info`。
+每个 Issue/PR 必须同时满足以下标签要求：
+
+- 至少一个 `type:*` 标签、恰好一个风险标签（`low`、`standard`、`high`）和至少一个与实际改动有关的 `area:*` 标签。
+- 复用现有标签，不使用近义标签重复表达同一含义。当前类型包括 `type:feature`、`type:fix`、`type:test`、`type:infra`、`type:docs`、`type:proposal`；范围包括 backend、frontend、data、connector、agent、infra、security、qa、docs、workflow。其中 `type:fix` 用于缺陷修复，`area:workflow` 用于仓库协作与交付流程。
+- 新的工作类别或影响范围确实无法由现有标签表达时，可以创建有明确用途的标签。标签名使用稳定的英文标识，描述使用中文；不得为凑数量添加不相关标签。
+- 正文中列出的标签、风险级别及其依据必须与 GitHub 实际标签一致。PR 按本次实际变更评估风险；若与关联 Issue 不同，在 PR 正文解释范围差异与分级依据，不机械降低风险。
+- 需要用户或维护者决策时添加 `status:needs-info`。
 
 ### 分支与 Commit
 
@@ -128,13 +134,16 @@ Relythra 面向发布后异常排查，关联发布、代码变更、指标、�
 
 ### Pull Request
 
-PR 标题必须使用英文，正文可以使用中文。PR 必须：
+PR 标题必须使用英文，说明正文必须使用中文。Issue/PR 中的产品名称、技术术语、代码标识、文件路径、代码块、命令、原始输出及 GitHub 关联关键字（如 `Closes`、`Refs`）可以保留原文；章节标题、问题说明和验收描述使用中文。分支名和 Commit 标题继续使用英文。
 
-- 与关联 Issue 的范围一致，并在正文使用 `Closes #<issue>`。
+PR 必须：
+
+- 明确本次交付的范围与关联 Issue。满足该 Issue 全部验收标准时使用 `Closes #<issue>`；部分交付使用 `Refs #<issue>`，写明本次完成项与剩余验收范围，保留 Issue 开放。不得用关闭关键字提前关闭未完成的 Issue。
 - 说明问题、关键改动、范围与风险、兼容性、验证证据、部署影响和回滚方式。
 - 链接或说明需要 Reviewer 重点检查的边界与未覆盖项。
-- 同步 Issue 的 Milestone、类型、风险和范围标签。
+- 沿用关联 Issue 的适用里程碑，并按实际范围设置类型、风险和范围标签。跨里程碑的仓库维护任务可以不设置里程碑，但需写明原因。
 - 保持小而可审；出现无关改动时先拆分。
+- 创建或修改 Issue/PR 后、最终交付前，回读 GitHub 远端的标题、正文、标签、里程碑和关联关系，核对语言、标签完整性、正文与风险的一致性，以及 `Closes`/`Refs` 的使用。批量修正历史内容时保留修改前清单，不改变验收事实、未完成项或合并状态。
 
 合并门禁：
 
