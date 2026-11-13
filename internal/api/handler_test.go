@@ -420,3 +420,12 @@ func assertErrorResponse(
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
+
+func TestInvestigationTimelineAllowsGrafanaSource(t *testing.T) {
+	const id = "44444444-4444-4444-8444-444444444444"
+	reader := &fakeReader{timeline: store.InvestigationTimeline{InvestigationID: id}}
+	response := serve(NewHandler(reader, discardLogger()), http.MethodGet, "/api/v1/investigations/"+id+"/timeline?source_type=GRAFANA")
+	if response.Code != http.StatusOK || reader.calls != 1 || reader.filter.SourceType != "GRAFANA" {
+		t.Fatalf("status=%d filter=%+v calls=%d body=%s", response.Code, reader.filter, reader.calls, response.Body.String())
+	}
+}
