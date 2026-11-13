@@ -87,22 +87,23 @@ type Host struct {
 }
 
 type Container struct {
-	ID               string      `json:"id"`
-	InstanceID       string      `json:"instance_id"`
-	HostID           string      `json:"host_id"`
-	Service          string      `json:"service,omitempty"`
-	MappingStatus    string      `json:"mapping_status"`
-	MappingVersion   int         `json:"mapping_version,omitempty"`
-	StartTime        *time.Time  `json:"start_time,omitempty"`
-	StartEvidence    Measurement `json:"start_evidence"`
-	CPU              Measurement `json:"cpu"`
-	Memory           Measurement `json:"memory"`
-	OOMEvents        Measurement `json:"oom_events"`
-	LastObservedAt   *time.Time  `json:"last_observed_at,omitempty"`
-	Stale            bool        `json:"stale"`
-	ClockSkew        bool        `json:"clock_skew"`
-	State            string      `json:"state"`
-	PeerContainerIDs []string    `json:"peer_container_ids"`
+	ID                    string                 `json:"id"`
+	InstanceID            string                 `json:"instance_id"`
+	HostID                string                 `json:"host_id"`
+	Service               string                 `json:"service,omitempty"`
+	MappingStatus         string                 `json:"mapping_status"`
+	MappingVersion        int                    `json:"mapping_version,omitempty"`
+	StartTime             *time.Time             `json:"start_time,omitempty"`
+	StartEvidence         Measurement            `json:"start_evidence"`
+	CPU                   Measurement            `json:"cpu"`
+	Memory                Measurement            `json:"memory"`
+	OOMEvents             Measurement            `json:"oom_events"`
+	OOMWindowObservations []OOMWindowObservation `json:"oom_window_observations"`
+	LastObservedAt        *time.Time             `json:"last_observed_at,omitempty"`
+	Stale                 bool                   `json:"stale"`
+	ClockSkew             bool                   `json:"clock_skew"`
+	State                 string                 `json:"state"`
+	PeerContainerIDs      []string               `json:"peer_container_ids"`
 }
 
 type Event struct {
@@ -497,6 +498,7 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 	}
 	ordered := make([]Container, 0, len(containers))
 	for _, container := range containers {
+		container.OOMWindowObservations = summarizeOOMWindows(*container, request, result)
 		if container.CPU.Empty {
 			result.Gaps = append(result.Gaps, "container_cpu_metrics_missing")
 			result.Partial = true
