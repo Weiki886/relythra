@@ -30,6 +30,9 @@ Relythra 是一个面向发布后异常排查的只读诊断系统：关联发�
 - API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/deployments/{id}`
 
 `GET /api/v1/investigations/{id}/timeline` 返回该 Investigation 已持久化的 Evidence，支持 `source_type`、`entity_id`、`completeness`、`stance`、`limit` 和 `offset`。`stance=SUPPORTS` 或 `stance=CONTRADICTS` 筛选与该调查中任意假设存在对应立场关联的证据；多次关联仅返回一次，当前不支持指定假设筛选。每个时间线项的 `relations` 返回所有关联假设 ID 与立场，包括筛选条件相反的关系；无关系时为空数组。关联本身不代表根因已确定。完整度包括 `COMPLETE`、`PARTIAL`、`MISSING` 和 `EXPIRED`；Evidence 会分别保留 UTC 事件区间、来源原始时间/时区和采集时间，无法追溯的历史记录 `collected_at` 为空；新采集记录还保存经过脱敏的查询文本、参数快照与来源引用。默认 `limit=50`，最大 `100`，`offset` 最大 `10000`；按事件开始/结束时间及来源、实体、内容摘要和 ID 稳定排序，计数与当前页在同一只读数据库快照中读取。不存在的 Investigation 返回 `404`，存在但没有匹配证据时返回空 `items`。此端点不合成尚未持久化的查询失败或缺口。
+
+时间线支持 `source_type=GRAFANA`。后端提供 `PersistGrafanaAlertEvidence`，将数据库中与调查所属事件关联的规范告警保存为不可变、脱敏的证据快照；持续触发的告警以触发时间为点事件，恢复后追加结束时间已知的区间快照，同一告警的状态快照共享独立性分组。未映射、缺来源引用或恢复时间未知时标记为 `PARTIAL`。此入口尚未接入 Webhook/Worker 自动采集，接收告警不会自动产生这些快照。部署该能力前先执行迁移 `000009`；存在 `GRAFANA` 历史证据时，该迁移拒绝降级以保留数据，回滚应用可以保留扩展后的数据库约束。
+
 - Worker metrics：<http://127.0.0.1:8081/metrics>
 
 按 `Ctrl+C` 会停止脚本启动的全部进程。默认连接 `postgres://$USER@127.0.0.1:5432/relythra?sslmode=disable`。连接凭据也可以从绝对路径文件注入，避免把密码写进仓库或命令行：

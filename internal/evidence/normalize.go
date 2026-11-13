@@ -18,6 +18,7 @@ import (
 
 const (
 	SourceDeployment     = "DEPLOYMENT"
+	SourceGrafana        = "GRAFANA"
 	SourceGitHub         = "GITHUB"
 	SourcePrometheus     = "PROMETHEUS"
 	SourceLoki           = "LOKI"
@@ -273,7 +274,7 @@ func contentHash(record Record) (string, error) {
 
 func validSource(source string) bool {
 	switch source {
-	case SourceDeployment, SourceGitHub, SourcePrometheus, SourceLoki, SourceRuntime, SourceMapping, SourceSystem:
+	case SourceDeployment, SourceGrafana, SourceGitHub, SourcePrometheus, SourceLoki, SourceRuntime, SourceMapping, SourceSystem:
 		return true
 	default:
 		return false

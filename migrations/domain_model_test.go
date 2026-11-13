@@ -69,6 +69,11 @@ func TestDomainSchemaMigratesAndRollsBack(t *testing.T) {
 	assertGrafanaAlertIngestionSchema(t, ctx, db, schema)
 	assertEvidenceObservationSchema(t, ctx, db, schema)
 
+	assertGrafanaEvidenceSource(t, ctx, db, true)
+	if err := goose.DownContext(ctx, db, "."); err != nil {
+		t.Fatalf("roll back Grafana Evidence source migration: %v", err)
+	}
+	assertGrafanaEvidenceSource(t, ctx, db, false)
 	if err := goose.DownContext(ctx, db, "."); err != nil {
 		t.Fatalf("roll back Evidence observation metadata migration: %v", err)
 	}
@@ -172,6 +177,11 @@ func TestDomainSchemaMigratesAndRollsBack(t *testing.T) {
 	assertDomainConstraints(t, ctx, db, fixture)
 	var count int
 
+	assertGrafanaEvidenceSource(t, ctx, db, true)
+	if err := goose.DownContext(ctx, db, "."); err != nil {
+		t.Fatalf("roll back Grafana Evidence source migration: %v", err)
+	}
+	assertGrafanaEvidenceSource(t, ctx, db, false)
 	if err := goose.DownContext(ctx, db, "."); err != nil {
 		t.Fatalf("roll back Evidence observation metadata migration: %v", err)
 	}
@@ -722,5 +732,16 @@ func assertStatementRejected(
 	t.Helper()
 	if _, err := db.ExecContext(ctx, statement, args...); err == nil {
 		t.Fatalf("%s was accepted", label)
+	}
+}
+
+func assertGrafanaEvidenceSource(t *testing.T, ctx context.Context, db *sql.DB, want bool) {
+	t.Helper()
+	var definition string
+	if err := db.QueryRowContext(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='evidence'::regclass AND conname='evidence_source_type_check'`).Scan(&definition); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(definition, "GRAFANA") != want {
+		t.Fatalf("GRAFANA allowed=%v want=%v: %s", !want, want, definition)
 	}
 }

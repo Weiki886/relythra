@@ -172,7 +172,7 @@ func loadTimelineEvidenceRelations(
 func ValidateInvestigationTimelineFilter(filter InvestigationTimelineFilter) error {
 	if filter.SourceType != "" {
 		switch filter.SourceType {
-		case "DEPLOYMENT", "GITHUB", "PROMETHEUS", "LOKI", "RUNTIME", "MAPPING", "SYSTEM":
+		case "DEPLOYMENT", "GRAFANA", "GITHUB", "PROMETHEUS", "LOKI", "RUNTIME", "MAPPING", "SYSTEM":
 		default:
 			return fmt.Errorf("%w: invalid timeline source type", ErrInvalidInput)
 		}
