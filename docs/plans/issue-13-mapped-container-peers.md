@@ -34,4 +34,5 @@
 - `gitleaks detect --source . --no-git --redact`：未发现泄漏；`git diff --check`：通过。
 - `make fmt-check vet test build web-check case-check dev-script-check`：通过；Web Vitest 1 个文件、3 个测试通过。
 - 本次风险自查：分组规模受映射上限 1000 限制；每个副本比较同组候选并排序，最多约一百万次 ID 比较。只增添候选身份关系，不生成任何健康、事件或根因结论。
-- 最终远程 CI 在 PR 创建后回填；Compose 配置与 smoke 仍依赖远程 CI 验证。
+- PR #66 初始 HEAD `6609deff69fac17cc0d483efabcae7d42fe9e90c` 的远程 CI run `43609292843`：Backend、Frontend、Compose smoke 全部通过；Compose smoke 的配置/迁移/服务探测及 demo workload/telemetry/isolation 步骤均通过。
+- 本地 `compose-config` 仍因本机 Docker CLI 不支持 `docker compose --file` 未通过；远程 Compose CI 已验证仓库 Compose 和 smoke 工作流。
