@@ -496,6 +496,7 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 			}
 		}
 	}
+	linkMappedContainerPeers(containers)
 	ordered := make([]Container, 0, len(containers))
 	for _, container := range containers {
 		container.OOMWindowObservations = summarizeOOMWindows(*container, request, result)
@@ -534,6 +535,37 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 	}
 	sort.Slice(ordered, func(left, right int) bool { return ordered[left].ID < ordered[right].ID })
 	return ordered
+}
+
+func linkMappedContainerPeers(containers map[string]*Container) {
+	type peerGroupKey struct {
+		hostID         string
+		service        string
+		mappingVersion int
+	}
+	groups := make(map[peerGroupKey][]*Container)
+	for _, container := range containers {
+		if container.MappingStatus != "explicit_mapping" || container.Service == "" || container.MappingVersion < 1 {
+			continue
+		}
+		key := peerGroupKey{hostID: container.HostID, service: container.Service, mappingVersion: container.MappingVersion}
+		groups[key] = append(groups[key], container)
+	}
+	for _, group := range groups {
+		if len(group) < 2 {
+			continue
+		}
+		for _, container := range group {
+			peers := make([]string, 0, len(group)-1)
+			for _, candidate := range group {
+				if candidate.ID != container.ID {
+					peers = append(peers, candidate.ID)
+				}
+			}
+			sort.Strings(peers)
+			container.PeerContainerIDs = peers
+		}
+	}
 }
 
 func normalizeEvents(result loki.Result, request Request, containers []Container) []Event {
