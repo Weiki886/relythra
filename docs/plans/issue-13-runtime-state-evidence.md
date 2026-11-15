@@ -33,4 +33,4 @@
 - `make fmt-check vet test build web-check case-check dev-script-check`：通过，包含 Go、前端 lint/typecheck/Vitest/生产构建、评测用例和本地启动脚本检查。
 - `gitleaks detect --source . --no-git --redact` 与 `git diff --check`：通过。
 - `make check` 在最后的 `compose-config` 阶段失败：本机 Docker CLI 没有 Compose 子命令，且未安装 `docker-compose`。因此本地 Compose 配置/启动未验证；由 PR 最终 HEAD 的必需 CI 单独验证。
-- 首轮 PR Backend CI 暴露 `internal/store/runtime_oom_test.go` 的手工结果夹具缺少 Container `State`；已将空 CPU/Memory 夹具标记为 `unknown`，等待更新 HEAD 的 CI 回归确认。该本地数据库集成测试因未配置 `RELYTHRA_TEST_DATABASE_URL` 无法在本机完整执行。
+- 首轮 PR Backend CI 暴露 `internal/store/runtime_oom_test.go` 的手工结果夹具缺少 Container `State`；已将空 CPU/Memory 夹具标记为 `unknown`。本地未配置 `RELYTHRA_TEST_DATABASE_URL`，因此由远端 CI 验证该数据库集成测试；修正后 Backend、Frontend、Compose smoke 均通过。
