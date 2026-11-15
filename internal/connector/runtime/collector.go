@@ -217,6 +217,9 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 		result.Containers = result.Containers[:request.MaxSeries]
 		result.Gaps = append(result.Gaps, "runtime_entities_truncated")
 		result.Partial = true
+		if prunePeerContainerIDs(result.Containers) {
+			result.Gaps = append(result.Gaps, "runtime_peer_links_truncated")
+		}
 	}
 	if len(result.Hosts) > request.MaxSeries {
 		result.Hosts = result.Hosts[:request.MaxSeries]
@@ -270,6 +273,26 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 	result.Gaps = compactGaps(result.Gaps)
 	result.Duration = time.Since(started)
 	return result, nil
+}
+
+func prunePeerContainerIDs(containers []Container) bool {
+	returned := make(map[string]struct{}, len(containers))
+	for _, container := range containers {
+		returned[container.ID] = struct{}{}
+	}
+	pruned := false
+	for index := range containers {
+		peers := containers[index].PeerContainerIDs[:0]
+		for _, peerID := range containers[index].PeerContainerIDs {
+			if _, exists := returned[peerID]; !exists || peerID == containers[index].ID {
+				pruned = true
+				continue
+			}
+			peers = append(peers, peerID)
+		}
+		containers[index].PeerContainerIDs = peers
+	}
+	return pruned
 }
 
 type metricTemplate struct{ id, gap string }

@@ -148,6 +148,54 @@ func TestQueryLinksOnlyExplicitlyMappedContainersAsPeers(t *testing.T) {
 	}
 }
 
+func TestQueryTruncatesPeerReferencesWithContainerBudget(t *testing.T) {
+	series := []prometheus.Series{
+		metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1),
+		metricSeries("cgroup-b", "host-a", "raw_cgroup_only", 2),
+		metricSeries("cgroup-c", "host-a", "raw_cgroup_only", 3),
+	}
+	metrics := &fakeMetrics{series: map[string][]prometheus.Series{
+		"prometheus.runtime.container.cpu.v1":    series,
+		"prometheus.runtime.container.memory.v1": series,
+	}}
+	collector, err := NewCollector(metrics, &fakeLogs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validRequest(nil)
+	request.MappingVersion = 4
+	request.MaxSeries = 2
+	request.ContainerMappings = []datasource.RuntimeContainerMapping{
+		{HostID: "host-a", CgroupID: "cgroup-a"},
+		{HostID: "host-a", CgroupID: "cgroup-b"},
+		{HostID: "host-a", CgroupID: "cgroup-c"},
+	}
+
+	result, err := collector.Query(context.Background(), Target{}, request)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(result.Containers) != request.MaxSeries || !result.Partial ||
+		!containsGap(result.Gaps, "runtime_entities_truncated") || !containsGap(result.Gaps, "runtime_peer_links_truncated") {
+		t.Fatalf("container budget was not reported: %+v", result)
+	}
+
+	returned := make(map[string]struct{}, len(result.Containers))
+	for _, container := range result.Containers {
+		returned[container.ID] = struct{}{}
+	}
+	for _, container := range result.Containers {
+		if len(container.PeerContainerIDs) != 1 {
+			t.Fatalf("container %s peers = %v, want the other returned instance", container.ID, container.PeerContainerIDs)
+		}
+		for _, peerID := range container.PeerContainerIDs {
+			if _, exists := returned[peerID]; !exists || peerID == container.ID {
+				t.Fatalf("container %s has peer %s outside the returned result: %+v", container.ID, peerID, result.Containers)
+			}
+		}
+	}
+}
+
 func TestQueryMapsOnlyExactHostAndCgroupUsingVersionedAdminMapping(t *testing.T) {
 	metrics := &fakeMetrics{series: map[string][]prometheus.Series{
 		"prometheus.runtime.container.cpu.v1": {
