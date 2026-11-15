@@ -218,7 +218,7 @@ func investigationTimelineWhere(
 		arguments = append(arguments, filter.ContainerID)
 		conditions = append(conditions, fmt.Sprintf(`value_summary @> jsonb_build_object(
 			'measurements', jsonb_build_array(jsonb_build_object(
-				'entity_type', 'CONTAINER', 'entity_id', $%d
+				'entity_type', 'CONTAINER', 'entity_id', $%d::text
 			))
 		)`, len(arguments)))
 	}
