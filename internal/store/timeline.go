@@ -10,14 +10,16 @@ import (
 )
 
 const (
-	maxInvestigationTimelinePageSize = 100
-	maxInvestigationTimelineOffset   = 10000
-	maxInvestigationTimelineEntityID = 256
+	maxInvestigationTimelinePageSize    = 100
+	maxInvestigationTimelineOffset      = 10000
+	maxInvestigationTimelineEntityID    = 256
+	maxInvestigationTimelineContainerID = 256
 )
 
 type InvestigationTimelineFilter struct {
 	SourceType   string
 	EntityID     string
+	ContainerID  string
 	Completeness string
 	Stance       string
 }
@@ -191,6 +193,10 @@ func ValidateInvestigationTimelineFilter(filter InvestigationTimelineFilter) err
 		len(filter.EntityID) > maxInvestigationTimelineEntityID {
 		return fmt.Errorf("%w: invalid timeline entity ID", ErrInvalidInput)
 	}
+	if filter.ContainerID != strings.TrimSpace(filter.ContainerID) ||
+		len(filter.ContainerID) > maxInvestigationTimelineContainerID {
+		return fmt.Errorf("%w: invalid timeline container ID", ErrInvalidInput)
+	}
 	return nil
 }
 
@@ -207,6 +213,14 @@ func investigationTimelineWhere(
 	if filter.EntityID != "" {
 		arguments = append(arguments, filter.EntityID)
 		conditions = append(conditions, fmt.Sprintf("entity_id = $%d", len(arguments)))
+	}
+	if filter.ContainerID != "" {
+		arguments = append(arguments, filter.ContainerID)
+		conditions = append(conditions, fmt.Sprintf(`value_summary @> jsonb_build_object(
+			'measurements', jsonb_build_array(jsonb_build_object(
+				'entity_type', 'CONTAINER', 'entity_id', $%d::text
+			))
+		)`, len(arguments)))
 	}
 	if filter.Completeness != "" {
 		arguments = append(arguments, filter.Completeness)

@@ -13,6 +13,7 @@ const (
 	maxTimelinePageSize     = 100
 	maxTimelineOffset       = 10000
 	maxTimelineEntityID     = 256
+	maxTimelineContainerID  = 256
 )
 
 func (handler *handler) getInvestigationTimeline(w http.ResponseWriter, r *http.Request) {
@@ -30,7 +31,7 @@ func (handler *handler) getInvestigationTimeline(w http.ResponseWriter, r *http.
 	}
 	for key := range values {
 		switch key {
-		case "source_type", "entity_id", "completeness", "stance", "limit", "offset":
+		case "source_type", "entity_id", "container_id", "completeness", "stance", "limit", "offset":
 		default:
 			writeError(w, r, http.StatusBadRequest, "invalid_request", "timeline query is invalid")
 			return
@@ -65,6 +66,7 @@ func parseInvestigationTimelineFilter(values url.Values) (store.InvestigationTim
 	for key, target := range map[string]*string{
 		"source_type":  &filter.SourceType,
 		"entity_id":    &filter.EntityID,
+		"container_id": &filter.ContainerID,
 		"completeness": &filter.Completeness,
 		"stance":       &filter.Stance,
 	} {
@@ -78,6 +80,9 @@ func parseInvestigationTimelineFilter(values url.Values) (store.InvestigationTim
 		*target = items[0]
 	}
 	if filter.EntityID != "" && len(filter.EntityID) > maxTimelineEntityID {
+		return store.InvestigationTimelineFilter{}, store.ErrInvalidInput
+	}
+	if filter.ContainerID != "" && len(filter.ContainerID) > maxTimelineContainerID {
 		return store.InvestigationTimelineFilter{}, store.ErrInvalidInput
 	}
 	if err := store.ValidateInvestigationTimelineFilter(filter); err != nil {
