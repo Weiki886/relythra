@@ -117,3 +117,161 @@ func TestRuntimeOOMWindowsSurvivePersistenceReplayAndTimeline(t *testing.T) {
 		t.Fatal("OOM evidence absent from timeline")
 	}
 }
+
+func TestRuntimeContainerReplacementHistorySurvivesPersistenceAndTimeline(t *testing.T) {
+	db := openStoreTestDB(t)
+	ctx := context.Background()
+	fixture := insertStoreFixture(t, ctx, db, "runtime-container-replacement-history")
+	filter, err := redact.NewFilter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := NewPostgres(db)
+	queryStart := fixture.startedAt.UTC()
+	source := "https://prometheus.example.test/api/v1/query_range"
+	empty := runtimeconnector.Measurement{Empty: true}
+
+	for _, incarnation := range []struct {
+		id         string
+		instance   string
+		queryStart time.Time
+		startedAt  time.Time
+	}{
+		{
+			id: "opaque-old-container", instance: "old-incarnation", queryStart: queryStart,
+			startedAt: queryStart.Add(-time.Hour),
+		},
+		{
+			id: "opaque-new-container", instance: "new-incarnation", queryStart: queryStart.Add(10 * time.Minute),
+			startedAt: queryStart.Add(9 * time.Minute),
+		},
+	} {
+		start := incarnation.queryStart
+		end := start.Add(5 * time.Minute)
+		evaluation := end.Add(-time.Minute)
+		result := runtimeconnector.Result{
+			Runtime: datasource.RuntimeDockerCompose, Service: "checkout", Environment: "demo", HostID: "host-1",
+			MappingVersion: 7, Start: start, End: end,
+			Containers: []runtimeconnector.Container{{
+				ID: incarnation.id, InstanceID: incarnation.instance, HostID: "host-1", Service: "checkout",
+				MappingStatus: "explicit_mapping", MappingVersion: 7, StartTime: &incarnation.startedAt,
+				StartEvidence: runtimeconnector.Measurement{
+					Samples: []prometheus.Sample{{Timestamp: evaluation, Value: float64(incarnation.startedAt.Unix())}}, SourceReference: source,
+				},
+				CPU: runtimeconnector.Measurement{
+					Samples: []prometheus.Sample{{Timestamp: evaluation, Value: 0.25}}, SourceReference: source,
+				},
+				Memory: runtimeconnector.Measurement{
+					Samples: []prometheus.Sample{{Timestamp: evaluation, Value: 1024}}, SourceReference: source,
+				},
+				OOMEvents: empty, State: "observed", LastObservedAt: &evaluation, PeerContainerIDs: []string{},
+			}},
+		}
+		metadata := evidence.RuntimeEvidenceContext{
+			InvestigationID: fixture.investigationID, CollectedAt: end.Add(time.Second),
+		}
+		records, err := evidence.FromRuntimeResult(ctx, result, metadata, filter)
+		if err != nil {
+			t.Fatalf("normalize %s runtime evidence: %v", incarnation.id, err)
+		}
+		items, created, err := repository.PersistEvidenceBatch(ctx, records)
+		if err != nil || len(items) != 8 || len(created) != 8 {
+			t.Fatalf("persist %s runtime evidence: items=%d created=%v err=%v", incarnation.id, len(items), created, err)
+		}
+		for i, wasCreated := range created {
+			if !wasCreated {
+				t.Fatalf("first persist of %s evidence item %d was not created", incarnation.id, i)
+			}
+		}
+
+		metadata.CollectedAt = metadata.CollectedAt.Add(time.Hour)
+		replay, err := evidence.FromRuntimeResult(ctx, result, metadata, filter)
+		if err != nil {
+			t.Fatalf("normalize replay for %s: %v", incarnation.id, err)
+		}
+		replayed, created, err := repository.PersistEvidenceBatch(ctx, replay)
+		if err != nil || len(replayed) != len(items) || len(created) != len(items) {
+			t.Fatalf("replay %s runtime evidence: items=%d created=%v err=%v", incarnation.id, len(replayed), created, err)
+		}
+		for i := range items {
+			if created[i] || replayed[i].ID != items[i].ID {
+				t.Fatalf("replay changed %s evidence item %d identity", incarnation.id, i)
+			}
+		}
+	}
+
+	timeline, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID, InvestigationTimelineFilter{}, 20, 0)
+	if err != nil {
+		t.Fatalf("read runtime timeline: %v", err)
+	}
+	if timeline.Total != 16 || len(timeline.Items) != 16 {
+		t.Fatalf("runtime timeline has total=%d items=%d, want two batches of eight records", timeline.Total, len(timeline.Items))
+	}
+
+	for _, incarnation := range []struct {
+		id         string
+		instance   string
+		queryStart time.Time
+		startedAt  time.Time
+	}{
+		{
+			id: "opaque-old-container", instance: "old-incarnation", queryStart: queryStart,
+			startedAt: queryStart.Add(-time.Hour),
+		},
+		{
+			id: "opaque-new-container", instance: "new-incarnation", queryStart: queryStart.Add(10 * time.Minute),
+			startedAt: queryStart.Add(9 * time.Minute),
+		},
+	} {
+		matchedRecords := 0
+		startTimeRecords := 0
+		for _, item := range timeline.Items {
+			var summary struct {
+				Measurements []struct {
+					EntityType string     `json:"entity_type"`
+					EntityID   string     `json:"entity_id"`
+					InstanceID string     `json:"instance_id"`
+					StartTime  *time.Time `json:"start_time"`
+				} `json:"measurements"`
+			}
+			var parameters struct {
+				TemplateID string `json:"template_id"`
+			}
+			if !item.ObservedStart.Equal(incarnation.queryStart) || !item.ObservedEnd.Equal(incarnation.queryStart.Add(5*time.Minute)) {
+				continue
+			}
+			if err := json.Unmarshal(item.ValueSummary, &summary); err != nil {
+				t.Fatalf("decode runtime timeline evidence: %v", err)
+			}
+			if err := json.Unmarshal(item.QueryParameters, &parameters); err != nil {
+				t.Fatalf("decode runtime timeline query parameters: %v", err)
+			}
+			for _, measurement := range summary.Measurements {
+				if measurement.EntityType != "CONTAINER" || measurement.EntityID != incarnation.id {
+					continue
+				}
+				matchedRecords++
+				if item.EntityType != "HOST" || item.EntityID == nil || *item.EntityID != "host-1" {
+					t.Fatalf("runtime evidence top-level identity changed unexpectedly: %+v", item)
+				}
+				if measurement.InstanceID != incarnation.instance {
+					t.Fatalf("timeline for %s lost incarnation identity: %s", incarnation.id, item.ValueSummary)
+				}
+				if parameters.TemplateID == "prometheus.runtime.container.start_time.v1" {
+					startTimeRecords++
+					if measurement.StartTime == nil || !measurement.StartTime.Equal(incarnation.startedAt) {
+						t.Fatalf("timeline for %s lost its start time: %s", incarnation.id, item.ValueSummary)
+					}
+				} else if measurement.StartTime != nil {
+					t.Fatalf("timeline for %s attributed start time to %s: %s", incarnation.id, parameters.TemplateID, item.ValueSummary)
+				}
+			}
+		}
+		if matchedRecords != 4 {
+			t.Fatalf("timeline for %s has %d matching container records, want four", incarnation.id, matchedRecords)
+		}
+		if startTimeRecords != 1 {
+			t.Fatalf("timeline for %s has %d start-time records, want 1", incarnation.id, startTimeRecords)
+		}
+	}
+}
