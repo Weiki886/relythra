@@ -408,9 +408,12 @@ func (fake *fakeMetrics) Query(_ context.Context, _ prometheus.Target, query dat
 }
 
 type fakeLogs struct {
-	calls   int
-	entries []loki.Entry
-	err     error
+	calls      int
+	entries    []loki.Entry
+	err        error
+	partial    bool
+	timeSkew   bool
+	nextCursor string
 }
 
 func (fake *fakeLogs) Query(_ context.Context, _ loki.Target, query datasource.NormalizedQuery) (loki.Result, error) {
@@ -420,7 +423,8 @@ func (fake *fakeLogs) Query(_ context.Context, _ loki.Target, query datasource.N
 	}
 	return loki.Result{
 		TemplateID: query.TemplateID, SourceReference: "http://loki.example.test/explore",
-		Entries: fake.entries, Empty: len(fake.entries) == 0,
+		Entries: fake.entries, NextCursor: fake.nextCursor, Empty: len(fake.entries) == 0,
+		Partial: fake.partial, TimeSkew: fake.timeSkew,
 	}, nil
 }
 
@@ -546,6 +550,61 @@ func TestQueryCorrelatesLifecycleEventOnlyByExplicitCgroupMapping(t *testing.T) 
 		if event.ContainerID == "cgroup-a" || event.ContainerID == "cgroup-b" {
 			t.Fatalf("raw cgroup identifier escaped in event: %+v", event)
 		}
+	}
+}
+
+func TestQuerySurfacesLifecycleLogCollectionGaps(t *testing.T) {
+	request := validRequest(nil)
+	baseEntry := loki.Entry{
+		Timestamp: request.End.Add(-time.Minute),
+		Labels:    map[string]string{"host_id": request.HostID, "service": request.Service, "env": request.Environment},
+	}
+	cases := []struct {
+		name   string
+		mutate func(*fakeLogs, *loki.Entry)
+		gap    string
+	}{
+		{
+			name:   "partial result",
+			mutate: func(logs *fakeLogs, _ *loki.Entry) { logs.partial = true },
+			gap:    "container_lifecycle_events_truncated",
+		},
+		{
+			name:   "continuation cursor",
+			mutate: func(logs *fakeLogs, _ *loki.Entry) { logs.nextCursor = "opaque-next-page" },
+			gap:    "container_lifecycle_events_truncated",
+		},
+		{
+			name:   "clock skew",
+			mutate: func(logs *fakeLogs, _ *loki.Entry) { logs.timeSkew = true },
+			gap:    "container_lifecycle_events_time_skewed",
+		},
+		{
+			name:   "outside query window",
+			mutate: func(_ *fakeLogs, entry *loki.Entry) { entry.OutsideTimeWindow = true },
+			gap:    "container_lifecycle_events_outside_window",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			entry := baseEntry
+			logs := &fakeLogs{entries: []loki.Entry{entry}}
+			testCase.mutate(logs, &logs.entries[0])
+			collector, err := NewCollector(&fakeMetrics{}, logs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := collector.Query(context.Background(), Target{}, request)
+			if err != nil {
+				t.Fatalf("Query: %v", err)
+			}
+			if !result.Partial || !containsGap(result.Gaps, "container_lifecycle_events_unverified") || !containsGap(result.Gaps, testCase.gap) {
+				t.Fatalf("lifecycle gaps = %v", result.Gaps)
+			}
+			if len(result.Events) != 1 || result.Events[0].Classification != "unverified_log_match" {
+				t.Fatalf("lifecycle event = %+v", result.Events)
+			}
+		})
 	}
 }
 

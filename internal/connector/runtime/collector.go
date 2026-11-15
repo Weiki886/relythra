@@ -241,6 +241,18 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 		result.Events = normalizeEvents(logResult, request, result.Containers)
 		result.Partial = true
 		result.Gaps = append(result.Gaps, "container_lifecycle_events_unverified")
+		if logResult.Partial || logResult.NextCursor != "" {
+			result.Gaps = append(result.Gaps, "container_lifecycle_events_truncated")
+		}
+		if logResult.TimeSkew {
+			result.Gaps = append(result.Gaps, "container_lifecycle_events_time_skewed")
+		}
+		for _, event := range result.Events {
+			if event.OutsideTimeWindow {
+				result.Gaps = append(result.Gaps, "container_lifecycle_events_outside_window")
+				break
+			}
+		}
 		if logResult.Partial || logResult.TimeSkew || logResult.Empty {
 			result.Partial = true
 		}
