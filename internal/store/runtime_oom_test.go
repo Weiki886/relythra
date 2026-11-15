@@ -223,6 +223,21 @@ func TestRuntimeContainerReplacementHistorySurvivesPersistenceAndTimeline(t *tes
 			startedAt: queryStart.Add(9 * time.Minute),
 		},
 	} {
+		filtered, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID, InvestigationTimelineFilter{
+			ContainerID: incarnation.id,
+		}, 20, 0)
+		if err != nil {
+			t.Fatalf("filter timeline for %s: %v", incarnation.id, err)
+		}
+		if filtered.Total != 4 || len(filtered.Items) != 4 {
+			t.Fatalf("timeline filter for %s returned total=%d items=%d, want four", incarnation.id, filtered.Total, len(filtered.Items))
+		}
+		for _, item := range filtered.Items {
+			if !item.ObservedStart.Equal(incarnation.queryStart) || !item.ObservedEnd.Equal(incarnation.queryStart.Add(5*time.Minute)) {
+				t.Fatalf("timeline filter for %s included another incarnation's interval: %s-%s", incarnation.id, item.ObservedStart, item.ObservedEnd)
+			}
+		}
+
 		matchedRecords := 0
 		startTimeRecords := 0
 		for _, item := range timeline.Items {

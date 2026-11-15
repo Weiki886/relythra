@@ -901,6 +901,7 @@ func TestGetInvestigationTimelineRejectsInvalidInputsBeforeDatabaseAccess(t *tes
 		{name: "bad source", id: validID, filter: InvestigationTimelineFilter{SourceType: "UNKNOWN"}, limit: 1},
 		{name: "bad completeness", id: validID, filter: InvestigationTimelineFilter{Completeness: "INVALID"}, limit: 1},
 		{name: "bad stance", id: validID, filter: InvestigationTimelineFilter{Stance: "INVALID"}, limit: 1},
+		{name: "oversized container ID", id: validID, filter: InvestigationTimelineFilter{ContainerID: strings.Repeat("x", maxInvestigationTimelineContainerID+1)}, limit: 1},
 		{name: "oversized page", id: validID, limit: 101},
 		{name: "negative offset", id: validID, limit: 1, offset: -1},
 		{name: "oversized offset", id: validID, limit: 1, offset: 10001},
