@@ -35,16 +35,17 @@ type runtimeQueryParameters struct {
 }
 
 type runtimeMeasurementObservation struct {
-	EntityType     string                       `json:"entity_type"`
-	EntityID       string                       `json:"entity_id"`
-	HostID         string                       `json:"host_id"`
-	Instance       string                       `json:"instance,omitempty"`
-	InstanceID     string                       `json:"instance_id,omitempty"`
-	Service        string                       `json:"service,omitempty"`
-	MappingStatus  string                       `json:"mapping_status,omitempty"`
-	MappingVersion int                          `json:"mapping_version,omitempty"`
-	StartTime      *time.Time                   `json:"start_time,omitempty"`
-	Measurement    runtimeconnector.Measurement `json:"measurement"`
+	EntityType       string                       `json:"entity_type"`
+	EntityID         string                       `json:"entity_id"`
+	HostID           string                       `json:"host_id"`
+	Instance         string                       `json:"instance,omitempty"`
+	InstanceID       string                       `json:"instance_id,omitempty"`
+	Service          string                       `json:"service,omitempty"`
+	MappingStatus    string                       `json:"mapping_status,omitempty"`
+	MappingVersion   int                          `json:"mapping_version,omitempty"`
+	StartTime        *time.Time                   `json:"start_time,omitempty"`
+	PeerContainerIDs []string                     `json:"peer_container_ids,omitempty"`
+	Measurement      runtimeconnector.Measurement `json:"measurement"`
 }
 
 type runtimeValueSummary struct {
@@ -83,6 +84,8 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 		buckets[i] = []runtimeMeasurementObservation{}
 	}
 	explicitlyMappedContainers := make(map[string]struct{}, len(result.Containers))
+	containerIDs := make(map[string]int, len(result.Containers))
+	peerContainerIDs := make(map[string][]string, len(result.Containers))
 	oomWindows := []runtimeconnector.OOMWindowObservation{}
 	for _, host := range result.Hosts {
 		if host.HostID != result.HostID {
@@ -96,6 +99,7 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 		if container.HostID != result.HostID || strings.TrimSpace(container.ID) == "" || (container.StartTime != nil && container.StartTime.IsZero()) {
 			return nil, ErrInvalidInput
 		}
+		containerIDs[container.ID]++
 		switch container.MappingStatus {
 		case "explicit_mapping":
 			if result.MappingVersion < 1 || container.MappingVersion != result.MappingVersion || container.Service != result.Service {
@@ -123,6 +127,40 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 				observation.StartTime = &started
 			}
 			buckets[i+3] = append(buckets[i+3], observation)
+		}
+	}
+	mappedIDs := make([]string, 0, len(explicitlyMappedContainers))
+	for containerID := range explicitlyMappedContainers {
+		mappedIDs = append(mappedIDs, containerID)
+	}
+	sort.Strings(mappedIDs)
+	for _, container := range result.Containers {
+		expected := make([]string, 0, len(mappedIDs))
+		if container.MappingStatus == "explicit_mapping" {
+			for _, peerID := range mappedIDs {
+				if peerID != container.ID {
+					expected = append(expected, peerID)
+				}
+			}
+		}
+		peers := append([]string(nil), container.PeerContainerIDs...)
+		sort.Strings(peers)
+		if len(peers) != len(expected) || (len(expected) > 0 && containerIDs[container.ID] != 1) {
+			return nil, ErrInvalidInput
+		}
+		for i, peerID := range peers {
+			if strings.TrimSpace(peerID) == "" || peerID == container.ID || (i > 0 && peers[i-1] == peerID) ||
+				peerID != expected[i] || containerIDs[peerID] != 1 {
+				return nil, ErrInvalidInput
+			}
+		}
+		if len(peers) > 0 {
+			peerContainerIDs[container.ID] = peers
+		}
+	}
+	for i := 3; i < 7; i++ {
+		for j := range buckets[i] {
+			buckets[i][j].PeerContainerIDs = append([]string(nil), peerContainerIDs[buckets[i][j].EntityID]...)
 		}
 	}
 	if err := sortRuntimeObservations(oomWindows); err != nil {
