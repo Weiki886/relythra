@@ -152,6 +152,119 @@ func TestFromRuntimePreservesContainerMappingVersion(t *testing.T) {
 	}
 }
 
+func mappedRuntimePeerObservation() (runtimeconnector.Result, RuntimeEvidenceContext) {
+	result, meta := runtimeObservation()
+	result.MappingVersion = 7
+	result.Containers[0].MappingStatus = "explicit_mapping"
+	result.Containers[0].MappingVersion = 7
+	result.Containers[0].Service = result.Service
+	result.Containers[0].PeerContainerIDs = []string{"peer-z", "peer-a"}
+	peerA := result.Containers[0]
+	peerA.ID = "peer-a"
+	peerA.InstanceID = "peer-a-instance"
+	peerA.PeerContainerIDs = []string{"peer-z", result.Containers[0].ID}
+	peerZ := result.Containers[0]
+	peerZ.ID = "peer-z"
+	peerZ.InstanceID = "peer-z-instance"
+	peerZ.PeerContainerIDs = []string{peerA.ID, result.Containers[0].ID}
+	result.Containers = append(result.Containers, peerA, peerZ)
+	return result, meta
+}
+
+func TestFromRuntimePreservesCanonicalMappedContainerPeers(t *testing.T) {
+	result, meta := mappedRuntimePeerObservation()
+	before, _ := json.Marshal(result)
+	filter, _ := redact.NewFilter()
+	records, err := FromRuntimeResult(nil, result, meta, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records[3:7] {
+		var summary struct {
+			Measurements []struct {
+				EntityID         string   `json:"entity_id"`
+				PeerContainerIDs []string `json:"peer_container_ids"`
+			} `json:"measurements"`
+		}
+		if err := json.Unmarshal(record.ValueSummary, &summary); err != nil {
+			t.Fatal(err)
+		}
+		if len(summary.Measurements) != 3 {
+			t.Fatalf("template %s measurements=%+v", record.QueryParameters, summary.Measurements)
+		}
+		for _, measurement := range summary.Measurements {
+			var want []string
+			switch measurement.EntityID {
+			case "opaque-cgroup":
+				want = []string{"peer-a", "peer-z"}
+			case "peer-a":
+				want = []string{"opaque-cgroup", "peer-z"}
+			case "peer-z":
+				want = []string{"opaque-cgroup", "peer-a"}
+			default:
+				t.Fatalf("unexpected entity: %+v", measurement)
+			}
+			if !reflect.DeepEqual(measurement.PeerContainerIDs, want) {
+				t.Fatalf("entity %s peers=%v want=%v", measurement.EntityID, measurement.PeerContainerIDs, want)
+			}
+		}
+	}
+	after, _ := json.Marshal(result)
+	if string(before) != string(after) {
+		t.Fatal("peer canonicalization mutated connector result")
+	}
+	shuffled := result
+	shuffled.Containers = []runtimeconnector.Container{result.Containers[2], result.Containers[0], result.Containers[1]}
+	replayed, err := FromRuntimeResult(nil, shuffled, meta, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range records {
+		if records[i].ContentHash != replayed[i].ContentHash {
+			t.Fatalf("container ordering changed evidence hash at record %d", i)
+		}
+	}
+}
+
+func TestFromRuntimeRejectsInvalidMappedContainerPeers(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*runtimeconnector.Result)
+	}{
+		{"raw cgroup", func(r *runtimeconnector.Result) { r.Containers[0].PeerContainerIDs = []string{"other"} }},
+		{"self reference", func(r *runtimeconnector.Result) { r.Containers[0].PeerContainerIDs = []string{r.Containers[0].ID} }},
+		{"unknown peer", func(r *runtimeconnector.Result) { r.Containers[0].PeerContainerIDs = []string{"unknown"} }},
+		{"duplicate peer", func(r *runtimeconnector.Result) { r.Containers[0].PeerContainerIDs = []string{"peer-a", "peer-a"} }},
+		{"ambiguous peer identity", func(r *runtimeconnector.Result) {
+			duplicate := r.Containers[1]
+			r.Containers = append(r.Containers, duplicate)
+		}},
+		{"asymmetric relation", func(r *runtimeconnector.Result) { r.Containers[1].PeerContainerIDs = []string{"peer-z"} }},
+		{"incomplete symmetric set", func(r *runtimeconnector.Result) {
+			r.Containers[0].PeerContainerIDs = []string{"peer-a"}
+			r.Containers[1].PeerContainerIDs = []string{r.Containers[0].ID}
+			r.Containers[2].PeerContainerIDs = nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, meta := mappedRuntimePeerObservation()
+			if tc.name == "raw cgroup" {
+				result.Containers = result.Containers[:1]
+				result.MappingVersion = 0
+				result.Containers[0].MappingStatus = "raw_cgroup_only"
+				result.Containers[0].MappingVersion = 0
+				result.Containers[0].Service = ""
+			}
+			tc.mutate(&result)
+			filter, _ := redact.NewFilter()
+			records, err := FromRuntimeResult(nil, result, meta, filter)
+			if !errors.Is(err, ErrInvalidInput) || records != nil {
+				t.Fatalf("unexpected records or validation error: records=%t err=%v", records != nil, err)
+			}
+		})
+	}
+}
+
 func TestFromRuntimeAcceptsLifecycleEventForMappedContainer(t *testing.T) {
 	result, meta := runtimeObservation()
 	result.MappingVersion = 7
