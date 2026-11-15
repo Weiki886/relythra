@@ -30,7 +30,7 @@ func TestRuntimeOOMWindowsSurvivePersistenceReplayAndTimeline(t *testing.T) {
 		Runtime: datasource.RuntimeDockerCompose, Service: "checkout", Environment: "demo", HostID: "host-1",
 		Start: start, End: start.Add(5 * time.Minute),
 		Containers: []runtimeconnector.Container{{
-			ID: "opaque-cgroup", HostID: "host-1", MappingStatus: "raw_cgroup_only",
+			ID: "opaque-cgroup", HostID: "host-1", MappingStatus: "raw_cgroup_only", State: "unknown",
 			CPU: empty, Memory: empty, StartEvidence: empty,
 			OOMEvents: runtimeconnector.Measurement{
 				Samples: []prometheus.Sample{{Timestamp: evaluation, Value: 1.25}}, SourceReference: source,
