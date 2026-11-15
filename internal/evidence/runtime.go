@@ -44,6 +44,10 @@ type runtimeMeasurementObservation struct {
 	MappingStatus    string                       `json:"mapping_status,omitempty"`
 	MappingVersion   int                          `json:"mapping_version,omitempty"`
 	StartTime        *time.Time                   `json:"start_time,omitempty"`
+	LastObservedAt   *time.Time                   `json:"last_observed_at,omitempty"`
+	State            string                       `json:"state,omitempty"`
+	Stale            *bool                        `json:"stale,omitempty"`
+	ClockSkew        bool                         `json:"clock_skew"`
 	PeerContainerIDs []string                     `json:"peer_container_ids,omitempty"`
 	Measurement      runtimeconnector.Measurement `json:"measurement"`
 }
@@ -88,15 +92,20 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 	peerContainerIDs := make(map[string][]string, len(result.Containers))
 	oomWindows := []runtimeconnector.OOMWindowObservation{}
 	for _, host := range result.Hosts {
-		if host.HostID != result.HostID {
+		if host.HostID != result.HostID || invalidRuntimeObservationTime(host.LastObservedAt, result.End, host.ClockSkew) {
 			return nil, ErrInvalidInput
 		}
 		for i, measurement := range []runtimeconnector.Measurement{host.CPU, host.MemoryAvailable, host.Load} {
-			buckets[i] = append(buckets[i], runtimeMeasurementObservation{EntityType: "HOST", EntityID: host.HostID, HostID: host.HostID, Instance: host.Instance, Measurement: measurement})
+			buckets[i] = append(buckets[i], runtimeMeasurementObservation{
+				EntityType: "HOST", EntityID: host.HostID, HostID: host.HostID, Instance: host.Instance,
+				LastObservedAt: utcTimePointer(host.LastObservedAt), ClockSkew: host.ClockSkew, Measurement: measurement,
+			})
 		}
 	}
 	for _, container := range result.Containers {
-		if container.HostID != result.HostID || strings.TrimSpace(container.ID) == "" || (container.StartTime != nil && container.StartTime.IsZero()) {
+		if container.HostID != result.HostID || strings.TrimSpace(container.ID) == "" || (container.StartTime != nil && container.StartTime.IsZero()) ||
+			!validRuntimeContainerState(container.State, container.Stale, container.ClockSkew) ||
+			invalidRuntimeObservationTime(container.LastObservedAt, result.End, container.ClockSkew) {
 			return nil, ErrInvalidInput
 		}
 		containerIDs[container.ID]++
@@ -119,9 +128,11 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 		}
 		oomWindows = append(oomWindows, windows...)
 		for i, measurement := range []runtimeconnector.Measurement{container.CPU, container.Memory, container.OOMEvents, container.StartEvidence} {
+			stale := container.Stale
 			observation := runtimeMeasurementObservation{EntityType: "CONTAINER", EntityID: container.ID, HostID: container.HostID,
 				InstanceID: container.InstanceID, Service: container.Service, MappingStatus: container.MappingStatus,
-				MappingVersion: container.MappingVersion, Measurement: measurement}
+				MappingVersion: container.MappingVersion, LastObservedAt: utcTimePointer(container.LastObservedAt),
+				State: container.State, Stale: &stale, ClockSkew: container.ClockSkew, Measurement: measurement}
 			if i == 3 && container.StartTime != nil {
 				started := container.StartTime.UTC()
 				observation.StartTime = &started
@@ -253,6 +264,31 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 		records = append(records, record)
 	}
 	return records, nil
+}
+
+func validRuntimeContainerState(state string, stale, clockSkew bool) bool {
+	switch state {
+	case "observed":
+		return !stale && !clockSkew
+	case "stale":
+		return stale && !clockSkew
+	case "unknown":
+		return true
+	default:
+		return false
+	}
+}
+
+func invalidRuntimeObservationTime(observedAt *time.Time, end time.Time, clockSkew bool) bool {
+	return observedAt != nil && (observedAt.IsZero() || (observedAt.After(end) && !clockSkew))
+}
+
+func utcTimePointer(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	utc := value.UTC()
+	return &utc
 }
 
 // Copy before sorting: the connector result may be replayed by another consumer.

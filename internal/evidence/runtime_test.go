@@ -171,6 +171,123 @@ func mappedRuntimePeerObservation() (runtimeconnector.Result, RuntimeEvidenceCon
 	return result, meta
 }
 
+func TestFromRuntimePreservesRuntimeStateMetadata(t *testing.T) {
+	result, meta := runtimeObservation()
+	zone := time.FixedZone("runtime-source", 2*60*60)
+	hostObservedAt := result.End.Add(-time.Minute).In(zone)
+	containerObservedAt := result.End.Add(-30 * time.Second).In(zone)
+	started := result.Start.Add(-time.Hour).In(zone)
+	result.Hosts[0].LastObservedAt = &hostObservedAt
+	result.Hosts[0].ClockSkew = true
+	result.Containers[0].StartTime = &started
+	result.Containers[0].LastObservedAt = &containerObservedAt
+	result.Containers[0].State = "unknown"
+	result.Containers[0].Stale = true
+	result.Containers[0].ClockSkew = true
+	filter, _ := redact.NewFilter()
+	records, err := FromRuntimeResult(nil, result, meta, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, record := range records {
+		var summary struct {
+			Measurements []struct {
+				EntityType     string     `json:"entity_type"`
+				EntityID       string     `json:"entity_id"`
+				StartTime      *time.Time `json:"start_time"`
+				LastObservedAt *time.Time `json:"last_observed_at"`
+				State          string     `json:"state"`
+				Stale          *bool      `json:"stale"`
+				ClockSkew      bool       `json:"clock_skew"`
+			} `json:"measurements"`
+		}
+		if err := json.Unmarshal(record.ValueSummary, &summary); err != nil {
+			t.Fatal(err)
+		}
+		for _, measurement := range summary.Measurements {
+			switch measurement.EntityType {
+			case "HOST":
+				if i > 2 || measurement.LastObservedAt == nil || !measurement.LastObservedAt.Equal(hostObservedAt.UTC()) || !measurement.ClockSkew || measurement.Stale != nil {
+					t.Fatalf("host metadata not preserved for template %d: %+v", i, measurement)
+				}
+			case "CONTAINER":
+				if i < 3 || measurement.LastObservedAt == nil || !measurement.LastObservedAt.Equal(containerObservedAt.UTC()) ||
+					measurement.State != "unknown" ||
+					measurement.Stale == nil || !*measurement.Stale || !measurement.ClockSkew {
+					t.Fatalf("container metadata not preserved for template %d: %+v", i, measurement)
+				}
+				if (i == 6) != (measurement.StartTime != nil) || (measurement.StartTime != nil && !measurement.StartTime.Equal(started.UTC())) {
+					t.Fatalf("start time changed its evidence scope for template %d: %+v", i, measurement)
+				}
+			default:
+				t.Fatalf("unexpected entity type: %+v", measurement)
+			}
+		}
+	}
+	_, hostOffset := result.Hosts[0].LastObservedAt.Zone()
+	_, containerOffset := result.Containers[0].LastObservedAt.Zone()
+	_, startOffset := result.Containers[0].StartTime.Zone()
+	if hostOffset != 2*60*60 || containerOffset != 2*60*60 || startOffset != 2*60*60 {
+		t.Fatal("metadata canonicalization mutated connector result")
+	}
+}
+
+func TestFromRuntimePreservesFalseStaleState(t *testing.T) {
+	result, meta := runtimeObservation()
+	filter, _ := redact.NewFilter()
+	records, err := FromRuntimeResult(nil, result, meta, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records[3:7] {
+		var summary struct {
+			Measurements []struct {
+				State     string `json:"state"`
+				Stale     *bool  `json:"stale"`
+				ClockSkew bool   `json:"clock_skew"`
+			} `json:"measurements"`
+		}
+		if err := json.Unmarshal(record.ValueSummary, &summary); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(record.ValueSummary), `"stale":false`) || !strings.Contains(string(record.ValueSummary), `"clock_skew":false`) {
+			t.Fatalf("false state values were not serialized explicitly: %s", record.ValueSummary)
+		}
+		measurement := summary.Measurements[0]
+		if measurement.State != "observed" || measurement.Stale == nil || *measurement.Stale || measurement.ClockSkew {
+			t.Fatalf("false runtime state metadata was omitted or changed: %+v", measurement)
+		}
+	}
+}
+
+func TestFromRuntimeRejectsInvalidContainerStateAndObservationTime(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*runtimeconnector.Result)
+	}{
+		{name: "unknown value", mutate: func(r *runtimeconnector.Result) { r.Containers[0].State = "healthy" }},
+		{name: "stale without stale flag", mutate: func(r *runtimeconnector.Result) { r.Containers[0].State = "stale" }},
+		{name: "observed with clock skew", mutate: func(r *runtimeconnector.Result) { r.Containers[0].ClockSkew = true }},
+		{name: "host future observation without skew", mutate: func(r *runtimeconnector.Result) {
+			future := r.End.Add(time.Second)
+			r.Hosts[0].LastObservedAt = &future
+		}},
+		{name: "container future observation without skew", mutate: func(r *runtimeconnector.Result) {
+			future := r.End.Add(time.Second)
+			r.Containers[0].LastObservedAt = &future
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, meta := runtimeObservation()
+			tc.mutate(&result)
+			filter, _ := redact.NewFilter()
+			if records, err := FromRuntimeResult(nil, result, meta, filter); !errors.Is(err, ErrInvalidInput) || records != nil {
+				t.Fatalf("records=%t err=%v, want invalid input", records != nil, err)
+			}
+		})
+	}
+}
+
 func TestFromRuntimePreservesCanonicalMappedContainerPeers(t *testing.T) {
 	result, meta := mappedRuntimePeerObservation()
 	before, _ := json.Marshal(result)
