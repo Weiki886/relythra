@@ -200,6 +200,14 @@ func TestRuntimeContainerReplacementHistorySurvivesPersistenceAndTimeline(t *tes
 		}
 	}
 
+	timeline, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID, InvestigationTimelineFilter{}, 20, 0)
+	if err != nil {
+		t.Fatalf("read runtime timeline: %v", err)
+	}
+	if timeline.Total != 16 || len(timeline.Items) != 16 {
+		t.Fatalf("runtime timeline has total=%d items=%d, want two batches of eight records", timeline.Total, len(timeline.Items))
+	}
+
 	for _, incarnation := range []struct {
 		id         string
 		instance   string
@@ -215,18 +223,13 @@ func TestRuntimeContainerReplacementHistorySurvivesPersistenceAndTimeline(t *tes
 			startedAt: queryStart.Add(9 * time.Minute),
 		},
 	} {
-		timeline, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID,
-			InvestigationTimelineFilter{EntityID: incarnation.id}, 10, 0)
-		if err != nil {
-			t.Fatalf("read %s timeline: %v", incarnation.id, err)
-		}
-		if timeline.Total != 4 || len(timeline.Items) != 4 {
-			t.Fatalf("timeline for %s has total=%d items=%d, want four container metric records", incarnation.id, timeline.Total, len(timeline.Items))
-		}
+		matchedRecords := 0
 		startTimeRecords := 0
 		for _, item := range timeline.Items {
 			var summary struct {
 				Measurements []struct {
+					EntityType string     `json:"entity_type"`
+					EntityID   string     `json:"entity_id"`
 					InstanceID string     `json:"instance_id"`
 					StartTime  *time.Time `json:"start_time"`
 				} `json:"measurements"`
@@ -234,26 +237,38 @@ func TestRuntimeContainerReplacementHistorySurvivesPersistenceAndTimeline(t *tes
 			var parameters struct {
 				TemplateID string `json:"template_id"`
 			}
+			if !item.ObservedStart.Equal(incarnation.queryStart) || !item.ObservedEnd.Equal(incarnation.queryStart.Add(5*time.Minute)) {
+				continue
+			}
 			if err := json.Unmarshal(item.ValueSummary, &summary); err != nil {
-				t.Fatalf("decode %s timeline evidence: %v", incarnation.id, err)
+				t.Fatalf("decode runtime timeline evidence: %v", err)
 			}
 			if err := json.Unmarshal(item.QueryParameters, &parameters); err != nil {
-				t.Fatalf("decode %s timeline query parameters: %v", incarnation.id, err)
+				t.Fatalf("decode runtime timeline query parameters: %v", err)
 			}
-			if len(summary.Measurements) != 1 || summary.Measurements[0].InstanceID != incarnation.instance {
-				t.Fatalf("timeline for %s lost incarnation identity: %s", incarnation.id, item.ValueSummary)
-			}
-			if !item.ObservedStart.Equal(incarnation.queryStart) || !item.ObservedEnd.Equal(incarnation.queryStart.Add(5*time.Minute)) {
-				t.Fatalf("timeline for %s lost the observation interval: %+v", incarnation.id, item)
-			}
-			if parameters.TemplateID == "prometheus.runtime.container.start_time.v1" {
-				startTimeRecords++
-				if summary.Measurements[0].StartTime == nil || !summary.Measurements[0].StartTime.Equal(incarnation.startedAt) {
-					t.Fatalf("timeline for %s lost its start time: %s", incarnation.id, item.ValueSummary)
+			for _, measurement := range summary.Measurements {
+				if measurement.EntityType != "CONTAINER" || measurement.EntityID != incarnation.id {
+					continue
 				}
-			} else if summary.Measurements[0].StartTime != nil {
-				t.Fatalf("timeline for %s attributed start time to %s: %s", incarnation.id, parameters.TemplateID, item.ValueSummary)
+				matchedRecords++
+				if item.EntityType != "HOST" || item.EntityID == nil || *item.EntityID != "host-1" {
+					t.Fatalf("runtime evidence top-level identity changed unexpectedly: %+v", item)
+				}
+				if measurement.InstanceID != incarnation.instance {
+					t.Fatalf("timeline for %s lost incarnation identity: %s", incarnation.id, item.ValueSummary)
+				}
+				if parameters.TemplateID == "prometheus.runtime.container.start_time.v1" {
+					startTimeRecords++
+					if measurement.StartTime == nil || !measurement.StartTime.Equal(incarnation.startedAt) {
+						t.Fatalf("timeline for %s lost its start time: %s", incarnation.id, item.ValueSummary)
+					}
+				} else if measurement.StartTime != nil {
+					t.Fatalf("timeline for %s attributed start time to %s: %s", incarnation.id, parameters.TemplateID, item.ValueSummary)
+				}
 			}
+		}
+		if matchedRecords != 4 {
+			t.Fatalf("timeline for %s has %d matching container records, want four", incarnation.id, matchedRecords)
 		}
 		if startTimeRecords != 1 {
 			t.Fatalf("timeline for %s has %d start-time records, want 1", incarnation.id, startTimeRecords)

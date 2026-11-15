@@ -2,15 +2,15 @@
 
 ## 目标与边界
 
-证明同一 Investigation 中先后观测到的两个不同容器 ID 会各自保留原始时间区间、启动时间和 incarnation 标识；重放各自查询不产生重复记录。用户按容器 ID 查询时间线时，替换前后两段历史都可独立核验。
+证明同一 Investigation 中先后观测到的两个不同容器 ID 会各自保留原始时间区间、启动时间和 incarnation 标识；重放各自查询不产生重复记录。读取完整时间线后，可按观测时间和嵌套 measurement 中的容器 ID 核验替换前后的历史。
 
-本切片只补持久化集成验收，不增加运行时查询、状态推断、API、迁移、依赖或外部操作。它不证明任一容器健康、不推断重启原因，也不把 OOM 窗口归属于某个 incarnation。
+本切片只补持久化集成验收，不增加运行时查询、状态推断、API、迁移、依赖或外部操作。当前 Runtime Evidence 的顶层实体仍是 Host，容器 ID 保存在 `value_summary.measurements`；本测试不宣称时间线支持按容器 ID 直接筛选。它不证明任一容器健康、不推断重启原因，也不把 OOM 窗口归属于某个 incarnation。
 
 ## 验证设计
 
 1. 使用隔离的 PostgreSQL 测试 schema 为同一 Investigation 构造两个不同容器 ID 和不同启动时间的 runtime 观测。
 2. 分别通过 `FromRuntimeResult` 规范化并持久化，重复持久化同一观测，要求 Evidence ID 稳定且不新增记录。
-3. 按旧、新容器 ID 分别读取时间线，断言原查询区间、`InstanceID` 和 start-time Evidence 均保留，且其他指标 Evidence 不携带 `StartTime`。
+3. 读取 Investigation 的时间线，按两个观测区间及嵌套容器 ID 分别核验原查询区间、`InstanceID` 和 start-time Evidence，且其他指标 Evidence 不携带 `StartTime`。
 
 ## 风险与回滚
 
@@ -19,6 +19,7 @@
 ## 执行记录
 
 - 定向 `go test ./internal/store -run '^TestRuntimeContainerReplacementHistorySurvivesPersistenceAndTimeline$' -count=1 -v` 可编译，但本机因未设置 `RELYTHRA_TEST_DATABASE_URL` 跳过隔离 PostgreSQL 集成场景；需要最终 PR Backend CI 在配置的 PostgreSQL 上实际执行。
+- 首轮 Backend CI 证实容器 ID 是 ValueSummary 内的嵌套 identity，顶层 `EntityID` 筛选不能命中它；回归测试现按时间区间与嵌套 measurement 验证既有契约，不扩展 API 筛选语义。
 - `make fmt-check vet test build web-check case-check dev-script-check`：通过。`internal/store` 包在本机通过，但该集成测试因相同环境限制被跳过。
 - `gitleaks detect --source . --no-git --redact` 与 `git diff --check`：通过。
 - 本切片验证已有持久化与时间线行为；未将测试通过描述为完整 Issue #13 验收，Issue 继续开放。
