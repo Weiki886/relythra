@@ -185,6 +185,9 @@ func TestGrafanaAlertManualRemappingRequiresManagementAuthAndExpectedVersion(t *
 	if response.Code != http.StatusOK {
 		t.Fatalf("remap status = %d: %s", response.Code, response.Body.String())
 	}
+	if repository.grafanaRemapFilter == nil {
+		t.Fatal("Grafana alert remapping did not receive the redaction filter")
+	}
 	if recorder.eventCount() != 1 || recorder.lastEvent(t).Action != audit.ActionAlertMappingChanged {
 		t.Fatalf("remap audit = %+v", recorder.lastEvent(t))
 	}

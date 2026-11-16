@@ -455,7 +455,7 @@ func (handler *handler) remapGrafanaAlert(w http.ResponseWriter, r *http.Request
 			writeError(w, r, http.StatusBadRequest, "invalid_request", "alert remapping request is invalid")
 			return
 		}
-		result, err := handler.grafanaAlerts.RemapGrafanaAlert(r.Context(), alertID, request.ExpectedVersion, request.ServiceID, request.Environment)
+		result, err := handler.grafanaAlerts.RemapGrafanaAlert(r.Context(), alertID, request.ExpectedVersion, request.ServiceID, request.Environment, handler.filter)
 		if err != nil {
 			handler.writeStoreError(w, r, err)
 			return

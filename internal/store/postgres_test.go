@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Weiki886/relythra/internal/domain"
+	"github.com/Weiki886/relythra/internal/security/redact"
 	"github.com/Weiki886/relythra/migrations"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
@@ -513,15 +514,67 @@ func TestRemapGrafanaAlertUsesVersionAndCreatesInvestigation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ingest unmapped alert: %v", err)
 	}
-	result, err := repository.RemapGrafanaAlert(ctx, created[0].Alert.ID, created[0].Alert.EventVersion, fixture.serviceID, "prod")
+	if _, err := repository.RemapGrafanaAlert(ctx, created[0].Alert.ID, created[0].Alert.EventVersion, fixture.serviceID, "prod", nil); !errors.Is(err, redact.ErrUnsafeOutput) {
+		t.Fatalf("remap without redaction filter = %v, want ErrUnsafeOutput", err)
+	}
+	filter := mustGrafanaEvidenceFilter(t)
+	result, err := repository.RemapGrafanaAlert(ctx, created[0].Alert.ID, created[0].Alert.EventVersion, fixture.serviceID, "prod", filter)
 	if err != nil {
 		t.Fatalf("remap Grafana alert: %v", err)
 	}
 	if result.MatchState != "MATCHED" || result.InvestigationID == "" || result.Alert.EventVersion != 2 {
 		t.Fatalf("remapped alert result = %+v", result)
 	}
-	if _, err := repository.RemapGrafanaAlert(ctx, result.Alert.ID, 1, fixture.serviceID, "prod"); !errors.Is(err, ErrConflict) {
+	assertGrafanaEvidenceCount(t, ctx, db, result.InvestigationID, 1)
+	var summaryJSON []byte
+	if err := db.QueryRowContext(ctx, `SELECT value_summary FROM evidence WHERE investigation_id=$1`, result.InvestigationID).Scan(&summaryJSON); err != nil {
+		t.Fatalf("read remapped Grafana evidence: %v", err)
+	}
+	var summary map[string]any
+	if err := json.Unmarshal(summaryJSON, &summary); err != nil {
+		t.Fatalf("decode remapped Grafana evidence summary: %v", err)
+	}
+	if summary["mapping_status"] != "MATCHED" || summary["event_version"] != float64(result.Alert.EventVersion) || summary["service_id"] != fixture.serviceID {
+		t.Fatalf("remapped Grafana evidence summary = %#v", summary)
+	}
+	if _, err := repository.RemapGrafanaAlert(ctx, result.Alert.ID, 1, fixture.serviceID, "prod", filter); !errors.Is(err, ErrConflict) {
 		t.Fatalf("stale remap error = %v, want ErrConflict", err)
+	}
+}
+
+func TestRemapGrafanaAlertUpdatesExistingInvestigationEvidence(t *testing.T) {
+	db := openStoreTestDB(t)
+	ctx := context.Background()
+	fixture := insertStoreFixture(t, ctx, db, "grafana-remap-existing")
+	repository := NewPostgres(db)
+	input := fixtureAlertInput(fixture, "remap-existing-fingerprint")
+	input.ProjectSlug = "grafana-remap-existing"
+	input.ServiceSlug = "checkout-api"
+	filter := mustGrafanaEvidenceFilter(t)
+	created, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "remap-existing-request", filter)
+	if err != nil {
+		t.Fatalf("ingest mapped alert: %v", err)
+	}
+	var remappedServiceID string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO services (project_id, slug, name) VALUES ($1, 'billing-api', 'Billing API') RETURNING id::text
+	`, fixture.projectID).Scan(&remappedServiceID); err != nil {
+		t.Fatalf("insert remapped service: %v", err)
+	}
+	result, err := repository.RemapGrafanaAlert(ctx, created[0].Alert.ID, created[0].Alert.EventVersion, remappedServiceID, "prod", filter)
+	if err != nil {
+		t.Fatalf("remap alert with existing investigation: %v", err)
+	}
+	if result.InvestigationID == "" {
+		t.Fatal("remapped alert result has no investigation")
+	}
+	assertGrafanaEvidenceCount(t, ctx, db, result.InvestigationID, 2)
+	var investigationServiceID string
+	if err := db.QueryRowContext(ctx, `SELECT service_id::text FROM investigations WHERE id=$1`, result.InvestigationID).Scan(&investigationServiceID); err != nil {
+		t.Fatalf("read remapped investigation service: %v", err)
+	}
+	if investigationServiceID != remappedServiceID {
+		t.Fatalf("investigation service = %s, want %s", investigationServiceID, remappedServiceID)
 	}
 }
 
