@@ -356,7 +356,7 @@ func (handler *handler) receiveGrafanaWebhook(w http.ResponseWriter, r *http.Req
 			SourceTimezone: alert.SourceTimezone, SourceTimeText: alert.SourceTimeText,
 		})
 	}
-	results, err := handler.grafanaAlerts.IngestGrafanaAlerts(r.Context(), inputs, RequestIDFromContext(r.Context()))
+	results, err := handler.grafanaAlerts.IngestGrafanaAlerts(r.Context(), inputs, RequestIDFromContext(r.Context()), handler.filter)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			handler.recordGrafanaWebhookError(w, r, http.StatusUnprocessableEntity, "needs_mapping", audit.ResultDenied)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Weiki886/relythra/internal/domain"
+	"github.com/Weiki886/relythra/internal/security/redact"
 )
 
 type GrafanaAlertInput struct {
@@ -45,7 +46,7 @@ type GrafanaAlertResult struct {
 
 type GrafanaAlertRepository interface {
 	ClaimDeploymentWebhookSignature(context.Context, []byte, time.Time) (bool, error)
-	IngestGrafanaAlerts(context.Context, []GrafanaAlertInput, string) ([]GrafanaAlertResult, error)
+	IngestGrafanaAlerts(context.Context, []GrafanaAlertInput, string, *redact.Filter) ([]GrafanaAlertResult, error)
 	RemapGrafanaAlert(context.Context, string, int64, string, string) (GrafanaAlertResult, error)
 }
 
@@ -147,7 +148,11 @@ func (repository *Postgres) IngestGrafanaAlerts(
 	ctx context.Context,
 	inputs []GrafanaAlertInput,
 	requestID string,
+	filter *redact.Filter,
 ) ([]GrafanaAlertResult, error) {
+	if filter == nil {
+		return nil, redact.ErrUnsafeOutput
+	}
 	if len(inputs) == 0 || len(inputs) > 100 || !validRequestID(requestID) {
 		return nil, ErrInvalidInput
 	}
@@ -161,6 +166,15 @@ func (repository *Postgres) IngestGrafanaAlerts(
 		result, err := ingestOneGrafanaAlert(ctx, tx, input, requestID)
 		if err != nil {
 			return nil, err
+		}
+		if result.InvestigationID != "" {
+			_, _, err := persistGrafanaAlertEvidenceTx(ctx, tx, result.Alert.ID, GrafanaAlertEvidenceContext{
+				InvestigationID: result.InvestigationID,
+				CollectedAt:     time.Now().UTC(),
+			}, filter)
+			if err != nil {
+				return nil, fmt.Errorf("persist Grafana alert evidence during ingestion: %w", err)
+			}
 		}
 		results = append(results, result)
 	}

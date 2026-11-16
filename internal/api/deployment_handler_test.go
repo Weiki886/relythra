@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Weiki886/relythra/internal/security/audit"
+	"github.com/Weiki886/relythra/internal/security/redact"
 	"github.com/Weiki886/relythra/internal/security/secrets"
 	"github.com/Weiki886/relythra/internal/store"
 )
@@ -38,6 +39,7 @@ type fakeDeploymentRepository struct {
 	claimCalls       int
 	grafanaInputs    []store.GrafanaAlertInput
 	grafanaRequestID string
+	grafanaFilter    *redact.Filter
 	grafanaResults   []store.GrafanaAlertResult
 }
 
@@ -45,9 +47,11 @@ func (repository *fakeDeploymentRepository) IngestGrafanaAlerts(
 	_ context.Context,
 	inputs []store.GrafanaAlertInput,
 	requestID string,
+	filter *redact.Filter,
 ) ([]store.GrafanaAlertResult, error) {
 	repository.grafanaInputs = inputs
 	repository.grafanaRequestID = requestID
+	repository.grafanaFilter = filter
 	return repository.grafanaResults, repository.err
 }
 

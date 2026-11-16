@@ -102,8 +102,8 @@ func TestGrafanaWebhookRequiresValidSignatureAndRejectsReplay(t *testing.T) {
 	if first.Code != http.StatusCreated {
 		t.Fatalf("first request status = %d: %s", first.Code, first.Body.String())
 	}
-	if len(repository.grafanaInputs) != 1 || repository.grafanaRequestID == "" {
-		t.Fatalf("Grafana ingestion input = %+v, request=%q", repository.grafanaInputs, repository.grafanaRequestID)
+	if len(repository.grafanaInputs) != 1 || repository.grafanaRequestID == "" || repository.grafanaFilter == nil {
+		t.Fatalf("Grafana ingestion input = %+v, request=%q, filter=%v", repository.grafanaInputs, repository.grafanaRequestID, repository.grafanaFilter)
 	}
 	if repository.grafanaInputs[0].SourceTimeText != "2026-11-05T20:00:00.123+08:00" || repository.grafanaInputs[0].SourceTimezone != "+08:00" ||
 		repository.grafanaInputs[0].StartsAt.Format(time.RFC3339Nano) != "2026-11-05T12:00:00.123Z" {

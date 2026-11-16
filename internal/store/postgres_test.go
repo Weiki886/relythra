@@ -317,7 +317,8 @@ func TestIngestGrafanaAlertCreatesIncidentAndReusesItOnDuplicate(t *testing.T) {
 		Annotations:     json.RawMessage(`{"summary":"Checkout latency is high"}`),
 		RedactedPayload: json.RawMessage(`{"status":"firing","alerts":[]}`),
 	}
-	first, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-request-1")
+	filter := mustGrafanaEvidenceFilter(t)
+	first, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-request-1", filter)
 	if err != nil {
 		t.Fatalf("ingest firing alert: %v", err)
 	}
@@ -327,7 +328,7 @@ func TestIngestGrafanaAlertCreatesIncidentAndReusesItOnDuplicate(t *testing.T) {
 	if first[0].Alert.SourceTimezone != input.SourceTimezone || first[0].Alert.SourceTimeText != input.SourceTimeText {
 		t.Fatalf("persisted source timestamp = %q / %q", first[0].Alert.SourceTimezone, first[0].Alert.SourceTimeText)
 	}
-	second, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-request-2")
+	second, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-request-2", filter)
 	if err != nil {
 		t.Fatalf("ingest duplicate alert: %v", err)
 	}
@@ -340,7 +341,7 @@ func TestIngestGrafanaAlertCreatesIncidentAndReusesItOnDuplicate(t *testing.T) {
 	resolvedAt := fixture.startedAt.Add(5 * time.Minute)
 	input.Status = "RESOLVED"
 	input.EndsAt = &resolvedAt
-	resolved, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-request-3")
+	resolved, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-request-3", filter)
 	if err != nil {
 		t.Fatalf("ingest resolved alert: %v", err)
 	}
@@ -370,7 +371,7 @@ func TestIngestGrafanaAlertAllowsRepeatedFingerprintWithinOneRequest(t *testing.
 	input := fixtureAlertInput(fixture, "same-envelope-fingerprint")
 	input.ProjectSlug = "grafana-batch-duplicate"
 
-	results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input, input}, "grafana-shared-request")
+	results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input, input}, "grafana-shared-request", mustGrafanaEvidenceFilter(t))
 	if err != nil {
 		t.Fatalf("ingest repeated fingerprint in one request: %v", err)
 	}
@@ -398,7 +399,7 @@ func TestIngestGrafanaAlertLeavesUnknownServiceForMappingAndRollsBackWholeBatch(
 		Labels: json.RawMessage(`{"alertname":"Unmapped"}`), Annotations: json.RawMessage(`{"summary":"Unmapped alert"}`),
 		RedactedPayload: json.RawMessage(`{"alerts":[]}`),
 	}
-	results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "unmapped-request-1")
+	results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "unmapped-request-1", mustGrafanaEvidenceFilter(t))
 	if err != nil {
 		t.Fatalf("ingest unmapped alert: %v", err)
 	}
@@ -416,7 +417,7 @@ func TestIngestGrafanaAlertLeavesUnknownServiceForMappingAndRollsBackWholeBatch(
 	valid := fixtureAlertInput(fixture, "batch-rollback-valid")
 	invalid := valid
 	invalid.ProjectSlug = "project-that-does-not-exist"
-	if _, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{valid, invalid}, "batch-rollback-request"); !errors.Is(err, ErrNotFound) {
+	if _, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{valid, invalid}, "batch-rollback-request", mustGrafanaEvidenceFilter(t)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("batch with unresolved project error = %v, want ErrNotFound", err)
 	}
 	var count int
@@ -444,6 +445,7 @@ func TestIngestGrafanaAlertDeduplicatesConcurrentFingerprints(t *testing.T) {
 	repository := NewPostgres(db)
 	input := fixtureAlertInput(fixture, "concurrent-fingerprint")
 	input.ProjectSlug = "grafana-concurrent"
+	filter := mustGrafanaEvidenceFilter(t)
 
 	const writers = 8
 	var group sync.WaitGroup
@@ -453,7 +455,7 @@ func TestIngestGrafanaAlertDeduplicatesConcurrentFingerprints(t *testing.T) {
 		group.Add(1)
 		go func(index int) {
 			defer group.Done()
-			results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, fmt.Sprintf("concurrent-request-%d", index))
+			results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, fmt.Sprintf("concurrent-request-%d", index), filter)
 			if err != nil {
 				errorsChannel <- err
 				return
@@ -507,7 +509,7 @@ func TestRemapGrafanaAlertUsesVersionAndCreatesInvestigation(t *testing.T) {
 	input.ProjectSlug = "grafana-remap"
 	input.ServiceSlug = "missing-service"
 	input.Environment = "bad Env"
-	created, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "remap-request-1")
+	created, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "remap-request-1", mustGrafanaEvidenceFilter(t))
 	if err != nil {
 		t.Fatalf("ingest unmapped alert: %v", err)
 	}
