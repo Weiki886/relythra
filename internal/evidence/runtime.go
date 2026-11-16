@@ -3,6 +3,7 @@ package evidence
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -62,9 +63,11 @@ type runtimeValueSummary struct {
 }
 
 // FromRuntimeResult emits one record for each of the collector's seven metric
-// templates and one lifecycle log template. Reusing their source independence
-// groups prevents derived runtime observations from becoming independent votes.
-// It returns no records if any query fails validation, redaction or size bounds.
+// templates and one lifecycle log template. Failed templates become source-level
+// MISSING Evidence while successful templates remain available. Reusing their
+// source independence groups prevents derived observations from becoming
+// independent votes. It returns no records if any query fails validation,
+// redaction or size bounds.
 func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, metadata RuntimeEvidenceContext, filter *redact.Filter) ([]Record, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -82,6 +85,24 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 		"prometheus.runtime.host.cpu.v1", "prometheus.runtime.host.memory_available.v1", "prometheus.runtime.host.load.v1",
 		"prometheus.runtime.container.cpu.v1", "prometheus.runtime.container.memory.v1", "prometheus.runtime.container.oom_events.v1",
 		"prometheus.runtime.container.start_time.v1", "loki.container.restarts.v1",
+	}
+	templateIndexes := make(map[string]int, len(templates))
+	for index, template := range templates {
+		templateIndexes[template] = index
+	}
+	failuresByTemplate := make(map[string]runtimeconnector.CollectionFailure, len(result.Failures))
+	for _, failure := range result.Failures {
+		index, exists := templateIndexes[failure.TemplateID]
+		if !exists || failure.TemplateVersion != 1 ||
+			(failure.SourceType != SourcePrometheus && failure.SourceType != SourceLoki) ||
+			(index == len(templates)-1) != (failure.SourceType == SourceLoki) ||
+			!validCollectionFailureCode(CollectionFailureCode(failure.ReasonCode)) {
+			return nil, ErrInvalidInput
+		}
+		if _, duplicate := failuresByTemplate[failure.TemplateID]; duplicate {
+			return nil, ErrInvalidInput
+		}
+		failuresByTemplate[failure.TemplateID] = failure
 	}
 	buckets := make([][]runtimeMeasurementObservation, len(templates))
 	for i := range buckets {
@@ -181,6 +202,23 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 	sort.Strings(gaps)
 	records := make([]Record, 0, len(templates))
 	for i, template := range templates {
+		if failure, failed := failuresByTemplate[template]; failed {
+			if runtimeMeasurementsHaveData(buckets[i]) || (i == len(templates)-1 && len(result.Events) > 0) {
+				return nil, ErrInvalidInput
+			}
+			record, err := FromCollectionFailure(ctx, CollectionGapInput{
+				InvestigationID: metadata.InvestigationID, ToolCallID: metadata.ToolCallID,
+				SourceType: failure.SourceType, EntityType: "HOST", EntityID: result.HostID,
+				TemplateID: failure.TemplateID, TemplateVersion: failure.TemplateVersion,
+				ObservedStart: result.Start, ObservedEnd: result.End, CollectedAt: metadata.CollectedAt,
+				ReasonCode: CollectionFailureCode(failure.ReasonCode),
+			}, filter)
+			if err != nil {
+				return nil, fmt.Errorf("normalize collection gap for %s: %w", template, err)
+			}
+			records = append(records, record)
+			continue
+		}
 		summary := runtimeValueSummary{Measurements: buckets[i], Events: []runtimeconnector.Event{}, Gaps: gaps, Partial: result.Partial}
 		if template == "prometheus.runtime.container.oom_events.v1" {
 			summary.OOMWindowObservations = oomWindows
@@ -264,6 +302,15 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 		records = append(records, record)
 	}
 	return records, nil
+}
+
+func runtimeMeasurementsHaveData(measurements []runtimeMeasurementObservation) bool {
+	for _, observation := range measurements {
+		if len(observation.Measurement.Samples) > 0 || observation.Measurement.SourceReference != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func validRuntimeContainerState(state string, stale, clockSkew bool) bool {

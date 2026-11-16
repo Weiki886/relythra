@@ -2,8 +2,11 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,6 +88,82 @@ func TestQueryKeepsContainerInstancesSeparateAndMarksUnmappedEvidence(t *testing
 	}
 	if !result.Partial || !containsGap(result.Gaps, "container_oom_events_unavailable") || !containsGap(result.Gaps, "container_service_mapping_unavailable") {
 		t.Fatalf("missing evidence was not surfaced: %+v", result)
+	}
+}
+
+func TestQueryRecordsPerTemplateCollectionFailures(t *testing.T) {
+	metrics := &fakeMetrics{
+		series: map[string][]prometheus.Series{
+			"prometheus.runtime.host.cpu.v1": {hostSeries("host-a", 2.5)},
+		},
+		errorsByTemplate: map[string]error{
+			"prometheus.runtime.host.memory_available.v1": &prometheus.QueryError{Category: prometheus.ErrorTimeout},
+		},
+	}
+	logs := &fakeLogs{err: &loki.QueryError{Category: loki.ErrorUnauthorized}}
+	collector, err := NewCollector(metrics, logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := collector.Query(context.Background(), Target{}, validRequest(nil))
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if !result.Partial || len(result.Failures) != 2 {
+		t.Fatalf("partial failures = %+v, want two bounded failures", result)
+	}
+	want := []CollectionFailure{
+		{SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.memory_available.v1", TemplateVersion: 1, ReasonCode: CollectionFailureTimeout},
+		{SourceType: "LOKI", TemplateID: "loki.container.restarts.v1", TemplateVersion: 1, ReasonCode: CollectionFailurePermissionDenied},
+	}
+	if !reflect.DeepEqual(result.Failures, want) {
+		t.Fatalf("failures = %+v, want %+v", result.Failures, want)
+	}
+	if len(result.Hosts) != 1 || result.Hosts[0].CPU.Empty {
+		t.Fatalf("successful host evidence was not retained: %+v", result.Hosts)
+	}
+	encoded, err := json.Marshal(result.Failures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "sensitive") || strings.Contains(string(encoded), "token") {
+		t.Fatalf("raw error escaped into failure metadata: %s", encoded)
+	}
+}
+
+func TestQueryMapsUnclassifiedCollectionFailureToUnknown(t *testing.T) {
+	metrics := &fakeMetrics{err: errors.New("sensitive endpoint and token must not escape")}
+	collector, err := NewCollector(metrics, &fakeLogs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := collector.Query(context.Background(), Target{}, validRequest(nil))
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(result.Failures) != len(runtimeMetricTemplates) {
+		t.Fatalf("failures = %+v, want one entry per failed Prometheus template", result.Failures)
+	}
+	for _, failure := range result.Failures {
+		if failure.ReasonCode != CollectionFailureUnknown {
+			t.Fatalf("failure = %+v, want unknown reason", failure)
+		}
+	}
+}
+
+func TestQueryCancellationDoesNotBecomeCollectionFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	metrics := &fakeMetrics{}
+	logs := &fakeLogs{}
+	collector, err := NewCollector(metrics, logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := collector.Query(ctx, Target{}, validRequest(nil))
+	if !errors.Is(err, context.Canceled) || len(result.Failures) != 0 || metrics.calls != 0 || logs.calls != 0 {
+		t.Fatalf("result=%+v err=%v metric_calls=%d log_calls=%d", result, err, metrics.calls, logs.calls)
 	}
 }
 
@@ -390,13 +469,17 @@ func TestQueryDoesNotTrustMappedLabelsWithoutIdentityContract(t *testing.T) {
 }
 
 type fakeMetrics struct {
-	calls  int
-	series map[string][]prometheus.Series
-	err    error
+	calls            int
+	series           map[string][]prometheus.Series
+	err              error
+	errorsByTemplate map[string]error
 }
 
 func (fake *fakeMetrics) Query(_ context.Context, _ prometheus.Target, query datasource.NormalizedQuery) (prometheus.Result, error) {
 	fake.calls++
+	if err := fake.errorsByTemplate[query.TemplateID]; err != nil {
+		return prometheus.Result{}, err
+	}
 	if fake.err != nil {
 		return prometheus.Result{}, fake.err
 	}
