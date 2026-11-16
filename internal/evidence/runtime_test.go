@@ -126,6 +126,99 @@ func TestFromRuntimePreservesPrimaryObservations(t *testing.T) {
 	}
 }
 
+func TestFromRuntimeResultEmitsMissingEvidenceForFailedTemplate(t *testing.T) {
+	result, metadata := runtimeObservation()
+	result.Hosts[0].MemoryAvailable = runtimeconnector.Measurement{Samples: []prometheus.Sample{}, Empty: true, Stale: true}
+	result.Failures = []runtimeconnector.CollectionFailure{{
+		SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.memory_available.v1", TemplateVersion: 1,
+		ReasonCode: runtimeconnector.CollectionFailureTimeout,
+	}}
+	filter, _ := redact.NewFilter()
+	records, err := FromRuntimeResult(context.Background(), result, metadata, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != len(expectedRuntimeTemplates) {
+		t.Fatalf("record count = %d, want one record per template", len(records))
+	}
+	var failed Record
+	for _, record := range records {
+		var parameters struct {
+			TemplateID string `json:"template_id"`
+		}
+		if err := json.Unmarshal(record.QueryParameters, &parameters); err != nil {
+			t.Fatal(err)
+		}
+		if parameters.TemplateID == result.Failures[0].TemplateID {
+			failed = record
+			continue
+		}
+		if record.Completeness == CompletenessMissing {
+			t.Fatalf("unfailed template became missing: %+v", record)
+		}
+	}
+	if failed.ContentHash == "" || failed.SourceType != SourcePrometheus || failed.Completeness != CompletenessMissing ||
+		failed.EntityType != "HOST" || failed.EntityID == nil || *failed.EntityID != result.HostID || failed.InvestigationID != metadata.InvestigationID ||
+		failed.ObservedStart != result.Start || failed.ObservedEnd != result.End || failed.CollectedAt != metadata.CollectedAt {
+		t.Fatalf("failed template evidence = %+v", failed)
+	}
+	var summary map[string]any
+	if err := json.Unmarshal(failed.ValueSummary, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary["kind"] != "collection_gap" || summary["reason_code"] != string(CollectionFailureTimeout) {
+		t.Fatalf("gap summary = %s", failed.ValueSummary)
+	}
+	replayed, err := FromRuntimeResult(context.Background(), result, metadata, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range records {
+		if records[index].ContentHash != replayed[index].ContentHash {
+			t.Fatalf("replay changed evidence hash at index %d", index)
+		}
+	}
+}
+
+func TestFromRuntimeResultRejectsInvalidOrDuplicateCollectionFailures(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		failures []runtimeconnector.CollectionFailure
+	}{
+		{
+			name: "invalid template",
+			failures: []runtimeconnector.CollectionFailure{{
+				SourceType: "PROMETHEUS", TemplateID: "prometheus.anything.v1", TemplateVersion: 1,
+				ReasonCode: runtimeconnector.CollectionFailureTimeout,
+			}},
+		},
+		{
+			name: "unknown reason",
+			failures: []runtimeconnector.CollectionFailure{{
+				SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.cpu.v1", TemplateVersion: 1,
+				ReasonCode: runtimeconnector.CollectionFailureCode("raw secret value"),
+			}},
+		},
+		{
+			name: "duplicate template",
+			failures: []runtimeconnector.CollectionFailure{
+				{SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.cpu.v1", TemplateVersion: 1, ReasonCode: runtimeconnector.CollectionFailureTimeout},
+				{SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.cpu.v1", TemplateVersion: 1, ReasonCode: runtimeconnector.CollectionFailureTimeout},
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			result, metadata := runtimeObservation()
+			result.Failures = testCase.failures
+			filter, _ := redact.NewFilter()
+			records, err := FromRuntimeResult(context.Background(), result, metadata, filter)
+			if !errors.Is(err, ErrInvalidInput) || records != nil {
+				t.Fatalf("records=%t err=%v, want invalid input and no records", records != nil, err)
+			}
+		})
+	}
+}
+
 func TestFromRuntimePreservesContainerMappingVersion(t *testing.T) {
 	result, meta := runtimeObservation()
 	result.MappingVersion = 7

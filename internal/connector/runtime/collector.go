@@ -116,6 +116,25 @@ type Event struct {
 	Line              redact.UntrustedData `json:"line"`
 }
 
+type CollectionFailureCode string
+
+const (
+	CollectionFailureTimeout          CollectionFailureCode = "timeout"
+	CollectionFailureRateLimited      CollectionFailureCode = "rate_limited"
+	CollectionFailurePermissionDenied CollectionFailureCode = "permission_denied"
+	CollectionFailureUnavailable      CollectionFailureCode = "unavailable"
+	CollectionFailureInvalidResponse  CollectionFailureCode = "invalid_response"
+	CollectionFailureRequestRejected  CollectionFailureCode = "request_rejected"
+	CollectionFailureUnknown          CollectionFailureCode = "unknown"
+)
+
+type CollectionFailure struct {
+	SourceType      string                `json:"source_type"`
+	TemplateID      string                `json:"template_id"`
+	TemplateVersion int                   `json:"template_version"`
+	ReasonCode      CollectionFailureCode `json:"reason_code"`
+}
+
 type Result struct {
 	Runtime        datasource.RuntimeType `json:"runtime"`
 	Service        string                 `json:"service"`
@@ -129,6 +148,7 @@ type Result struct {
 	Containers     []Container            `json:"containers"`
 	Events         []Event                `json:"events"`
 	Gaps           []string               `json:"gaps"`
+	Failures       []CollectionFailure    `json:"collection_failures"`
 	Partial        bool                   `json:"partial"`
 }
 
@@ -173,7 +193,7 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 		Runtime: request.Runtime, Service: request.Service, Environment: request.Environment, HostID: request.HostID,
 		MappingVersion: request.MappingVersion,
 		Start:          request.Start, End: request.End,
-		Hosts: []Host{}, Containers: []Container{}, Events: []Event{}, Gaps: []string{},
+		Hosts: []Host{}, Containers: []Container{}, Events: []Event{}, Gaps: []string{}, Failures: []CollectionFailure{},
 	}
 
 	metricResults := make(map[string]prometheus.Result, 7)
@@ -196,6 +216,10 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 			}
 			result.Partial = true
 			result.Gaps = append(result.Gaps, specification.gap)
+			result.Failures = append(result.Failures, CollectionFailure{
+				SourceType: "PROMETHEUS", TemplateID: specification.id, TemplateVersion: 1,
+				ReasonCode: prometheusCollectionFailureCode(queryErr),
+			})
 			continue
 		}
 		metricResult.Series = rejectDuplicateSeries(metricResult.Series, &result)
@@ -237,6 +261,10 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 		}
 		result.Partial = true
 		result.Gaps = append(result.Gaps, "container_lifecycle_events_unavailable")
+		result.Failures = append(result.Failures, CollectionFailure{
+			SourceType: "LOKI", TemplateID: logQuery.TemplateID, TemplateVersion: 1,
+			ReasonCode: lokiCollectionFailureCode(err),
+		})
 	} else {
 		result.Events = normalizeEvents(logResult, request, result.Containers)
 		result.Partial = true
@@ -750,4 +778,52 @@ func measurementDelay(samples []prometheus.Sample, end time.Time) time.Duration 
 func opaqueIdentity(raw string) string {
 	digest := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(digest[:8])
+}
+
+func prometheusCollectionFailureCode(err error) CollectionFailureCode {
+	switch {
+	case prometheus.IsErrorCategory(err, prometheus.ErrorTimeout):
+		return CollectionFailureTimeout
+	case prometheus.IsErrorCategory(err, prometheus.ErrorRateLimited):
+		return CollectionFailureRateLimited
+	case prometheus.IsErrorCategory(err, prometheus.ErrorUnauthorized):
+		return CollectionFailurePermissionDenied
+	case prometheus.IsErrorCategory(err, prometheus.ErrorInvalidResponse),
+		prometheus.IsErrorCategory(err, prometheus.ErrorResponseTooLarge):
+		return CollectionFailureInvalidResponse
+	case prometheus.IsErrorCategory(err, prometheus.ErrorPolicyRejected),
+		prometheus.IsErrorCategory(err, prometheus.ErrorInvalidQuery):
+		return CollectionFailureRequestRejected
+	case prometheus.IsErrorCategory(err, prometheus.ErrorNetwork),
+		prometheus.IsErrorCategory(err, prometheus.ErrorRemoteUnavailable),
+		prometheus.IsErrorCategory(err, prometheus.ErrorSecretUnavailable):
+		return CollectionFailureUnavailable
+	default:
+		return CollectionFailureUnknown
+	}
+}
+
+func lokiCollectionFailureCode(err error) CollectionFailureCode {
+	switch {
+	case loki.IsErrorCategory(err, loki.ErrorTimeout):
+		return CollectionFailureTimeout
+	case loki.IsErrorCategory(err, loki.ErrorRateLimited):
+		return CollectionFailureRateLimited
+	case loki.IsErrorCategory(err, loki.ErrorUnauthorized):
+		return CollectionFailurePermissionDenied
+	case loki.IsErrorCategory(err, loki.ErrorInvalidResponse),
+		loki.IsErrorCategory(err, loki.ErrorResponseTooLarge):
+		return CollectionFailureInvalidResponse
+	case loki.IsErrorCategory(err, loki.ErrorPolicyRejected),
+		loki.IsErrorCategory(err, loki.ErrorInvalidQuery),
+		loki.IsErrorCategory(err, loki.ErrorInvalidCursor),
+		loki.IsErrorCategory(err, loki.ErrorCursorExpired):
+		return CollectionFailureRequestRejected
+	case loki.IsErrorCategory(err, loki.ErrorNetwork),
+		loki.IsErrorCategory(err, loki.ErrorRemoteUnavailable),
+		loki.IsErrorCategory(err, loki.ErrorSecretUnavailable):
+		return CollectionFailureUnavailable
+	default:
+		return CollectionFailureUnknown
+	}
 }
