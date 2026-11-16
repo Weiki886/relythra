@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Weiki886/relythra/internal/domain"
+	"github.com/Weiki886/relythra/internal/security/redact"
 )
 
 type GrafanaAlertInput struct {
@@ -45,8 +46,8 @@ type GrafanaAlertResult struct {
 
 type GrafanaAlertRepository interface {
 	ClaimDeploymentWebhookSignature(context.Context, []byte, time.Time) (bool, error)
-	IngestGrafanaAlerts(context.Context, []GrafanaAlertInput, string) ([]GrafanaAlertResult, error)
-	RemapGrafanaAlert(context.Context, string, int64, string, string) (GrafanaAlertResult, error)
+	IngestGrafanaAlerts(context.Context, []GrafanaAlertInput, string, *redact.Filter) ([]GrafanaAlertResult, error)
+	RemapGrafanaAlert(context.Context, string, int64, string, string, *redact.Filter) (GrafanaAlertResult, error)
 }
 
 func (repository *Postgres) RemapGrafanaAlert(
@@ -55,7 +56,11 @@ func (repository *Postgres) RemapGrafanaAlert(
 	expectedVersion int64,
 	serviceID string,
 	environment string,
+	filter *redact.Filter,
 ) (GrafanaAlertResult, error) {
+	if filter == nil {
+		return GrafanaAlertResult{}, redact.ErrUnsafeOutput
+	}
 	if !domain.IsID(alertID) || !domain.IsID(serviceID) || expectedVersion < 1 || !validGrafanaEnvironment(environment) {
 		return GrafanaAlertResult{}, ErrInvalidInput
 	}
@@ -99,10 +104,11 @@ func (repository *Postgres) RemapGrafanaAlert(
 		return GrafanaAlertResult{}, fmt.Errorf("update remapped Grafana incident: %w", err)
 	}
 	result := GrafanaAlertResult{Alert: updated, IncidentID: incidentID, MatchState: "MATCHED"}
-	if updated.Status == "FIRING" {
-		var investigationID string
-		err := tx.QueryRowContext(ctx, `SELECT id::text FROM investigations WHERE incident_id = $1 ORDER BY attempt DESC LIMIT 1`, incidentID).Scan(&investigationID)
-		if errors.Is(err, sql.ErrNoRows) {
+	var investigationID string
+	err = tx.QueryRowContext(ctx, `SELECT id::text FROM investigations WHERE incident_id = $1 ORDER BY attempt DESC LIMIT 1 FOR UPDATE`, incidentID).Scan(&investigationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+		if updated.Status == "FIRING" {
 			err = tx.QueryRowContext(ctx, `
 				INSERT INTO investigations (incident_id, service_id, environment)
 				VALUES ($1, $2, $3) RETURNING id::text
@@ -115,9 +121,22 @@ func (repository *Postgres) RemapGrafanaAlert(
 			}
 		}
 		if err != nil {
-			return GrafanaAlertResult{}, fmt.Errorf("create remapped Grafana investigation: %w", err)
+			return GrafanaAlertResult{}, fmt.Errorf("resolve remapped Grafana investigation: %w", err)
+		}
+	}
+	if investigationID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE investigations SET service_id=$2, environment=$3 WHERE id=$1`, investigationID, serviceID, environment); err != nil {
+			return GrafanaAlertResult{}, fmt.Errorf("update remapped Grafana investigation ownership: %w", err)
 		}
 		result.InvestigationID = investigationID
+		if _, _, err := persistGrafanaAlertEvidenceTx(ctx, tx, updated.ID, GrafanaAlertEvidenceContext{
+			InvestigationID: investigationID,
+			CollectedAt:     time.Now().UTC(),
+		}, filter); err != nil {
+			return GrafanaAlertResult{}, fmt.Errorf("persist Grafana alert evidence after remapping: %w", err)
+		}
+	}
+	if updated.Status == "FIRING" {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO deployment_candidates (project_id, incident_id, deployment_event_id, match_status, match_reason)
 			SELECT $1, $2, deployment.id,
@@ -147,7 +166,11 @@ func (repository *Postgres) IngestGrafanaAlerts(
 	ctx context.Context,
 	inputs []GrafanaAlertInput,
 	requestID string,
+	filter *redact.Filter,
 ) ([]GrafanaAlertResult, error) {
+	if filter == nil {
+		return nil, redact.ErrUnsafeOutput
+	}
 	if len(inputs) == 0 || len(inputs) > 100 || !validRequestID(requestID) {
 		return nil, ErrInvalidInput
 	}
@@ -161,6 +184,15 @@ func (repository *Postgres) IngestGrafanaAlerts(
 		result, err := ingestOneGrafanaAlert(ctx, tx, input, requestID)
 		if err != nil {
 			return nil, err
+		}
+		if result.InvestigationID != "" {
+			_, _, err := persistGrafanaAlertEvidenceTx(ctx, tx, result.Alert.ID, GrafanaAlertEvidenceContext{
+				InvestigationID: result.InvestigationID,
+				CollectedAt:     time.Now().UTC(),
+			}, filter)
+			if err != nil {
+				return nil, fmt.Errorf("persist Grafana alert evidence during ingestion: %w", err)
+			}
 		}
 		results = append(results, result)
 	}

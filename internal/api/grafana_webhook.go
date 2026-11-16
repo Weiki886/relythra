@@ -356,7 +356,7 @@ func (handler *handler) receiveGrafanaWebhook(w http.ResponseWriter, r *http.Req
 			SourceTimezone: alert.SourceTimezone, SourceTimeText: alert.SourceTimeText,
 		})
 	}
-	results, err := handler.grafanaAlerts.IngestGrafanaAlerts(r.Context(), inputs, RequestIDFromContext(r.Context()))
+	results, err := handler.grafanaAlerts.IngestGrafanaAlerts(r.Context(), inputs, RequestIDFromContext(r.Context()), handler.filter)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			handler.recordGrafanaWebhookError(w, r, http.StatusUnprocessableEntity, "needs_mapping", audit.ResultDenied)
@@ -455,7 +455,7 @@ func (handler *handler) remapGrafanaAlert(w http.ResponseWriter, r *http.Request
 			writeError(w, r, http.StatusBadRequest, "invalid_request", "alert remapping request is invalid")
 			return
 		}
-		result, err := handler.grafanaAlerts.RemapGrafanaAlert(r.Context(), alertID, request.ExpectedVersion, request.ServiceID, request.Environment)
+		result, err := handler.grafanaAlerts.RemapGrafanaAlert(r.Context(), alertID, request.ExpectedVersion, request.ServiceID, request.Environment, handler.filter)
 		if err != nil {
 			handler.writeStoreError(w, r, err)
 			return

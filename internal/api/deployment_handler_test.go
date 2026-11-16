@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Weiki886/relythra/internal/security/audit"
+	"github.com/Weiki886/relythra/internal/security/redact"
 	"github.com/Weiki886/relythra/internal/security/secrets"
 	"github.com/Weiki886/relythra/internal/store"
 )
@@ -23,31 +24,35 @@ const (
 )
 
 type fakeDeploymentRepository struct {
-	event            store.DeploymentEvent
-	created          bool
-	createInput      store.CreateDeploymentEventInput
-	updateInput      store.UpdateDeploymentEventInput
-	updateID         string
-	query            store.DeploymentCandidateQuery
-	candidates       []store.DeploymentEvent
-	err              error
-	createCalls      int
-	updateCalls      int
-	queryCalls       int
-	claimed          map[string]bool
-	claimCalls       int
-	grafanaInputs    []store.GrafanaAlertInput
-	grafanaRequestID string
-	grafanaResults   []store.GrafanaAlertResult
+	event              store.DeploymentEvent
+	created            bool
+	createInput        store.CreateDeploymentEventInput
+	updateInput        store.UpdateDeploymentEventInput
+	updateID           string
+	query              store.DeploymentCandidateQuery
+	candidates         []store.DeploymentEvent
+	err                error
+	createCalls        int
+	updateCalls        int
+	queryCalls         int
+	claimed            map[string]bool
+	claimCalls         int
+	grafanaInputs      []store.GrafanaAlertInput
+	grafanaRequestID   string
+	grafanaFilter      *redact.Filter
+	grafanaRemapFilter *redact.Filter
+	grafanaResults     []store.GrafanaAlertResult
 }
 
 func (repository *fakeDeploymentRepository) IngestGrafanaAlerts(
 	_ context.Context,
 	inputs []store.GrafanaAlertInput,
 	requestID string,
+	filter *redact.Filter,
 ) ([]store.GrafanaAlertResult, error) {
 	repository.grafanaInputs = inputs
 	repository.grafanaRequestID = requestID
+	repository.grafanaFilter = filter
 	return repository.grafanaResults, repository.err
 }
 
@@ -57,7 +62,9 @@ func (repository *fakeDeploymentRepository) RemapGrafanaAlert(
 	expectedVersion int64,
 	serviceID string,
 	environment string,
+	filter *redact.Filter,
 ) (store.GrafanaAlertResult, error) {
+	repository.grafanaRemapFilter = filter
 	return store.GrafanaAlertResult{
 		Alert:      store.Alert{ID: alertID, EventVersion: expectedVersion + 1},
 		IncidentID: "incident-id", MatchState: "MATCHED",
