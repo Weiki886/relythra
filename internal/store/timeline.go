@@ -22,6 +22,7 @@ type InvestigationTimelineFilter struct {
 	ContainerID  string
 	Completeness string
 	Stance       string
+	HypothesisID string
 }
 
 type InvestigationTimeline struct {
@@ -189,6 +190,9 @@ func ValidateInvestigationTimelineFilter(filter InvestigationTimelineFilter) err
 	if filter.Stance != "" && filter.Stance != "SUPPORTS" && filter.Stance != "CONTRADICTS" {
 		return fmt.Errorf("%w: invalid timeline stance", ErrInvalidInput)
 	}
+	if filter.HypothesisID != "" && !domain.IsID(filter.HypothesisID) {
+		return fmt.Errorf("%w: invalid timeline hypothesis ID", ErrInvalidInput)
+	}
 	if filter.EntityID != strings.TrimSpace(filter.EntityID) ||
 		len(filter.EntityID) > maxInvestigationTimelineEntityID {
 		return fmt.Errorf("%w: invalid timeline entity ID", ErrInvalidInput)
@@ -232,6 +236,14 @@ func investigationTimelineWhere(
 			SELECT 1 FROM hypothesis_evidence he
 			WHERE he.investigation_id = evidence.investigation_id
 			  AND he.evidence_id = evidence.id AND he.stance = $%d
+		)`, len(arguments)))
+	}
+	if filter.HypothesisID != "" {
+		arguments = append(arguments, filter.HypothesisID)
+		conditions = append(conditions, fmt.Sprintf(`EXISTS (
+			SELECT 1 FROM hypothesis_evidence he
+			WHERE he.investigation_id = evidence.investigation_id
+			  AND he.evidence_id = evidence.id AND he.hypothesis_id = $%d
 		)`, len(arguments)))
 	}
 	return " WHERE " + strings.Join(conditions, " AND "), arguments

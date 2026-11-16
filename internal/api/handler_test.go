@@ -211,7 +211,7 @@ func TestInvestigationTimelinePassesValidatedFiltersAndPagination(t *testing.T) 
 	response := serve(
 		NewHandler(reader, discardLogger()),
 		http.MethodGet,
-		"/api/v1/investigations/"+investigationID+"/timeline?source_type=LOKI&entity_id=service%3Aorders&container_id=opaque-container&completeness=EXPIRED&stance=SUPPORTS&limit=10&offset=5",
+		"/api/v1/investigations/"+investigationID+"/timeline?source_type=LOKI&entity_id=service%3Aorders&container_id=opaque-container&completeness=EXPIRED&stance=SUPPORTS&hypothesis_id=66666666-6666-4666-8666-666666666666&limit=10&offset=5",
 	)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
@@ -220,7 +220,7 @@ func TestInvestigationTimelinePassesValidatedFiltersAndPagination(t *testing.T) 
 		t.Fatalf("reader call = %d for %q", reader.calls, reader.timelineID)
 	}
 	if reader.filter != (store.InvestigationTimelineFilter{
-		SourceType: "LOKI", EntityID: "service:orders", ContainerID: "opaque-container", Completeness: "EXPIRED", Stance: "SUPPORTS",
+		SourceType: "LOKI", EntityID: "service:orders", ContainerID: "opaque-container", Completeness: "EXPIRED", Stance: "SUPPORTS", HypothesisID: "66666666-6666-4666-8666-666666666666",
 	}) {
 		t.Fatalf("filter = %#v", reader.filter)
 	}
@@ -257,6 +257,9 @@ func TestInvestigationTimelineRejectsInvalidQueryBeforeStore(t *testing.T) {
 		"source_type=UNKNOWN",
 		"completeness=INVALID",
 		"stance=INVALID",
+		"hypothesis_id=invalid",
+		"hypothesis_id=",
+		"hypothesis_id=66666666-6666-4666-8666-666666666666&hypothesis_id=77777777-7777-4777-8777-777777777777",
 		"stance=",
 		"stance=SUPPORTS&stance=CONTRADICTS",
 		"entity_id=%20",

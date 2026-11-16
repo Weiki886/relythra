@@ -956,6 +956,7 @@ func TestGetInvestigationTimelineRejectsInvalidInputsBeforeDatabaseAccess(t *tes
 		{name: "bad source", id: validID, filter: InvestigationTimelineFilter{SourceType: "UNKNOWN"}, limit: 1},
 		{name: "bad completeness", id: validID, filter: InvestigationTimelineFilter{Completeness: "INVALID"}, limit: 1},
 		{name: "bad stance", id: validID, filter: InvestigationTimelineFilter{Stance: "INVALID"}, limit: 1},
+		{name: "bad hypothesis ID", id: validID, filter: InvestigationTimelineFilter{HypothesisID: "bad"}, limit: 1},
 		{name: "oversized container ID", id: validID, filter: InvestigationTimelineFilter{ContainerID: strings.Repeat("x", maxInvestigationTimelineContainerID+1)}, limit: 1},
 		{name: "oversized page", id: validID, limit: 101},
 		{name: "negative offset", id: validID, limit: 1, offset: -1},
@@ -1014,11 +1015,12 @@ func TestTimelineStanceFiltersRelationsWithoutDuplicates(t *testing.T) {
 	unlinked := insertEvidence(fixture, "RUNTIME", "e")
 	foreign := insertEvidence(other, "LOKI", "c")
 	h1, h2 := insertHypothesis(fixture, 1), insertHypothesis(fixture, 2)
+	hForeign := insertHypothesis(other, 1)
 	link(fixture, h1, first, "SUPPORTS")
 	link(fixture, h2, first, "CONTRADICTS")
 	link(fixture, h1, second, "CONTRADICTS")
 	link(fixture, h2, third, "SUPPORTS")
-	link(other, insertHypothesis(other, 1), foreign, "SUPPORTS")
+	link(other, hForeign, foreign, "SUPPORTS")
 	repository := NewPostgres(db)
 	for _, tc := range []struct{ stance, source, want string }{
 		{"CONTRADICTS", "PROMETHEUS", second}, {"CONTRADICTS", "LOKI", first}, {"SUPPORTS", "LOKI", first},
@@ -1052,6 +1054,29 @@ func TestTimelineStanceFiltersRelationsWithoutDuplicates(t *testing.T) {
 		InvestigationTimelineFilter{}, 10, 0)
 	if err != nil || page.Total != 4 {
 		t.Fatalf("unfiltered page: got %+v, err %v", page, err)
+	}
+	page, err = repository.GetInvestigationTimeline(ctx, fixture.investigationID,
+		InvestigationTimelineFilter{HypothesisID: h1}, 10, 0)
+	if err != nil || page.Total != 2 || len(page.Items) != 2 || page.HasMore {
+		t.Fatalf("hypothesis %s page: got %+v, err %v", h1, page, err)
+	}
+	for _, item := range page.Items {
+		if item.ID != first && item.ID != second {
+			t.Fatalf("hypothesis %s returned unrelated evidence %s", h1, item.ID)
+		}
+		if item.ID == first && len(item.Relations) != 2 {
+			t.Fatalf("hypothesis-filtered evidence lost its full relation set: %+v", item.Relations)
+		}
+	}
+	page, err = repository.GetInvestigationTimeline(ctx, fixture.investigationID,
+		InvestigationTimelineFilter{HypothesisID: h2, Stance: "CONTRADICTS"}, 10, 0)
+	if err != nil || page.Total != 1 || len(page.Items) != 1 || page.Items[0].ID != first {
+		t.Fatalf("hypothesis and stance page: got %+v, err %v", page, err)
+	}
+	foreignPage, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID,
+		InvestigationTimelineFilter{HypothesisID: hForeign}, 10, 0)
+	if err != nil || foreignPage.Total != 0 || len(foreignPage.Items) != 0 {
+		t.Fatalf("foreign hypothesis page: got %+v, err %v", foreignPage, err)
 	}
 	for _, item := range page.Items {
 		if item.ID == unlinked && (item.Relations == nil || len(item.Relations) != 0) {
