@@ -137,3 +137,65 @@ func persistGrafanaAlertEvidenceTx(ctx context.Context, tx *sql.Tx, alertID stri
 	}
 	return item, created, nil
 }
+
+func persistGrafanaDeploymentCandidateEvidenceTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	investigationID string,
+	collectedAt time.Time,
+	filter *redact.Filter,
+) error {
+	if filter == nil {
+		return redact.ErrUnsafeOutput
+	}
+	if !domain.IsID(investigationID) || collectedAt.IsZero() {
+		return ErrInvalidInput
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+prefixedDeploymentColumns("deployment")+`
+		FROM investigations investigation
+		JOIN incidents incident ON incident.id=investigation.incident_id
+		JOIN deployment_candidates candidate ON candidate.incident_id=incident.id
+		JOIN deployment_events deployment ON deployment.id=candidate.deployment_event_id
+		WHERE investigation.id=$1
+		  AND candidate.project_id=incident.project_id
+		  AND deployment.project_id=incident.project_id
+		  AND deployment.service_id=investigation.service_id
+		  AND deployment.environment=investigation.environment
+		  AND candidate.match_status IN ('MATCHED', 'AMBIGUOUS')
+		ORDER BY deployment.started_at, deployment.id
+		LIMIT 100
+	`, investigationID)
+	if err != nil {
+		return fmt.Errorf("query investigation deployment candidates: %w", err)
+	}
+	deployments := make([]DeploymentEvent, 0, 100)
+	for rows.Next() {
+		deployment, err := scanDeploymentEvent(rows)
+		if err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan investigation deployment candidate: %w", err)
+		}
+		deployments = append(deployments, deployment)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("read investigation deployment candidates: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close investigation deployment candidates: %w", err)
+	}
+	for _, deployment := range deployments {
+		record, err := DeploymentEvidence(ctx, deployment, DeploymentEvidenceContext{
+			InvestigationID: investigationID,
+			CollectedAt:     collectedAt,
+		}, filter)
+		if err != nil {
+			return fmt.Errorf("normalize investigation deployment candidate: %w", err)
+		}
+		if _, _, err := persistValidatedEvidence(ctx, tx, record); err != nil {
+			return fmt.Errorf("persist investigation deployment candidate: %w", err)
+		}
+	}
+	return nil
+}
