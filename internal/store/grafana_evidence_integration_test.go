@@ -89,6 +89,127 @@ func TestIngestGrafanaAlertsPersistsEvidenceAtomically(t *testing.T) {
 	}
 }
 
+func TestIngestGrafanaAlertsPersistsDeploymentCandidateEvidence(t *testing.T) {
+	db := openStoreTestDB(t)
+	ctx := context.Background()
+	repository := NewPostgres(db)
+	fixture := insertStoreFixture(t, ctx, db, "grafana-deployment-evidence")
+	deploymentInput := fixture.deploymentInput("grafana-deployment-evidence-1")
+	deploymentInput.SourceReference = "https://example.com/deployments/1"
+	deployment, created, err := repository.CreateDeploymentEvent(ctx, deploymentInput)
+	if err != nil || !created {
+		t.Fatalf("create deployment event: created=%v err=%v", created, err)
+	}
+	secondDeploymentInput := fixture.deploymentInput("grafana-deployment-evidence-2")
+	secondDeploymentInput.SourceReference = "https://example.com/deployments/2"
+	secondDeployment, created, err := repository.CreateDeploymentEvent(ctx, secondDeploymentInput)
+	if err != nil || !created {
+		t.Fatalf("create second deployment event: created=%v err=%v", created, err)
+	}
+	filter := mustGrafanaEvidenceFilter(t)
+	input := fixtureAlertInput(fixture, "grafana-deployment-evidence-alert")
+	input.ProjectSlug = "grafana-deployment-evidence"
+	results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-deployment-evidence-request", filter)
+	if err != nil {
+		t.Fatalf("ingest Grafana alert: %v", err)
+	}
+	if len(results) != 1 || results[0].InvestigationID == "" || results[0].DeploymentCount != 2 {
+		t.Fatalf("ingestion result = %+v, want one investigation and both deployment candidates", results)
+	}
+	assertDeploymentEvidence(t, ctx, db, results[0].InvestigationID, deployment.ID, 1)
+	assertDeploymentEvidence(t, ctx, db, results[0].InvestigationID, secondDeployment.ID, 1)
+
+	if _, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-deployment-evidence-replay", filter); err != nil {
+		t.Fatalf("replay Grafana alert: %v", err)
+	}
+	assertDeploymentEvidence(t, ctx, db, results[0].InvestigationID, deployment.ID, 1)
+	assertDeploymentEvidence(t, ctx, db, results[0].InvestigationID, secondDeployment.ID, 1)
+
+	timeline, err := repository.GetInvestigationTimeline(ctx, results[0].InvestigationID, InvestigationTimelineFilter{SourceType: "DEPLOYMENT"}, 10, 0)
+	if err != nil {
+		t.Fatalf("read deployment evidence timeline: %v", err)
+	}
+	if timeline.Total != 2 || len(timeline.Items) != 2 || timeline.Items[0].Evidence.Completeness != "COMPLETE" || timeline.Items[1].Evidence.Completeness != "COMPLETE" {
+		t.Fatalf("deployment timeline = %+v, want both complete candidate facts", timeline)
+	}
+}
+
+func TestIngestGrafanaAlertsRollsBackDeploymentCandidateEvidence(t *testing.T) {
+	db := openStoreTestDB(t)
+	ctx := context.Background()
+	repository := NewPostgres(db)
+	fixture := insertStoreFixture(t, ctx, db, "grafana-deployment-evidence-rollback")
+	deploymentInput := fixture.deploymentInput("grafana-deployment-evidence-rollback")
+	deploymentInput.SourceReference = "https://example.com/deployments/rollback"
+	deployment, _, err := repository.CreateDeploymentEvent(ctx, deploymentInput)
+	if err != nil {
+		t.Fatalf("create deployment event: %v", err)
+	}
+	valid := fixtureAlertInput(fixture, "grafana-deployment-evidence-rollback-alert")
+	valid.ProjectSlug = "grafana-deployment-evidence-rollback"
+	invalid := fixtureAlertInput(fixture, "grafana-deployment-evidence-rollback-invalid")
+	invalid.ProjectSlug = "missing-project"
+	if _, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{valid, invalid}, "grafana-deployment-evidence-rollback-request", mustGrafanaEvidenceFilter(t)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("batch ingestion error = %v, want ErrNotFound", err)
+	}
+	var alertCount, evidenceCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM alerts WHERE fingerprint=$1`, valid.Fingerprint).Scan(&alertCount); err != nil {
+		t.Fatalf("count rolled-back alert: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM evidence WHERE source_type='DEPLOYMENT' AND query_parameters->>'deployment_event_id'=$1`, deployment.ID).Scan(&evidenceCount); err != nil {
+		t.Fatalf("count rolled-back deployment evidence: %v", err)
+	}
+	if alertCount != 0 || evidenceCount != 0 {
+		t.Fatalf("rollback state: alerts=%d deployment evidence=%d, want both zero", alertCount, evidenceCount)
+	}
+}
+
+func TestRemapGrafanaAlertPersistsDeploymentCandidateEvidence(t *testing.T) {
+	db := openStoreTestDB(t)
+	ctx := context.Background()
+	repository := NewPostgres(db)
+	fixture := insertStoreFixture(t, ctx, db, "grafana-remap-deployment-evidence")
+	deploymentInput := fixture.deploymentInput("grafana-remap-deployment-evidence")
+	deploymentInput.SourceReference = "https://example.com/deployments/remap"
+	deployment, _, err := repository.CreateDeploymentEvent(ctx, deploymentInput)
+	if err != nil {
+		t.Fatalf("create deployment event: %v", err)
+	}
+	input := fixtureAlertInput(fixture, "grafana-remap-deployment-evidence-alert")
+	input.ProjectSlug = "grafana-remap-deployment-evidence"
+	input.ServiceSlug = "unmapped-service"
+	filter := mustGrafanaEvidenceFilter(t)
+	results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-remap-deployment-evidence-request", filter)
+	if err != nil {
+		t.Fatalf("ingest unmapped alert: %v", err)
+	}
+	if len(results) != 1 || results[0].InvestigationID != "" {
+		t.Fatalf("unmapped ingestion result = %+v, want no investigation", results)
+	}
+	remapped, err := repository.RemapGrafanaAlert(ctx, results[0].Alert.ID, results[0].Alert.EventVersion, fixture.serviceID, "prod", filter)
+	if err != nil {
+		t.Fatalf("remap Grafana alert: %v", err)
+	}
+	if remapped.InvestigationID == "" || remapped.DeploymentCount != 1 {
+		t.Fatalf("remapped result = %+v, want investigation with one deployment candidate", remapped)
+	}
+	assertDeploymentEvidence(t, ctx, db, remapped.InvestigationID, deployment.ID, 1)
+}
+
+func assertDeploymentEvidence(t *testing.T, ctx context.Context, db *sql.DB, investigationID, deploymentID string, want int) {
+	t.Helper()
+	var count int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM evidence
+		WHERE source_type='DEPLOYMENT' AND investigation_id=$1 AND query_parameters->>'deployment_event_id'=$2
+	`, investigationID, deploymentID).Scan(&count); err != nil {
+		t.Fatalf("count deployment candidate evidence: %v", err)
+	}
+	if count != want {
+		t.Fatalf("deployment evidence count=%d, want %d", count, want)
+	}
+}
+
 func mustGrafanaEvidenceFilter(t *testing.T, secrets ...string) *redact.Filter {
 	t.Helper()
 	filter, err := redact.NewFilter(secrets...)

@@ -155,6 +155,9 @@ func (repository *Postgres) RemapGrafanaAlert(
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM deployment_candidates WHERE incident_id = $1`, incidentID).Scan(&result.DeploymentCount); err != nil {
 			return GrafanaAlertResult{}, fmt.Errorf("count remapped deployment candidates: %w", err)
 		}
+		if err := persistGrafanaDeploymentCandidateEvidenceTx(ctx, tx, investigationID, time.Now().UTC(), filter); err != nil {
+			return GrafanaAlertResult{}, fmt.Errorf("persist deployment candidate evidence after Grafana remapping: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return GrafanaAlertResult{}, fmt.Errorf("commit Grafana alert remapping: %w", err)
@@ -186,12 +189,16 @@ func (repository *Postgres) IngestGrafanaAlerts(
 			return nil, err
 		}
 		if result.InvestigationID != "" {
+			collectedAt := time.Now().UTC()
 			_, _, err := persistGrafanaAlertEvidenceTx(ctx, tx, result.Alert.ID, GrafanaAlertEvidenceContext{
 				InvestigationID: result.InvestigationID,
-				CollectedAt:     time.Now().UTC(),
+				CollectedAt:     collectedAt,
 			}, filter)
 			if err != nil {
 				return nil, fmt.Errorf("persist Grafana alert evidence during ingestion: %w", err)
+			}
+			if err := persistGrafanaDeploymentCandidateEvidenceTx(ctx, tx, result.InvestigationID, collectedAt, filter); err != nil {
+				return nil, fmt.Errorf("persist deployment candidate evidence during Grafana ingestion: %w", err)
 			}
 		}
 		results = append(results, result)
