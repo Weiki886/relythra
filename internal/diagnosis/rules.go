@@ -103,6 +103,7 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 	seenIDs := make(map[string]struct{}, len(input.Evidence))
 	var latencyEvidence, slowQueryEvidence []matchedEvidence
 	latencySourcePresent, slowQuerySourcePresent := false, false
+	independenceMismatch := false
 	for _, item := range input.Evidence {
 		if !domain.IsID(item.ID) || item.InvestigationID != input.InvestigationID {
 			return AnalysisResult{}, ErrInvalidInput
@@ -132,6 +133,10 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 		switch {
 		case item.SourceType == "PROMETHEUS" && metadata.TemplateID == latencyTemplateID:
 			latencySourcePresent = true
+			if item.IndependenceGroup != "prometheus:prometheus.database.query_latency.v1:v1" {
+				independenceMismatch = true
+				continue
+			}
 			var summary prometheusSummary
 			if err := json.Unmarshal(item.ValueSummary, &summary); err != nil {
 				return AnalysisResult{}, fmt.Errorf("%w: decode Prometheus Evidence summary", ErrInvalidInput)
@@ -141,6 +146,10 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 			}
 		case item.SourceType == "LOKI" && metadata.TemplateID == slowQueryTemplateID:
 			slowQuerySourcePresent = true
+			if item.IndependenceGroup != "loki:loki.service.slow_queries.v1:v1" {
+				independenceMismatch = true
+				continue
+			}
 			var summary lokiSummary
 			if err := json.Unmarshal(item.ValueSummary, &summary); err != nil {
 				return AnalysisResult{}, fmt.Errorf("%w: decode Loki Evidence summary", ErrInvalidInput)
@@ -163,6 +172,9 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 	}
 	if slowQuerySourcePresent && len(slowQueryEvidence) == 0 {
 		missing["slow_query_log_in_window"] = struct{}{}
+	}
+	if independenceMismatch {
+		missing["approved_independence_groups"] = struct{}{}
 	}
 
 	byService := make(map[string]*Candidate)

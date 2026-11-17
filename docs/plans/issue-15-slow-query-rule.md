@@ -52,11 +52,15 @@ there is no persisted state to clean up.
 - Ruling: when multiple evidence pairs exist for one service, a complete pair
   preserves `MEDIUM` confidence even if other pairs are partial. A regression
   test failed before this adjustment and passes afterward.
+- Ruling: matching the source and template is not enough to satisfy the rule's
+  independent-evidence requirement. Both approved `IndependenceGroup` values
+  must match exactly; a regression test failed before enforcement and passes
+  afterward.
 - The output deliberately uses symptom language (`DATABASE_PERFORMANCE`),
   stable Evidence references, and no deployment attribution or numeric
   threshold. Unsupported templates are ignored; malformed recognized evidence
   is rejected as invalid input.
-- Final validation passed after the last rule/test change:
+- Final validation passed after the independence-group change:
   `go test -race ./internal/diagnosis -count=1`; full `make check` with an
   isolated local PostgreSQL test schema; `gitleaks dir --no-banner --redact`;
   and `git diff --check`.

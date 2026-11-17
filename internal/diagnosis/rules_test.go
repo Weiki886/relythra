@@ -65,6 +65,14 @@ func TestAnalyzeSlowQueryRequiresSameServiceAndInWindowObservations(t *testing.T
 			missing: []string{"same_service"},
 		},
 		{
+			name: "unapproved independence group",
+			mutate: func(items []Evidence) []Evidence {
+				items[0].IndependenceGroup = "shared:unknown"
+				return items
+			},
+			missing: []string{"approved_independence_groups"},
+		},
+		{
 			name: "no timestamp correlation",
 			mutate: func(items []Evidence) []Evidence {
 				items[1] = ruleSlowQueryEvidence(t, slowQueryEvidenceID, ruleTestInvestigationID, ruleTestServiceID, "COMPLETE", start.Add(6*time.Minute), start.Add(10*time.Minute), start.Add(7*time.Minute))
