@@ -7,8 +7,9 @@ using the existing normalization and timeline contracts.
 
 ## Scope
 
-- Add `Postgres.PersistPrometheusEvidence` to validate the Investigation and
-  derive its service entity while holding a shared row lock.
+- Add `Postgres.PersistPrometheusEvidence` to require a validated service entity
+  from the caller, then verify it against the Investigation under a shared row
+  lock.
 - Normalize the connector result with the existing `evidence.FromPrometheusResult`
   adapter and persist it through `persistValidatedEvidence` in the same transaction.
 - Cover valid writes, replay idempotency, timeline readback, missing or foreign
@@ -26,9 +27,9 @@ using the existing normalization and timeline contracts.
 
 1. Write PostgreSQL integration tests for success/replay/readback and ownership
    rejection; confirm the new method is missing before implementation.
-2. Implement one transaction that locks the Investigation, checks its service
-   against any supplied service entity, derives canonical `SERVICE` identity,
-   normalizes, inserts idempotently, and commits.
+2. Implement one transaction that requires a UUID service entity, locks the
+   Investigation, rejects a service mismatch, normalizes with canonical
+   `SERVICE` identity, inserts idempotently, and commits.
 3. Run focused tests, race tests for store/evidence/API, `make check`, Gitleaks,
    and `git diff --check`. Report local checks separately from remote CI.
 
@@ -43,13 +44,23 @@ immutable and does not require data cleanup.
 
 - RED: the focused store tests failed to compile because
   `PersistPrometheusEvidence` did not exist.
+- CI regression: Backend reported that a result with no service identity could
+  be attached to another Investigation. Added a focused test and confirmed it
+  failed against the implementation (`nil`, expected `ErrInvalidInput`).
+- Ruling: Prometheus connector results contain no Investigation/service owner.
+  Persistence now requires the caller's validated SERVICE UUID and confirms it
+  matches the locked Investigation before writing.
 - GREEN: `go test ./internal/store -run 'TestPersistPrometheusEvidence' -count=1`
   passed with PostgreSQL, including ownership, replay, missing-result and
   timeline assertions.
 - `go test -race ./internal/store ./internal/evidence ./internal/api -count=1`
   passed.
-- `RELYTHRA_POSTGRES_PASSWORD_FILE=/dev/null RELYTHRA_MANAGEMENT_TOKEN_FILE=/dev/null make check`
+- With `RELYTHRA_TEST_DATABASE_URL` set to the local `relythra` test database,
+  `go test -race ./internal/store ./internal/evidence ./internal/api -count=1`
+  passed with PostgreSQL integration tests enabled.
+- With the same test database configured,
+  `RELYTHRA_POSTGRES_PASSWORD_FILE=/dev/null RELYTHRA_MANAGEMENT_TOKEN_FILE=/dev/null make check`
   passed, including Go vet/tests/build, frontend lint/typecheck/tests/build,
   diagnosis case validation, Compose rendering and local startup-script checks.
 - `gitleaks dir --no-banner --redact` and `git diff --check` passed.
-- No container smoke was run; remote CI will be reported from the PR checks.
+- No local container smoke was run; remote CI is being rechecked on the fix commit.

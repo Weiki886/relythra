@@ -22,6 +22,8 @@ func TestPersistPrometheusEvidenceValidatesOwnershipAndReplays(t *testing.T) {
 	}
 	metadata := evidence.PrometheusEvidenceContext{
 		InvestigationID: fixture.investigationID,
+		EntityType:      "SERVICE",
+		EntityID:        fixture.serviceID,
 		CollectedAt:     fixture.startedAt.Add(5*time.Minute + 2*time.Second),
 	}
 	result := prometheusResult(fixture.startedAt)
@@ -62,6 +64,8 @@ func TestPersistPrometheusEvidencePreservesEmptyResultAsMissing(t *testing.T) {
 
 	item, created, err := repository.PersistPrometheusEvidence(ctx, result, evidence.PrometheusEvidenceContext{
 		InvestigationID: fixture.investigationID,
+		EntityType:      "SERVICE",
+		EntityID:        fixture.serviceID,
 		CollectedAt:     fixture.startedAt.Add(5 * time.Minute),
 	}, filter)
 	if err != nil || !created {
@@ -82,6 +86,8 @@ func TestPersistPrometheusEvidenceRejectsForeignInvestigationAndService(t *testi
 	result := prometheusResult(fixture.startedAt)
 	metadata := evidence.PrometheusEvidenceContext{
 		InvestigationID: other.investigationID,
+		EntityType:      "SERVICE",
+		EntityID:        fixture.serviceID,
 		CollectedAt:     fixture.startedAt.Add(5 * time.Minute),
 	}
 	if _, _, err := repository.PersistPrometheusEvidence(ctx, result, metadata, filter); !errors.Is(err, ErrNotFound) {
@@ -112,10 +118,27 @@ func TestPersistPrometheusEvidenceRejectsInvalidContextBeforeDatabaseAccess(t *t
 	start := time.Date(2026, 11, 8, 10, 0, 0, 0, time.UTC)
 	metadata := evidence.PrometheusEvidenceContext{
 		InvestigationID: "invalid",
+		EntityType:      "SERVICE",
+		EntityID:        "55555555-5555-4555-8555-555555555555",
 		CollectedAt:     start.Add(5 * time.Minute),
 	}
 	if _, _, err := NewPostgres(nil).PersistPrometheusEvidence(context.Background(), prometheusResult(start), metadata, filter); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("invalid context error = %v, want ErrInvalidInput", err)
+	}
+}
+
+func TestPersistPrometheusEvidenceRequiresVerifiedServiceEntity(t *testing.T) {
+	db := openStoreTestDB(t)
+	ctx := context.Background()
+	fixture := insertStoreFixture(t, ctx, db, "prometheus-evidence-service-required")
+	repository := NewPostgres(db)
+	filter, _ := redact.NewFilter()
+	metadata := evidence.PrometheusEvidenceContext{
+		InvestigationID: fixture.investigationID,
+		CollectedAt:     fixture.startedAt.Add(5 * time.Minute),
+	}
+	if _, _, err := repository.PersistPrometheusEvidence(ctx, prometheusResult(fixture.startedAt), metadata, filter); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("missing service identity error = %v, want ErrInvalidInput", err)
 	}
 }
 

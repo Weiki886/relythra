@@ -24,10 +24,11 @@ func (repository *Postgres) PersistPrometheusEvidence(
 	if filter == nil {
 		return Evidence{}, false, redact.ErrUnsafeOutput
 	}
-	if !domain.IsID(meta.InvestigationID) || (meta.ToolCallID != "" && !domain.IsID(meta.ToolCallID)) || meta.CollectedAt.IsZero() {
+	if !domain.IsID(meta.InvestigationID) || (meta.ToolCallID != "" && !domain.IsID(meta.ToolCallID)) ||
+		!domain.IsID(meta.EntityID) || meta.CollectedAt.IsZero() {
 		return Evidence{}, false, ErrInvalidInput
 	}
-	if meta.EntityType != "" && !strings.EqualFold(meta.EntityType, "SERVICE") {
+	if !strings.EqualFold(meta.EntityType, "SERVICE") {
 		return Evidence{}, false, ErrInvalidInput
 	}
 
