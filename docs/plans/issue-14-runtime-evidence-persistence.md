@@ -48,13 +48,15 @@ persisted immutable evidence remains valid and requires no cleanup.
 
 - RED: `go test ./internal/store -run '^TestPersistRuntimeEvidence' -count=1`
   failed to compile because the persistence context and method were missing.
-- GREEN: the same focused command passed after implementation, exercising the
-  PostgreSQL integration cases for batch persistence, replay, ownership and
-  rollback.
-- `go test -race ./internal/store ./internal/evidence ./internal/api -count=1`
-  passed.
-- `RELYTHRA_MANAGEMENT_TOKEN_FILE=/dev/null
+- GREEN: `RELYTHRA_TEST_DATABASE_URL=<isolated-local-postgres-url> go test
+  ./internal/store -run '^TestPersistRuntimeEvidence' -count=1 -v` passed against
+  PostgreSQL, exercising batch persistence, replay, ownership and rollback.
+- `RELYTHRA_TEST_DATABASE_URL=<isolated-local-postgres-url> go test -race
+  ./internal/store ./internal/evidence ./internal/api -count=1` passed.
+- `RELYTHRA_TEST_DATABASE_URL=<isolated-local-postgres-url>
+  RELYTHRA_MANAGEMENT_TOKEN_FILE=/dev/null
   RELYTHRA_POSTGRES_PASSWORD_FILE=/dev/null make check` passed, including Go,
   frontend, case validation, Compose rendering and local startup script checks.
-  The placeholder paths were used only for Compose configuration rendering.
+  The PostgreSQL tests use isolated temporary schemas; placeholder secret paths
+  were used only for Compose configuration rendering.
 - `gitleaks dir --no-banner --redact` and `git diff --check` passed.

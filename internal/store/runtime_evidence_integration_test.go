@@ -171,7 +171,7 @@ func storeRuntimeObservation(fixture storeFixture) runtimeconnector.Result {
 			Load:            measurement(1, "https://prometheus.example.test/api/v1/query_range"),
 		}},
 		Containers: []runtimeconnector.Container{{
-			ID: "opaque-cgroup", InstanceID: "opaque-incarnation", HostID: "host-1", Service: "checkout-api",
+			ID: "opaque-cgroup", InstanceID: "opaque-incarnation", HostID: "host-1",
 			MappingStatus: "raw_cgroup_only", StartTime: &startedAt,
 			StartEvidence: measurement(float64(startedAt.Unix()), "https://prometheus.example.test/api/v1/query_range"),
 			CPU:           measurement(0.1, "https://prometheus.example.test/api/v1/query_range"),
