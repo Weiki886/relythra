@@ -220,8 +220,26 @@ a {
   border-bottom: 1px solid #dce4df;
   margin: 1.2rem 0 0;
 }
-.diagnosis-section {
+.diagnosis-section,
+.context-section {
   padding: 1.5rem 0;
+}
+.context-section {
+  border-bottom: 1px solid #dce4df;
+}
+.context-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 2rem;
+}
+.context-layout > * {
+  min-width: 0;
+}
+.context-id {
+  display: block;
+}
+.alert-title {
+  overflow-wrap: anywhere;
 }
 .diagnosis-summary {
   display: flex;
@@ -382,6 +400,10 @@ pre {
   color: #65726b;
 }
 @media (max-width: 760px) {
+  .context-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
   .shell {
     width: calc(100% - 2rem);
     padding-top: 1.25rem;

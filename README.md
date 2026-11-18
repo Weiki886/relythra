@@ -27,11 +27,13 @@ Relythra 是一个面向发布后异常排查的只读诊断系统：关联发�
 
 - Web：<http://127.0.0.1:5173>
 - API readiness：<http://127.0.0.1:8080/health/ready>
-- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/investigations/{id}/diagnosis`、`/api/v1/deployments/{id}`
+- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/investigations/{id}/diagnosis`、`/api/v1/deployments/{id}`
 
 Web 首页提供基础只读调查工作台。输入已有 Investigation UUID，或打开 `/?investigation=<uuid>`，可查看固定规则候选、定性置信等级、证据缺口及 UTC 时间线；时间线支持来源/完整度筛选和每页 50 条分页。点击候选的支持/反证引用或时间线项目，查看 Evidence 的查询、参数、观测摘要、完整度和原始来源。只有不带 userinfo 的绝对 HTTP(S) 引用可点击，其他引用保留为文本。
 
-诊断、时间线与 Evidence 详情独立加载和重试，单次请求最多等待 15 秒；页面筛选不改变诊断输入。各区域是分别读取的快照，不能当作同一时刻的原子结果。空时间线或 `INCONCLUSIVE` 都不代表服务健康。当前按 ID 查询已有记录，不提供调查列表、告警摘要、服务/环境名称、指标趋势图或自动采集；没有真实记录时不展示模拟结果。Vite 与 Compose 的 Web 入口转发 `/api/` 到 API，沿用本地/受信网络访问边界，不增加生产认证能力，也不需要在浏览器保存管理 Token。
+顶部调查摘要展示项目、服务、环境、调查生命周期和可选关联告警（状态、级别、摘要、UTC 时间及来源）。摘要、诊断和时间线各自读取、独立失败与重试，切换调查隐藏旧数据。`GET /api/v1/investigations/{id}` 不接受查询参数；通过一个数据库语句读取当前登记状态，字段只包含展示所需信息，不返回 labels、annotations、Webhook payload、SecretRef 或数据源配置。`mapping_status` 只描述调查/Incident/告警的实体关联：`MATCHED` 表示服务与环境一致，`NEEDS_MAPPING` 表示缺失，`CONFLICT` 表示记录间不一致或服务不属于项目（隐藏服务与环境，返回 `mapping_conflict`）。无告警时 `alert=null` 并标记 `alert_not_linked`，不伪造告警。实体映射不证明数据源就绪；告警恢复不代表调查已结束或根因已确认。摘要是当前状态，Evidence 仍是独立的历史观测快照。待映射 Grafana 告警按 ADR 0008 不会自动创建 Investigation，本摘要仅能读取已存在的调查，不能代替待映射告警管理入口。
+
+诊断、时间线与 Evidence 详情独立加载和重试，单次请求最多等待 15 秒；页面筛选不改变诊断输入。各区域是分别读取的快照，不能当作同一时刻的原子结果。空时间线或 `INCONCLUSIVE` 都不代表服务健康。当前按 ID 查询已有记录，不提供调查列表、部署候选独立视图、指标趋势图或自动采集；没有真实记录时不展示模拟结果。Vite 与 Compose 的 Web 入口转发 `/api/` 到 API，沿用本地/受信网络访问边界，不增加生产认证能力，也不需要在浏览器保存管理 Token。
 
 `GET /api/v1/investigations/{id}/timeline` 返回该 Investigation 已持久化的 Evidence，支持 `source_type`、`entity_id`、`container_id`、`completeness`、`stance`、`limit` 和 `offset`。`container_id` 按不透明 ID 精确匹配运行时 Evidence `value_summary.measurements` 中 `entity_type=CONTAINER` 的测量项，最多 256 字节；该过滤器不改变顶层 `entity_id` 的筛选语义。`stance=SUPPORTS` 或 `stance=CONTRADICTS` 筛选与该调查中任意假设存在对应立场关联的证据；多次关联仅返回一次，当前不支持指定假设筛选。每个时间线项的 `relations` 返回所有关联假设 ID 与立场，包括筛选条件相反的关系；无关系时为空数组。关联本身不代表根因已确定。完整度包括 `COMPLETE`、`PARTIAL`、`MISSING` 和 `EXPIRED`；Evidence 会分别保留 UTC 事件区间、来源原始时间/时区和采集时间，无法追溯的历史记录 `collected_at` 为空；新采集记录还保存经过脱敏的查询文本、参数快照与来源引用。默认 `limit=50`，最大 `100`，`offset` 最大 `10000`；按事件开始/结束时间及来源、实体、内容摘要和 ID 稳定排序，计数与当前页在同一只读数据库快照中读取。不存在的 Investigation 返回 `404`，存在但没有匹配证据时返回空 `items`。此端点不合成尚未持久化的查询失败或缺口。
 
@@ -98,7 +100,7 @@ docker compose --file deploy/compose/compose.yaml up --build
 - Web：<http://localhost:3000>
 - API liveness：<http://localhost:8080/health/live>
 - API readiness：<http://localhost:8080/health/ready>
-- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/investigations/{id}/diagnosis`、`/api/v1/deployments/{id}`
+- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/investigations/{id}/diagnosis`、`/api/v1/deployments/{id}`
 - API 数据源映射：<http://localhost:8080/api/v1/data-source-mappings>
 - Worker metrics：<http://localhost:8081/metrics>
 
@@ -138,7 +140,7 @@ docker compose --file deploy/compose/compose.yaml run --rm migrate down
 
 `down` 会回滚一个版本，执行前应确认影响。领域迁移的 `down` 会删除领域表和其中的数据，只允许用于隔离的本地或测试环境。API 启动不会自动迁移。
 
-三个领域端点只读，并返回统一请求 ID 和错误包络。数据库为空或资源不存在时返回 `404`，路径 ID 非法时在查询数据库前返回 `400`。当前没有创建这些资源的公开写接口。
+上述领域读取端点返回统一请求 ID 和错误包络。数据库为空或资源不存在时返回 `404`，路径 ID 非法时在查询数据库前返回 `400`。资源接入仍使用专用部署与告警入口，读取不会创建资源或触发采集。
 
 ## 数据源映射管理 API
 

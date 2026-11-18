@@ -13,6 +13,7 @@ import (
 )
 
 type Reader interface {
+	GetInvestigationContext(context.Context, string) (store.InvestigationContext, error)
 	GetReport(context.Context, string) (store.Report, error)
 	GetEvidence(context.Context, string) (store.Evidence, error)
 	GetInvestigationTimeline(
@@ -88,6 +89,7 @@ func NewHandlerWithDependencies(
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/reports/{id}", apiHandler.getReport)
 	mux.HandleFunc("/api/v1/evidence/{id}", apiHandler.getEvidence)
+	mux.HandleFunc("/api/v1/investigations/{id}", apiHandler.getInvestigationContext)
 	mux.HandleFunc("/api/v1/investigations/{id}/timeline", apiHandler.getInvestigationTimeline)
 	mux.HandleFunc("/api/v1/investigations/{id}/diagnosis", apiHandler.getInvestigationDiagnosis)
 	mux.HandleFunc("/api/v1/deployments/{id}", apiHandler.getDeployment)

@@ -3,11 +3,61 @@ import {
   parseDiagnosis,
   parseEvidence,
   parseTimeline,
+  parseInvestigationContext,
   safeSourceURL,
 } from "./investigation";
-import { diagnosis, evidence, timeline } from "./test/investigationFixture";
+import {
+  diagnosis,
+  evidence,
+  investigationContext,
+  timeline,
+} from "./test/investigationFixture";
 
 describe("read-only API contracts", () => {
+  it("decodes current investigation context and explicit absent alert/mapping", () => {
+    expect(parseInvestigationContext(investigationContext)).toEqual(
+      investigationContext,
+    );
+    expect(
+      parseInvestigationContext({
+        ...investigationContext,
+        alert: null,
+        service: null,
+        environment: null,
+        mapping_status: "NEEDS_MAPPING",
+        context_gaps: ["alert_not_linked", "service_mapping_missing"],
+      }).alert,
+    ).toBeNull();
+    expect(
+      parseInvestigationContext({
+        ...investigationContext,
+        service: null,
+        environment: null,
+        mapping_status: "CONFLICT",
+        context_gaps: ["mapping_conflict"],
+      }).mapping_status,
+    ).toBe("CONFLICT");
+  });
+  it.each([
+    { ...investigationContext, investigation_id: "other" },
+    { ...investigationContext, status: "HEALTHY" },
+    { ...investigationContext, mapping_status: "GUESS" },
+    { ...investigationContext, service: null },
+    { ...investigationContext, mapping_status: "CONFLICT" },
+    { ...investigationContext, environment: 42 },
+    { ...investigationContext, started_at: "yesterday" },
+    { ...investigationContext, alert: {} },
+    {
+      ...investigationContext,
+      alert: { ...investigationContext.alert, severity: "HIGH" },
+    },
+    {
+      ...investigationContext,
+      alert: { ...investigationContext.alert, ends_at: "2026-01-01T00:00:00Z" },
+    },
+  ])("rejects malformed investigation context", (input) => {
+    expect(() => parseInvestigationContext(input)).toThrow();
+  });
   it("normalizes nullable Go slices", () => {
     expect(parseDiagnosis(diagnosis).missing_requirements).toEqual([]);
     expect(

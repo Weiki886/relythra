@@ -56,6 +56,90 @@ function timestamp(value: unknown): string {
     : invalid();
 }
 
+function contextEntity(value: unknown) {
+  const entity = object(value);
+  return {
+    id: id(entity.id),
+    slug: text(entity.slug),
+    name: text(entity.name),
+  };
+}
+
+export function parseInvestigationContext(value: unknown) {
+  const item = object(value);
+  const service = item.service === null ? null : contextEntity(item.service);
+  const environment = item.environment === null ? null : text(item.environment);
+  const mapping_status = choice(item.mapping_status, [
+    "MATCHED",
+    "NEEDS_MAPPING",
+    "CONFLICT",
+  ] as const);
+  if (
+    (mapping_status === "MATCHED" && (!service || !environment)) ||
+    (mapping_status === "CONFLICT" &&
+      (service !== null || environment !== null)) ||
+    (mapping_status === "NEEDS_MAPPING" && service !== null && !!environment)
+  )
+    return invalid();
+  const alert =
+    item.alert === null
+      ? null
+      : (() => {
+          const alert = object(item.alert);
+          const starts_at = timestamp(alert.starts_at);
+          const ends_at =
+            alert.ends_at === null ? null : timestamp(alert.ends_at);
+          if (ends_at && Date.parse(ends_at) < Date.parse(starts_at))
+            return invalid();
+          return {
+            id: id(alert.id),
+            status: choice(alert.status, [
+              "FIRING",
+              "RESOLVED",
+              "UNKNOWN",
+            ] as const),
+            severity: choice(alert.severity, [
+              "INFO",
+              "WARNING",
+              "ERROR",
+              "CRITICAL",
+              "UNKNOWN",
+            ] as const),
+            summary: text(alert.summary),
+            starts_at,
+            ends_at,
+            source_reference: text(alert.source_reference),
+          };
+        })();
+  const started_at = timestamp(item.started_at);
+  const completed_at =
+    item.completed_at === null ? null : timestamp(item.completed_at);
+  if (completed_at && Date.parse(completed_at) < Date.parse(started_at))
+    return invalid();
+  return {
+    investigation_id: id(item.investigation_id),
+    incident_id: id(item.incident_id),
+    status: choice(item.status, [
+      "RECEIVED",
+      "MATCHED",
+      "COLLECTING",
+      "HYPOTHESIZING",
+      "VERIFYING",
+      "COMPLETED",
+      "INSUFFICIENT_EVIDENCE",
+      "FAILED",
+    ] as const),
+    started_at,
+    completed_at,
+    project: contextEntity(item.project),
+    service,
+    environment,
+    mapping_status,
+    context_gaps: list(item.context_gaps, text),
+    alert,
+  };
+}
+
 export function parseEvidence(value: unknown) {
   const item = object(value);
   const observed_start = timestamp(item.observed_start);

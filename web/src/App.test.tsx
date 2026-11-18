@@ -12,6 +12,7 @@ import {
   diagnosis,
   evidence,
   investigationID,
+  investigationContext,
   timeline,
 } from "./test/investigationFixture";
 
@@ -26,6 +27,8 @@ function mockAPI(overrides: Record<string, () => Promise<Response>> = {}) {
     if (overrides[input]) return overrides[input]();
     if (input === "/health/ready")
       return Promise.resolve(response({ status: "ready" }));
+    if (input === `/api/v1/investigations/${investigationID}`)
+      return Promise.resolve(response(investigationContext));
     if (input.endsWith("/diagnosis"))
       return Promise.resolve(response(diagnosis));
     if (input.includes("/timeline?"))
@@ -53,6 +56,139 @@ afterEach(() => {
 });
 
 describe("investigation workbench", () => {
+  it("normalizes context times with offsets to the displayed UTC zone", async () => {
+    mockAPI({
+      [`/api/v1/investigations/${investigationID}`]: async () =>
+        response({
+          ...investigationContext,
+          started_at: "2026-11-18T10:11:12+08:00",
+          completed_at: "2026-11-18T10:13:14+08:00",
+          alert: {
+            ...investigationContext.alert,
+            status: "RESOLVED",
+            starts_at: "2026-11-18T10:09:10+08:00",
+            ends_at: "2026-11-18T10:12:13+08:00",
+          },
+        }),
+    });
+    render(<App />);
+    openInvestigation();
+    expect(
+      await screen.findByText("2026-11-18T02:11:12.000Z"),
+    ).toBeInTheDocument();
+    for (const value of [
+      "2026-11-18T02:13:14.000Z",
+      "2026-11-18T02:09:10.000Z",
+      "2026-11-18T02:12:13.000Z",
+    ])
+      expect(screen.getByText(value)).toBeInTheDocument();
+  });
+  it("shows canonical alert and service context separately from diagnosis", async () => {
+    mockAPI();
+    render(<App />);
+    openInvestigation();
+    expect(await screen.findByText("Checkout API")).toBeInTheDocument();
+    expect(screen.getByText("Synthetic Shop")).toBeInTheDocument();
+    expect(screen.getByText("prod")).toBeInTheDocument();
+    expect(screen.getByText("Checkout latency rose")).toBeInTheDocument();
+    expect(screen.getByText("ERROR · FIRING")).toBeInTheDocument();
+    expect(screen.getByText("RECEIVED")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "打开告警来源" })).toHaveAttribute(
+      "rel",
+      "noopener noreferrer",
+    );
+  });
+  it.each([
+    {
+      mapping_status: "NEEDS_MAPPING",
+      context_gaps: ["service_mapping_missing"],
+      message: "服务或环境尚未完成映射。",
+    },
+    {
+      mapping_status: "CONFLICT",
+      context_gaps: ["mapping_conflict"],
+      message: "关联记录的服务或环境不一致，当前归属待核对。",
+    },
+  ])(
+    "shows $mapping_status and an absent alert without implying health",
+    async (input) => {
+      mockAPI({
+        [`/api/v1/investigations/${investigationID}`]: async () =>
+          response({
+            ...investigationContext,
+            ...input,
+            service: null,
+            environment: null,
+            alert: null,
+          }),
+      });
+      render(<App />);
+      openInvestigation();
+      expect(await screen.findByText(input.message)).toBeInTheDocument();
+      expect(screen.getByText("尚未关联告警")).toBeInTheDocument();
+      expect(screen.queryByText("Checkout API")).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("link", { name: "打开告警来源" }),
+      ).not.toBeInTheDocument();
+    },
+  );
+  it("retries context independently while retaining diagnosis and never displays another investigation", async () => {
+    let failed = true;
+    const fetchMock = mockAPI({
+      [`/api/v1/investigations/${investigationID}`]: async () =>
+        response(
+          failed
+            ? {
+                ...investigationContext,
+                investigation_id: evidence.id,
+                alert: {
+                  ...investigationContext.alert,
+                  summary: "other-investigation-context",
+                },
+              }
+            : investigationContext,
+        ),
+    });
+    render(<App />);
+    openInvestigation();
+    expect(
+      await screen.findByText("调查摘要加载失败，请重试。"),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText("slow-query-latency-correlation.v1"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("other-investigation-context"),
+    ).not.toBeInTheDocument();
+    failed = false;
+    fireEvent.click(screen.getByRole("button", { name: "重试调查摘要" }));
+    expect(await screen.findByText("Checkout API")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([url]) => url.endsWith("/diagnosis")),
+    ).toHaveLength(1);
+  });
+  it("renders alert HTML as text and rejects unsafe alert links", async () => {
+    mockAPI({
+      [`/api/v1/investigations/${investigationID}`]: async () =>
+        response({
+          ...investigationContext,
+          alert: {
+            ...investigationContext.alert,
+            summary: "<img src=x onerror=untrusted()>",
+            source_reference: "javascript:alert(1)",
+          },
+        }),
+    });
+    render(<App />);
+    openInvestigation();
+    expect(
+      await screen.findByText("<img src=x onerror=untrusted()>"),
+    ).toBeInTheDocument();
+    expect(document.querySelector("img")).toBeNull();
+    expect(
+      screen.queryByRole("link", { name: "打开告警来源" }),
+    ).not.toBeInTheDocument();
+  });
   it("retains readiness and rejects invalid IDs without data requests", async () => {
     const fetchMock = mockAPI();
     render(<App />);
