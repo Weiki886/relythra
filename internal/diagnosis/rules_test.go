@@ -179,6 +179,41 @@ func TestAnalyzeRejectsEvidenceFromAnotherInvestigation(t *testing.T) {
 	}
 }
 
+func TestAnalyzeUnavailableEvidenceCannotSupportCandidates(t *testing.T) {
+	start := time.Date(2026, 11, 17, 2, 0, 0, 0, time.UTC)
+	for _, state := range []string{"MISSING", "EXPIRED"} {
+		for _, source := range []string{"PROMETHEUS", "LOKI"} {
+			t.Run(source+"/"+state, func(t *testing.T) {
+				items := []Evidence{
+					ruleLatencyEvidence(t, latencyEvidenceID, ruleTestInvestigationID, ruleTestServiceID, "COMPLETE", start, start.Add(5*time.Minute), start.Add(2*time.Minute)),
+					ruleSlowQueryEvidence(t, slowQueryEvidenceID, ruleTestInvestigationID, ruleTestServiceID, "COMPLETE", start, start.Add(5*time.Minute), start.Add(3*time.Minute)),
+				}
+				for i := range items {
+					if items[i].SourceType == source {
+						items[i].Completeness = state
+					}
+				}
+				result, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: items})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result.Status != StatusInconclusive || len(result.Candidates) != 0 || len(result.MissingRequirements) == 0 {
+					t.Fatalf("unavailable observations supported a candidate: %+v", result)
+				}
+			})
+		}
+	}
+}
+
+func TestAnalyzeRejectsUnknownCompleteness(t *testing.T) {
+	start := time.Date(2026, 11, 17, 2, 0, 0, 0, time.UTC)
+	item := ruleLatencyEvidence(t, latencyEvidenceID, ruleTestInvestigationID, ruleTestServiceID, "UNKNOWN", start, start.Add(time.Minute), start)
+	_, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: []Evidence{item}})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("unknown completeness error = %v, want ErrInvalidInput", err)
+	}
+}
+
 func ruleLatencyEvidence(t *testing.T, id, investigationID, serviceID, completeness string, start, end, sampleAt time.Time) Evidence {
 	t.Helper()
 	queryParameters, err := json.Marshal(map[string]any{"template_id": "prometheus.database.query_latency.v1", "template_version": 1})

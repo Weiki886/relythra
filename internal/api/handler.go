@@ -89,6 +89,7 @@ func NewHandlerWithDependencies(
 	mux.HandleFunc("/api/v1/reports/{id}", apiHandler.getReport)
 	mux.HandleFunc("/api/v1/evidence/{id}", apiHandler.getEvidence)
 	mux.HandleFunc("/api/v1/investigations/{id}/timeline", apiHandler.getInvestigationTimeline)
+	mux.HandleFunc("/api/v1/investigations/{id}/diagnosis", apiHandler.getInvestigationDiagnosis)
 	mux.HandleFunc("/api/v1/deployments/{id}", apiHandler.getDeployment)
 	mux.HandleFunc("/api/v1/deployment-events/webhook", apiHandler.receiveDeploymentWebhook)
 	mux.HandleFunc("/api/v1/deployment-events", apiHandler.manageDeploymentCollection)

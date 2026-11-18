@@ -27,11 +27,13 @@ Relythra 是一个面向发布后异常排查的只读诊断系统：关联发�
 
 - Web：<http://127.0.0.1:5173>
 - API readiness：<http://127.0.0.1:8080/health/ready>
-- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/deployments/{id}`
+- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/investigations/{id}/diagnosis`、`/api/v1/deployments/{id}`
 
 `GET /api/v1/investigations/{id}/timeline` 返回该 Investigation 已持久化的 Evidence，支持 `source_type`、`entity_id`、`container_id`、`completeness`、`stance`、`limit` 和 `offset`。`container_id` 按不透明 ID 精确匹配运行时 Evidence `value_summary.measurements` 中 `entity_type=CONTAINER` 的测量项，最多 256 字节；该过滤器不改变顶层 `entity_id` 的筛选语义。`stance=SUPPORTS` 或 `stance=CONTRADICTS` 筛选与该调查中任意假设存在对应立场关联的证据；多次关联仅返回一次，当前不支持指定假设筛选。每个时间线项的 `relations` 返回所有关联假设 ID 与立场，包括筛选条件相反的关系；无关系时为空数组。关联本身不代表根因已确定。完整度包括 `COMPLETE`、`PARTIAL`、`MISSING` 和 `EXPIRED`；Evidence 会分别保留 UTC 事件区间、来源原始时间/时区和采集时间，无法追溯的历史记录 `collected_at` 为空；新采集记录还保存经过脱敏的查询文本、参数快照与来源引用。默认 `limit=50`，最大 `100`，`offset` 最大 `10000`；按事件开始/结束时间及来源、实体、内容摘要和 ID 稳定排序，计数与当前页在同一只读数据库快照中读取。不存在的 Investigation 返回 `404`，存在但没有匹配证据时返回空 `items`。此端点不合成尚未持久化的查询失败或缺口。
 
 时间线支持 `source_type=GRAFANA`。后端提供 `PersistGrafanaAlertEvidence`，将数据库中与调查所属事件关联的规范告警保存为不可变、脱敏的证据快照；持续触发的告警以触发时间为点事件，恢复后追加结束时间已知的区间快照，同一告警的状态快照共享独立性分组。未映射、缺来源引用或恢复时间未知时标记为 `PARTIAL`。此入口尚未接入 Webhook/Worker 自动采集，接收告警不会自动产生这些快照。部署该能力前先执行迁移 `000009`；存在 `GRAFANA` 历史证据时，该迁移拒绝降级以保留数据，回滚应用可以保留扩展后的数据库约束。
+
+`GET /api/v1/investigations/{id}/diagnosis` 对已入库 Evidence 即时执行 v0 固定规则，返回规则集版本、候选、支持/反证 Evidence ID、缺口，以及 `evidence_total`、`evidence_limit=100`、`evidence_truncated`。接口不接受查询参数，不触发外部采集或写入假设/报告；一次读取同一数据库快照中的完整时间线，超过 100 条时返回 `INCONCLUSIVE`、空候选与 `complete_evidence_snapshot` 缺口，避免用截断子集下结论。当前仅关联同服务、重叠时间窗内的数据库耗时样本与慢查询模板日志；结果是数据库性能症状候选，不证明 SQL 或发布导致故障，也不判定耗时已超过异常阈值。`COMPLETE` 配对的置信度为 `MEDIUM`，只有 `PARTIAL` 配对时为 `LOW`（定性等级，不是概率）；`MISSING`、`EXPIRED` 不作为支持证据。没有足够证据时为 `INCONCLUSIVE`；不存在的调查返回 `404`，损坏的规则输入返回通用 `500`。该端点沿用现有只读 API 的本地/受信网络边界。
 
 - Worker metrics：<http://127.0.0.1:8081/metrics>
 
@@ -92,7 +94,7 @@ docker compose --file deploy/compose/compose.yaml up --build
 - Web：<http://localhost:3000>
 - API liveness：<http://localhost:8080/health/live>
 - API readiness：<http://localhost:8080/health/ready>
-- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/deployments/{id}`
+- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/investigations/{id}/diagnosis`、`/api/v1/deployments/{id}`
 - API 数据源映射：<http://localhost:8080/api/v1/data-source-mappings>
 - Worker metrics：<http://localhost:8081/metrics>
 
