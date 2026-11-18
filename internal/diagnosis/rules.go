@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	RuleSetVersion       = "v0.1.0"
+	RuleSetVersion       = "v0.1.1"
 	RuleSlowQueryLatency = "slow-query-latency-correlation.v1"
 
 	StatusCandidatesFound = "CANDIDATES_FOUND"
@@ -115,6 +115,11 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 		if item.ObservedStart.IsZero() || item.ObservedEnd.IsZero() || item.ObservedEnd.Before(item.ObservedStart) {
 			return AnalysisResult{}, ErrInvalidInput
 		}
+		switch item.Completeness {
+		case "COMPLETE", "PARTIAL", "MISSING", "EXPIRED":
+		default:
+			return AnalysisResult{}, ErrInvalidInput
+		}
 		if item.EntityType != "SERVICE" || item.EntityID == nil || !domain.IsID(*item.EntityID) {
 			continue
 		}
@@ -133,6 +138,9 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 		switch {
 		case item.SourceType == "PROMETHEUS" && metadata.TemplateID == latencyTemplateID:
 			latencySourcePresent = true
+			if item.Completeness == "MISSING" || item.Completeness == "EXPIRED" {
+				continue
+			}
 			if item.IndependenceGroup != "prometheus:prometheus.database.query_latency.v1:v1" {
 				independenceMismatch = true
 				continue
@@ -146,6 +154,9 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 			}
 		case item.SourceType == "LOKI" && metadata.TemplateID == slowQueryTemplateID:
 			slowQuerySourcePresent = true
+			if item.Completeness == "MISSING" || item.Completeness == "EXPIRED" {
+				continue
+			}
 			if item.IndependenceGroup != "loki:loki.service.slow_queries.v1:v1" {
 				independenceMismatch = true
 				continue
