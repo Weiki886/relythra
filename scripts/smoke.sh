@@ -270,6 +270,12 @@ curl --fail --silent --show-error "http://localhost:${RELYTHRA_WORKER_PORT}/metr
 curl --fail --silent --show-error "http://localhost:${RELYTHRA_WEB_PORT}/" \
   | grep --fixed-strings '<title>Relythra</title>'
 
+# Browser reads must reach the API instead of the SPA fallback.
+web_diagnosis_status="$(curl --silent --show-error --output "${temp_dir}/web-diagnosis.json" --write-out '%{http_code}' \
+  "http://localhost:${RELYTHRA_WEB_PORT}/api/v1/investigations/00000000-0000-4000-8000-000000000000/diagnosis")"
+test "${web_diagnosis_status}" = "404"
+grep --fixed-strings '"code":"not_found"' "${temp_dir}/web-diagnosis.json"
+
 # Losing PostgreSQL must fail readiness without taking down the API process.
 "${COMPOSE[@]}" stop postgres
 readiness_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
