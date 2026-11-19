@@ -17,6 +17,8 @@ const (
 	ruleTestServiceID       = "22222222-2222-4222-8222-222222222222"
 	latencyEvidenceID       = "33333333-3333-4333-8333-333333333333"
 	slowQueryEvidenceID     = "44444444-4444-4444-8444-444444444444"
+	memoryEvidenceID        = "55555555-5555-4555-8555-555555555555"
+	secondMemoryEvidenceID  = "66666666-6666-4666-8666-666666666666"
 )
 
 func TestAnalyzeSlowQueryLatencyCorrelation(t *testing.T) {
@@ -214,6 +216,172 @@ func TestAnalyzeRejectsUnknownCompleteness(t *testing.T) {
 	}
 }
 
+func TestAnalyzeContainerMemoryGrowthNeedsThreeIncreasingSamplesFromOneSeries(t *testing.T) {
+	start := time.Date(2026, 11, 19, 2, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		series  []prometheusconnector.Series
+		want    bool
+		missing string
+	}{
+		{
+			name: "one series rises across three samples",
+			series: []prometheusconnector.Series{memorySeries(start,
+				[]float64{100, 120, 140}, []string{"container-a"})},
+			want: true,
+		},
+		{
+			name: "two samples are insufficient",
+			series: []prometheusconnector.Series{memorySeries(start,
+				[]float64{100, 140}, []string{"container-a"})},
+			missing: "container_memory_growth_trend",
+		},
+		{
+			name: "flat series does not show growth",
+			series: []prometheusconnector.Series{memorySeries(start,
+				[]float64{100, 100, 100}, []string{"container-a"})},
+			missing: "container_memory_growth_trend",
+		},
+		{
+			name: "samples from two series cannot be combined",
+			series: []prometheusconnector.Series{
+				memorySeries(start, []float64{100, 120}, []string{"container-a"}),
+				memorySeries(start, []float64{200, 240}, []string{"container-b"}),
+			},
+			missing: "container_memory_growth_trend",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item := ruleContainerMemoryEvidence(t, memoryEvidenceID, "COMPLETE", start, start.Add(3*time.Minute), test.series)
+			result, err := Analyze(context.Background(), AnalysisInput{
+				InvestigationID: ruleTestInvestigationID,
+				Evidence:        []Evidence{item},
+			})
+			if err != nil {
+				t.Fatalf("Analyze: %v", err)
+			}
+			if !test.want {
+				if result.Status != StatusInconclusive || len(result.Candidates) != 0 || !contains(result.MissingRequirements, test.missing) {
+					t.Fatalf("analysis = %+v, want no candidate and missing %q", result, test.missing)
+				}
+				return
+			}
+			if result.RuleSetVersion != "v0.2.0" || result.Status != StatusCandidatesFound || len(result.Candidates) != 1 {
+				t.Fatalf("analysis = %+v, want one versioned candidate", result)
+			}
+			candidate := result.Candidates[0]
+			if candidate.RuleID != "container-memory-growth-trend.v1" || candidate.FaultType != "CONTAINER_MEMORY_GROWTH_SIGNAL" ||
+				candidate.EntityID != ruleTestServiceID || candidate.Confidence != ConfidenceLow ||
+				len(candidate.SupportEvidenceIDs) != 1 || candidate.SupportEvidenceIDs[0] != memoryEvidenceID ||
+				len(candidate.ContradictEvidenceIDs) != 0 || candidate.TriggerChange != "" ||
+				!contains(candidate.MissingRequirements, "independent_memory_corroboration") ||
+				!contains(candidate.MissingRequirements, "memory_leak_causality_unproven") {
+				t.Fatalf("memory trend candidate exceeded its evidence: %+v", candidate)
+			}
+		})
+	}
+}
+
+func TestAnalyzeContainerMemoryGrowthKeepsPartialAndRejectsUnavailableEvidence(t *testing.T) {
+	start := time.Date(2026, 11, 19, 2, 0, 0, 0, time.UTC)
+	series := []prometheusconnector.Series{memorySeries(start, []float64{100, 120, 140}, []string{"container-a"})}
+	partial := ruleContainerMemoryEvidence(t, memoryEvidenceID, "PARTIAL", start, start.Add(3*time.Minute), series)
+	result, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: []Evidence{partial}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Candidates) != 1 || result.Candidates[0].Confidence != ConfidenceLow ||
+		!contains(result.Candidates[0].MissingRequirements, "complete_memory_source_evidence") {
+		t.Fatalf("partial trend candidate = %+v", result)
+	}
+
+	for _, completeness := range []string{"MISSING", "EXPIRED"} {
+		t.Run(completeness, func(t *testing.T) {
+			item := ruleContainerMemoryEvidence(t, memoryEvidenceID, completeness, start, start.Add(3*time.Minute), series)
+			result, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: []Evidence{item}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != StatusInconclusive || len(result.Candidates) != 0 ||
+				!contains(result.MissingRequirements, "container_memory_metric_unavailable") {
+				t.Fatalf("unavailable Evidence supported candidate: %+v", result)
+			}
+		})
+	}
+}
+
+func TestAnalyzeContainerMemoryGrowthSortsEvidenceIDsAcrossSnapshots(t *testing.T) {
+	start := time.Date(2026, 11, 19, 2, 0, 0, 0, time.UTC)
+	first := ruleContainerMemoryEvidence(t, memoryEvidenceID, "COMPLETE", start, start.Add(3*time.Minute),
+		[]prometheusconnector.Series{memorySeries(start, []float64{100, 120, 140}, []string{"container-a"})})
+	second := ruleContainerMemoryEvidence(t, secondMemoryEvidenceID, "COMPLETE", start, start.Add(3*time.Minute),
+		[]prometheusconnector.Series{memorySeries(start, []float64{200, 240, 280}, []string{"container-b"})})
+	result, err := Analyze(context.Background(), AnalysisInput{
+		InvestigationID: ruleTestInvestigationID,
+		Evidence:        []Evidence{second, first},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Candidates) != 1 || len(result.Candidates[0].SupportEvidenceIDs) != 2 ||
+		result.Candidates[0].SupportEvidenceIDs[0] != memoryEvidenceID || result.Candidates[0].SupportEvidenceIDs[1] != secondMemoryEvidenceID {
+		t.Fatalf("memory candidate order = %+v", result.Candidates)
+	}
+}
+
+func TestAnalyzeContainerMemoryGrowthRequiresApprovedGroupAndValidSamples(t *testing.T) {
+	start := time.Date(2026, 11, 19, 2, 0, 0, 0, time.UTC)
+	valid := ruleContainerMemoryEvidence(t, memoryEvidenceID, "COMPLETE", start, start.Add(3*time.Minute),
+		[]prometheusconnector.Series{memorySeries(start, []float64{100, 120, 140}, []string{"container-a"})})
+	valid.IndependenceGroup = "shared:unknown"
+	result, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: []Evidence{valid}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Candidates) != 0 || !contains(result.MissingRequirements, "approved_independence_groups") {
+		t.Fatalf("unapproved Evidence supported candidate: %+v", result)
+	}
+
+	invalidSeries := []struct {
+		name   string
+		series prometheusconnector.Series
+	}{
+		{
+			name: "negative value",
+			series: prometheusconnector.Series{
+				Labels: map[string]string{"container": "container-a"},
+				Samples: []prometheusconnector.Sample{
+					{Timestamp: start, Value: -1},
+				},
+			},
+		},
+		{
+			name: "outside observation window",
+			series: prometheusconnector.Series{
+				Labels: map[string]string{"container": "container-a"},
+				Samples: []prometheusconnector.Sample{
+					{Timestamp: start.Add(-time.Minute), Value: 1},
+				},
+			},
+		},
+	}
+	for _, test := range invalidSeries {
+		t.Run(test.name, func(t *testing.T) {
+			item := ruleContainerMemoryEvidence(t, memoryEvidenceID, "COMPLETE", start, start.Add(3*time.Minute), []prometheusconnector.Series{test.series})
+			_, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: []Evidence{item}})
+			if !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("invalid memory sample error = %v, want ErrInvalidInput", err)
+			}
+		})
+	}
+	malformed := ruleContainerMemoryEvidence(t, memoryEvidenceID, "COMPLETE", start, start.Add(3*time.Minute), nil)
+	malformed.ValueSummary = []byte(`{"series":[{"labels":{},"samples":[{"timestamp":"invalid","value":1}]}]}`)
+	if _, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: []Evidence{malformed}}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("malformed summary error = %v, want ErrInvalidInput", err)
+	}
+}
+
 func ruleLatencyEvidence(t *testing.T, id, investigationID, serviceID, completeness string, start, end, sampleAt time.Time) Evidence {
 	t.Helper()
 	queryParameters, err := json.Marshal(map[string]any{"template_id": "prometheus.database.query_latency.v1", "template_version": 1})
@@ -254,6 +422,44 @@ func ruleSlowQueryEvidence(t *testing.T, id, investigationID, serviceID, complet
 		QueryParameters: queryParameters, ValueSummary: valueSummary, Completeness: completeness,
 		IndependenceGroup: "loki:loki.service.slow_queries.v1:v1",
 	}
+}
+
+func ruleContainerMemoryEvidence(
+	t *testing.T,
+	id, completeness string,
+	start, end time.Time,
+	series []prometheusconnector.Series,
+) Evidence {
+	t.Helper()
+	queryParameters, err := json.Marshal(map[string]any{
+		"template_id":      "prometheus.container.memory.v1",
+		"template_version": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	valueSummary, err := json.Marshal(map[string]any{"series": series})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Evidence{
+		ID: id, InvestigationID: ruleTestInvestigationID, SourceType: "PROMETHEUS", EntityType: "SERVICE",
+		EntityID: stringPointer(ruleTestServiceID), ObservedStart: start, ObservedEnd: end,
+		QueryParameters: queryParameters, ValueSummary: valueSummary, Completeness: completeness,
+		IndependenceGroup: "prometheus:prometheus.container.memory.v1:v1",
+	}
+}
+
+func memorySeries(start time.Time, values []float64, labels []string) prometheusconnector.Series {
+	label := "container-a"
+	if len(labels) > 0 {
+		label = labels[0]
+	}
+	samples := make([]prometheusconnector.Sample, len(values))
+	for index, value := range values {
+		samples[index] = prometheusconnector.Sample{Timestamp: start.Add(time.Duration(index) * time.Minute), Value: value}
+	}
+	return prometheusconnector.Series{Labels: map[string]string{"container": label}, Samples: samples}
 }
 
 func stringPointer(value string) *string {

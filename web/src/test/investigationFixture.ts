@@ -60,7 +60,7 @@ export const diagnosis = {
   evidence_total: 2,
   evidence_limit: 100,
   evidence_truncated: false,
-  rule_set_version: "v0.1.1",
+  rule_set_version: "v0.2.0",
   status: "CANDIDATES_FOUND",
   missing_requirements: null,
   candidates: [
