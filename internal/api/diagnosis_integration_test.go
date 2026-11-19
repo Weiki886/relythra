@@ -137,6 +137,63 @@ func TestDiagnosisFromPersistedConnectorEvidence(t *testing.T) {
 	}
 }
 
+func TestDiagnosisFromPersistedContainerMemoryEvidence(t *testing.T) {
+	db := openDiagnosisTestDB(t)
+	ctx := context.Background()
+	investigationID, serviceID := insertDiagnosisFixture(t, db)
+	repository := store.NewPostgres(db)
+	filter, err := redact.NewFilter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 11, 19, 2, 0, 0, 0, time.UTC)
+	metric := prometheus.Result{
+		TemplateID: "prometheus.container.memory.v1", TemplateVersion: 1,
+		QueryType: "range", Query: "private_container_memory_query", Unit: "bytes",
+		Start: start, End: start.Add(4 * time.Minute), Step: time.Minute,
+		SourceReference: "https://prometheus.example.test/graph",
+		Series: []prometheus.Series{{Labels: map[string]string{"container": "checkout-api-1"}, Samples: []prometheus.Sample{
+			{Timestamp: start.Add(time.Minute), Value: 100},
+			{Timestamp: start.Add(2 * time.Minute), Value: 120},
+			{Timestamp: start.Add(3 * time.Minute), Value: 140},
+		}}},
+	}
+	metricEvidence, created, err := repository.PersistPrometheusEvidence(ctx, metric, evidence.PrometheusEvidenceContext{
+		InvestigationID: investigationID, EntityType: "SERVICE", EntityID: serviceID,
+		CollectedAt: start.Add(5 * time.Minute),
+	}, filter)
+	if err != nil || !created {
+		t.Fatalf("persist container memory metric: created=%v err=%v", created, err)
+	}
+	response := serve(NewHandler(repository, discardLogger()), http.MethodGet,
+		"/api/v1/investigations/"+investigationID+"/diagnosis")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Data investigationDiagnosis `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	result := envelope.Data
+	if result.RuleSetVersion != diagnosis.RuleSetVersion || result.Status != diagnosis.StatusCandidatesFound || len(result.Candidates) != 1 {
+		t.Fatalf("persisted memory Evidence result = %+v", result)
+	}
+	candidate := result.Candidates[0]
+	if candidate.RuleID != diagnosis.RuleContainerMemoryGrowth || candidate.FaultType != "CONTAINER_MEMORY_GROWTH_SIGNAL" ||
+		candidate.EntityID != serviceID || candidate.Confidence != diagnosis.ConfidenceLow ||
+		!reflect.DeepEqual(candidate.SupportEvidenceIDs, []string{metricEvidence.ID}) || len(candidate.ContradictEvidenceIDs) != 0 ||
+		candidate.TriggerChange != "" || !slices.Contains(candidate.MissingRequirements, "memory_leak_causality_unproven") {
+		t.Fatalf("persisted memory Evidence candidate exceeded its evidence: %+v", candidate)
+	}
+	for _, private := range []string{metric.Query, metric.SourceReference, "checkout-api-1"} {
+		if strings.Contains(response.Body.String(), private) {
+			t.Fatalf("diagnosis leaked %q", private)
+		}
+	}
+}
+
 func openDiagnosisTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	databaseURL := strings.TrimSpace(os.Getenv("RELYTHRA_TEST_DATABASE_URL"))

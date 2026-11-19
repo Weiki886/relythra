@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -14,8 +15,9 @@ import (
 )
 
 const (
-	RuleSetVersion       = "v0.1.1"
-	RuleSlowQueryLatency = "slow-query-latency-correlation.v1"
+	RuleSetVersion            = "v0.2.0"
+	RuleSlowQueryLatency      = "slow-query-latency-correlation.v1"
+	RuleContainerMemoryGrowth = "container-memory-growth-trend.v1"
 
 	StatusCandidatesFound = "CANDIDATES_FOUND"
 	StatusInconclusive    = "INCONCLUSIVE"
@@ -23,8 +25,9 @@ const (
 	ConfidenceLow    = "LOW"
 	ConfidenceMedium = "MEDIUM"
 
-	latencyTemplateID   = "prometheus.database.query_latency.v1"
-	slowQueryTemplateID = "loki.service.slow_queries.v1"
+	latencyTemplateID         = "prometheus.database.query_latency.v1"
+	containerMemoryTemplateID = "prometheus.container.memory.v1"
+	slowQueryTemplateID       = "loki.service.slow_queries.v1"
 )
 
 var ErrInvalidInput = errors.New("invalid diagnosis input")
@@ -101,8 +104,8 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 	}
 
 	seenIDs := make(map[string]struct{}, len(input.Evidence))
-	var latencyEvidence, slowQueryEvidence []matchedEvidence
-	latencySourcePresent, slowQuerySourcePresent := false, false
+	var latencyEvidence, memoryEvidence, slowQueryEvidence []matchedEvidence
+	latencySourcePresent, memorySourcePresent, memoryUsableSourcePresent, slowQuerySourcePresent := false, false, false, false
 	independenceMismatch := false
 	for _, item := range input.Evidence {
 		if !domain.IsID(item.ID) || item.InvestigationID != input.InvestigationID {
@@ -152,6 +155,27 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 			if hasLatencySample(summary, item.ObservedStart, item.ObservedEnd) {
 				latencyEvidence = append(latencyEvidence, entry)
 			}
+		case item.SourceType == "PROMETHEUS" && metadata.TemplateID == containerMemoryTemplateID:
+			memorySourcePresent = true
+			if item.Completeness == "MISSING" || item.Completeness == "EXPIRED" {
+				continue
+			}
+			memoryUsableSourcePresent = true
+			if item.IndependenceGroup != "prometheus:prometheus.container.memory.v1:v1" {
+				independenceMismatch = true
+				continue
+			}
+			var summary prometheusSummary
+			if err := json.Unmarshal(item.ValueSummary, &summary); err != nil {
+				return AnalysisResult{}, fmt.Errorf("%w: decode container memory Evidence summary", ErrInvalidInput)
+			}
+			increasing, err := hasIncreasingMemoryTrend(summary, item.ObservedStart, item.ObservedEnd)
+			if err != nil {
+				return AnalysisResult{}, err
+			}
+			if increasing {
+				memoryEvidence = append(memoryEvidence, entry)
+			}
 		case item.SourceType == "LOKI" && metadata.TemplateID == slowQueryTemplateID:
 			slowQuerySourcePresent = true
 			if item.Completeness == "MISSING" || item.Completeness == "EXPIRED" {
@@ -178,11 +202,20 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 	if !slowQuerySourcePresent {
 		missing["slow_query_log"] = struct{}{}
 	}
+	if !memorySourcePresent {
+		missing["container_memory_metric"] = struct{}{}
+	}
+	if memorySourcePresent && !memoryUsableSourcePresent {
+		missing["container_memory_metric_unavailable"] = struct{}{}
+	}
 	if latencySourcePresent && len(latencyEvidence) == 0 {
 		missing["database_latency_sample_in_window"] = struct{}{}
 	}
 	if slowQuerySourcePresent && len(slowQueryEvidence) == 0 {
 		missing["slow_query_log_in_window"] = struct{}{}
+	}
+	if memoryUsableSourcePresent && len(memoryEvidence) == 0 {
+		missing["container_memory_growth_trend"] = struct{}{}
 	}
 	if independenceMismatch {
 		missing["approved_independence_groups"] = struct{}{}
@@ -240,6 +273,46 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 		sort.Strings(candidate.MissingRequirements)
 		result.Candidates = append(result.Candidates, *candidate)
 	}
+
+	memoryByService := make(map[string]*Candidate)
+	completeMemoryByService := make(map[string]bool)
+	for _, memory := range memoryEvidence {
+		serviceID := *memory.evidence.EntityID
+		candidate := memoryByService[serviceID]
+		if candidate == nil {
+			candidate = &Candidate{
+				RuleID: RuleContainerMemoryGrowth, FaultType: "CONTAINER_MEMORY_GROWTH_SIGNAL",
+				EntityID: serviceID, Confidence: ConfidenceLow,
+				SupportEvidenceIDs: []string{}, ContradictEvidenceIDs: []string{},
+				MissingRequirements: []string{"independent_memory_corroboration", "memory_leak_causality_unproven"},
+			}
+			memoryByService[serviceID] = candidate
+		}
+		candidate.SupportEvidenceIDs = appendUnique(candidate.SupportEvidenceIDs, memory.evidence.ID)
+		if memory.complete {
+			completeMemoryByService[serviceID] = true
+		}
+	}
+	memoryServiceIDs := make([]string, 0, len(memoryByService))
+	for id := range memoryByService {
+		memoryServiceIDs = append(memoryServiceIDs, id)
+	}
+	sort.Strings(memoryServiceIDs)
+	for _, id := range memoryServiceIDs {
+		candidate := memoryByService[id]
+		if !completeMemoryByService[id] {
+			candidate.MissingRequirements = append(candidate.MissingRequirements, "complete_memory_source_evidence")
+		}
+		sort.Strings(candidate.SupportEvidenceIDs)
+		sort.Strings(candidate.MissingRequirements)
+		result.Candidates = append(result.Candidates, *candidate)
+	}
+	sort.Slice(result.Candidates, func(left, right int) bool {
+		if result.Candidates[left].RuleID == result.Candidates[right].RuleID {
+			return result.Candidates[left].EntityID < result.Candidates[right].EntityID
+		}
+		return result.Candidates[left].RuleID < result.Candidates[right].RuleID
+	})
 	result.MissingRequirements = sortedKeys(missing)
 	if len(result.Candidates) > 0 {
 		result.Status = StatusCandidatesFound
@@ -258,11 +331,35 @@ func registeredTemplate(item Evidence) (queryMetadata, bool, error) {
 	if metadata.TemplateID == "" || metadata.TemplateVersion <= 0 {
 		return queryMetadata{}, false, fmt.Errorf("%w: missing Evidence template identity", ErrInvalidInput)
 	}
-	if item.SourceType == "PROMETHEUS" && metadata.TemplateID == latencyTemplateID ||
+	if item.SourceType == "PROMETHEUS" &&
+		(metadata.TemplateID == latencyTemplateID || metadata.TemplateID == containerMemoryTemplateID) ||
 		item.SourceType == "LOKI" && metadata.TemplateID == slowQueryTemplateID {
 		return metadata, true, nil
 	}
 	return metadata, false, nil
+}
+
+func hasIncreasingMemoryTrend(summary prometheusSummary, start, end time.Time) (bool, error) {
+	for _, series := range summary.Series {
+		samples := append([]prometheusconnector.Sample(nil), series.Samples...)
+		for _, sample := range samples {
+			if sample.Timestamp.IsZero() || sample.Timestamp.Before(start) || sample.Timestamp.After(end) ||
+				math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) || sample.Value < 0 {
+				return false, fmt.Errorf("%w: invalid container memory sample", ErrInvalidInput)
+			}
+		}
+		sort.SliceStable(samples, func(left, right int) bool {
+			return samples[left].Timestamp.Before(samples[right].Timestamp)
+		})
+		for index := 2; index < len(samples); index++ {
+			first, second, third := samples[index-2], samples[index-1], samples[index]
+			if first.Timestamp.Before(second.Timestamp) && second.Timestamp.Before(third.Timestamp) &&
+				first.Value < second.Value && second.Value < third.Value {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func hasLatencySample(summary prometheusSummary, start, end time.Time) bool {
