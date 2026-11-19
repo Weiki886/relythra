@@ -276,6 +276,21 @@ web_diagnosis_status="$(curl --silent --show-error --output "${temp_dir}/web-dia
 test "${web_diagnosis_status}" = "404"
 grep --fixed-strings '"code":"not_found"' "${temp_dir}/web-diagnosis.json"
 
+web_context_status="$(curl --silent --show-error --output "${temp_dir}/web-context-missing.json" --write-out '%{http_code}' \
+  "http://localhost:${RELYTHRA_WEB_PORT}/api/v1/investigations/00000000-0000-4000-8000-000000000000")"
+test "${web_context_status}" = "404"
+grep --fixed-strings '"code":"not_found"' "${temp_dir}/web-context-missing.json"
+curl --fail --silent --show-error \
+  --output "${temp_dir}/web-context.json" \
+  "http://localhost:${RELYTHRA_WEB_PORT}/api/v1/investigations/10000000-0000-4000-8000-000000000007"
+grep --fixed-strings '"investigation_id":"10000000-0000-4000-8000-000000000007"' "${temp_dir}/web-context.json"
+grep --fixed-strings '"mapping_status":"MATCHED"' "${temp_dir}/web-context.json"
+grep --fixed-strings '"alert":null' "${temp_dir}/web-context.json"
+if grep --extended-regexp '"(secret_ref|redacted_payload|labels|annotations)"' "${temp_dir}/web-context.json"; then
+  printf 'Investigation context exposed fields outside its projection.\n' >&2
+  exit 1
+fi
+
 # Losing PostgreSQL must fail readiness without taking down the API process.
 "${COMPOSE[@]}" stop postgres
 readiness_status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \

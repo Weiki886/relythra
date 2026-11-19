@@ -3,6 +3,7 @@ import {
   completenessStates,
   parseDiagnosis,
   parseEvidence,
+  parseInvestigationContext,
   parseTimeline,
   safeSourceURL,
   sources,
@@ -42,6 +43,119 @@ function Gaps({ items }: { items: string[] }) {
     </ul>
   ) : (
     <p className="muted">未记录缺失项；不代表已排除其他原因。</p>
+  );
+}
+
+function ContextSummary({ id }: { id: string }) {
+  const { resource, retry } = useReadResource(
+    `/api/v1/investigations/${id}`,
+    parseInvestigationContext,
+    id,
+  );
+  const data = resource.state === "ready" ? resource.data : null;
+  const alert = data?.alert;
+  const href = alert ? safeSourceURL(alert.source_reference) : null;
+  return (
+    <section className="context-section" aria-labelledby="context-heading">
+      <div className="section-heading">
+        <h2 id="context-heading">调查摘要</h2>
+        {data && <span className="badge">{data.status}</span>}
+      </div>
+      {resource.state === "loading" && <p role="status">正在读取调查摘要…</p>}
+      {resource.state === "error" && (
+        <Failure status={resource.status} name="调查摘要" retry={retry} />
+      )}
+      {data && (
+        <>
+          <div className="context-layout">
+            <dl>
+              <dt>项目</dt>
+              <dd>
+                {data.project.name}
+                <span className="mono muted context-id">
+                  {data.project.slug} · {data.project.id}
+                </span>
+              </dd>
+              <dt>服务</dt>
+              <dd>
+                {data.service ? (
+                  <>
+                    {data.service.name}
+                    <span className="mono muted context-id">
+                      {data.service.slug} · {data.service.id}
+                    </span>
+                  </>
+                ) : (
+                  "待核对"
+                )}
+              </dd>
+              <dt>环境</dt>
+              <dd>{data.environment ?? "待核对"}</dd>
+              <dt>实体映射</dt>
+              <dd>{data.mapping_status}</dd>
+              <dt>调查开始 UTC</dt>
+              <dd className="mono">
+                {new Date(data.started_at).toISOString()}
+              </dd>
+              <dt>调查结束 UTC</dt>
+              <dd className="mono">
+                {data.completed_at
+                  ? new Date(data.completed_at).toISOString()
+                  : "尚未结束"}
+              </dd>
+              <dt>Incident</dt>
+              <dd className="mono">{data.incident_id}</dd>
+            </dl>
+            <div className="alert-summary">
+              <h3>关联告警</h3>
+              {alert ? (
+                <>
+                  <span className="badge warning">
+                    {alert.severity} · {alert.status}
+                  </span>
+                  <p className="alert-title">{alert.summary}</p>
+                  <dl>
+                    <dt>告警 ID</dt>
+                    <dd className="mono">{alert.id}</dd>
+                    <dt>开始 UTC</dt>
+                    <dd className="mono">
+                      {new Date(alert.starts_at).toISOString()}
+                    </dd>
+                    <dt>结束 UTC</dt>
+                    <dd className="mono">
+                      {alert.ends_at
+                        ? new Date(alert.ends_at).toISOString()
+                        : "未记录"}
+                    </dd>
+                  </dl>
+                  {href && (
+                    <a href={href} target="_blank" rel="noopener noreferrer">
+                      打开告警来源
+                    </a>
+                  )}
+                  {!href && <p className="muted">未记录可打开的告警来源</p>}
+                </>
+              ) : (
+                <p className="muted">尚未关联告警</p>
+              )}
+            </div>
+          </div>
+          {data.mapping_status === "NEEDS_MAPPING" && (
+            <p className="notice">服务或环境尚未完成映射。</p>
+          )}
+          {data.mapping_status === "CONFLICT" && (
+            <p className="notice">
+              关联记录的服务或环境不一致，当前归属待核对。
+            </p>
+          )}
+          {data.context_gaps.length > 0 && <Gaps items={data.context_gaps} />}
+          <p className="muted">
+            当前登记状态 ·
+            实体映射不代表数据源就绪；告警恢复不代表根因已确认或调查已结束。
+          </p>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -396,6 +510,7 @@ export default function InvestigationWorkbench({ id }: { id: string }) {
   return (
     <>
       <p className="investigation-reference mono">INVESTIGATION · {id}</p>
+      <ContextSummary id={id} />
       <Diagnosis id={id} onSelect={selectEvidence} />
       <div className="evidence-layout">
         <Timeline id={id} selected={selected} onSelect={selectEvidence} />

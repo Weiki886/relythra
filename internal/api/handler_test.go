@@ -23,6 +23,8 @@ const (
 )
 
 type fakeReader struct {
+	context    store.InvestigationContext
+	contextID  string
 	report     store.Report
 	evidence   store.Evidence
 	timeline   store.InvestigationTimeline
@@ -33,6 +35,12 @@ type fakeReader struct {
 	deployment store.DeploymentEvent
 	err        error
 	calls      int
+}
+
+func (reader *fakeReader) GetInvestigationContext(_ context.Context, id string) (store.InvestigationContext, error) {
+	reader.calls++
+	reader.contextID = id
+	return reader.context, reader.err
 }
 
 func (reader *fakeReader) GetReport(context.Context, string) (store.Report, error) {

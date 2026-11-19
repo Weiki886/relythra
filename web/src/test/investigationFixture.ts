@@ -1,4 +1,33 @@
 export const investigationID = "11111111-1111-4111-8111-111111111111";
+export const investigationContext = {
+  investigation_id: investigationID,
+  incident_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+  status: "RECEIVED",
+  started_at: "2026-11-18T01:01:00Z",
+  completed_at: null,
+  project: {
+    id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    slug: "synthetic-shop",
+    name: "Synthetic Shop",
+  },
+  service: {
+    id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    slug: "checkout-api",
+    name: "Checkout API",
+  },
+  environment: "prod",
+  mapping_status: "MATCHED",
+  context_gaps: [],
+  alert: {
+    id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    status: "FIRING",
+    severity: "ERROR",
+    summary: "Checkout latency rose",
+    starts_at: "2026-11-18T01:00:00Z",
+    ends_at: null,
+    source_reference: "https://grafana.example.test/alert",
+  },
+};
 export const evidence = {
   id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   investigation_id: investigationID,
