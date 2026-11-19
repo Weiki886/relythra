@@ -194,6 +194,61 @@ func TestDiagnosisFromPersistedContainerMemoryEvidence(t *testing.T) {
 	}
 }
 
+func TestDiagnosisFromPersistedConfigurationErrorEvidence(t *testing.T) {
+	db := openDiagnosisTestDB(t)
+	ctx := context.Background()
+	investigationID, serviceID := insertDiagnosisFixture(t, db)
+	repository := store.NewPostgres(db)
+	filter, err := redact.NewFilter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 11, 19, 3, 0, 0, 0, time.UTC)
+	logs := loki.Result{
+		TemplateID: "loki.service.config_errors.v1", TemplateVersion: 1,
+		Query:     `{service="checkout-api"} |~ "(?i)(invalid config|configuration error|unknown field|config[^\\n]*(invalid|error))"`,
+		Direction: "backward", Limit: 100, Start: start, End: start.Add(5 * time.Minute),
+		SourceReference: "https://loki.example.test/loki/api/v1/query_range",
+		Entries: []loki.Entry{{Timestamp: start.Add(2 * time.Minute), Line: redact.UntrustedData{
+			Trust: "untrusted_data", Source: "loki", Content: "private_configuration_error_log",
+		}}},
+	}
+	logEvidence, created, err := repository.PersistLokiEvidence(ctx, logs, evidence.LokiEvidenceContext{
+		InvestigationID: investigationID, EntityType: "SERVICE", EntityID: serviceID,
+		CollectedAt: start.Add(6 * time.Minute),
+	}, filter)
+	if err != nil || !created {
+		t.Fatalf("persist configuration error log: created=%v err=%v", created, err)
+	}
+	response := serve(NewHandler(repository, discardLogger()), http.MethodGet,
+		"/api/v1/investigations/"+investigationID+"/diagnosis")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Data investigationDiagnosis `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	result := envelope.Data
+	if result.RuleSetVersion != diagnosis.RuleSetVersion || result.Status != diagnosis.StatusCandidatesFound || len(result.Candidates) != 1 {
+		t.Fatalf("persisted configuration error Evidence result = %+v", result)
+	}
+	candidate := result.Candidates[0]
+	if candidate.RuleID != diagnosis.RuleConfigurationErrorSignal || candidate.FaultType != "CONFIGURATION_ERROR_LOG_SIGNAL" ||
+		candidate.EntityID != serviceID || candidate.Confidence != diagnosis.ConfidenceLow ||
+		!reflect.DeepEqual(candidate.SupportEvidenceIDs, []string{logEvidence.ID}) || len(candidate.ContradictEvidenceIDs) != 0 ||
+		candidate.TriggerChange != "" || !slices.Contains(candidate.MissingRequirements, "configuration_error_causality_unproven") {
+		t.Fatalf("persisted configuration error Evidence candidate exceeded its evidence: %+v", candidate)
+	}
+	for _, private := range []string{logs.Query, logs.SourceReference, "private_configuration_error_log"} {
+		if strings.Contains(response.Body.String(), private) {
+			t.Fatalf("diagnosis leaked %q", private)
+		}
+	}
+}
+
 func openDiagnosisTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	databaseURL := strings.TrimSpace(os.Getenv("RELYTHRA_TEST_DATABASE_URL"))

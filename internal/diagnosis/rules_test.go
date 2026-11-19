@@ -19,6 +19,7 @@ const (
 	slowQueryEvidenceID     = "44444444-4444-4444-8444-444444444444"
 	memoryEvidenceID        = "55555555-5555-4555-8555-555555555555"
 	secondMemoryEvidenceID  = "66666666-6666-4666-8666-666666666666"
+	configErrorEvidenceID   = "77777777-7777-4777-8777-777777777777"
 )
 
 func TestAnalyzeSlowQueryLatencyCorrelation(t *testing.T) {
@@ -267,7 +268,7 @@ func TestAnalyzeContainerMemoryGrowthNeedsThreeIncreasingSamplesFromOneSeries(t 
 				}
 				return
 			}
-			if result.RuleSetVersion != "v0.2.0" || result.Status != StatusCandidatesFound || len(result.Candidates) != 1 {
+			if result.RuleSetVersion != RuleSetVersion || result.Status != StatusCandidatesFound || len(result.Candidates) != 1 {
 				t.Fatalf("analysis = %+v, want one versioned candidate", result)
 			}
 			candidate := result.Candidates[0]
@@ -382,6 +383,107 @@ func TestAnalyzeContainerMemoryGrowthRequiresApprovedGroupAndValidSamples(t *tes
 	}
 }
 
+func TestAnalyzeConfigurationErrorLogSignal(t *testing.T) {
+	start := time.Date(2026, 11, 19, 3, 0, 0, 0, time.UTC)
+	for _, completeness := range []string{"COMPLETE", "PARTIAL"} {
+		t.Run(completeness, func(t *testing.T) {
+			item := ruleConfigurationErrorEvidence(t, configErrorEvidenceID, completeness, start, start.Add(5*time.Minute), true)
+			result, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: []Evidence{item}})
+			if err != nil {
+				t.Fatalf("Analyze: %v", err)
+			}
+			if result.RuleSetVersion != "v0.3.0" || result.Status != StatusCandidatesFound || len(result.Candidates) != 1 {
+				t.Fatalf("analysis result = %+v", result)
+			}
+			candidate := result.Candidates[0]
+			if candidate.RuleID != "configuration-error-log-signal.v1" || candidate.FaultType != "CONFIGURATION_ERROR_LOG_SIGNAL" ||
+				candidate.EntityID != ruleTestServiceID || candidate.Confidence != ConfidenceLow ||
+				len(candidate.SupportEvidenceIDs) != 1 || candidate.SupportEvidenceIDs[0] != configErrorEvidenceID ||
+				len(candidate.ContradictEvidenceIDs) != 0 || candidate.TriggerChange != "" ||
+				!contains(candidate.MissingRequirements, "independent_configuration_corroboration") ||
+				!contains(candidate.MissingRequirements, "configuration_error_causality_unproven") {
+				t.Fatalf("configuration signal exceeded its evidence: %+v", candidate)
+			}
+			if completeness == "PARTIAL" && !contains(candidate.MissingRequirements, "complete_configuration_log_evidence") {
+				t.Fatalf("partial evidence gap missing: %+v", candidate)
+			}
+		})
+	}
+}
+
+func TestAnalyzeConfigurationErrorRequiresWindowEvidenceAndApprovedGroup(t *testing.T) {
+	start := time.Date(2026, 11, 19, 3, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name         string
+		completeness string
+		inWindow     bool
+		group        string
+		mutate       func(*Evidence)
+		missing      string
+	}{
+		{name: "missing", completeness: "MISSING", inWindow: true, missing: "configuration_error_log_unavailable"},
+		{name: "expired", completeness: "EXPIRED", inWindow: true, missing: "configuration_error_log_unavailable"},
+		{name: "empty", completeness: "COMPLETE", inWindow: false, missing: "configuration_error_log_in_window"},
+		{name: "outside window", completeness: "COMPLETE", inWindow: true, missing: "configuration_error_log_in_window", mutate: func(item *Evidence) {
+			item.ValueSummary = []byte(`{"entries":[{"timestamp":"2026-11-19T03:06:00Z","outside_time_window":true}]}`)
+		}},
+		{name: "unapproved group", completeness: "COMPLETE", inWindow: true, group: "shared:unknown", missing: "approved_independence_groups"},
+		{name: "unknown template version", completeness: "COMPLETE", inWindow: true, mutate: func(item *Evidence) {
+			item.QueryParameters = []byte(`{"template_id":"loki.service.config_errors.v1","template_version":2}`)
+		}},
+		{name: "wrong entity type", completeness: "COMPLETE", inWindow: true, mutate: func(item *Evidence) { item.EntityType = "HOST" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			item := ruleConfigurationErrorEvidence(t, configErrorEvidenceID, test.completeness, start, start.Add(5*time.Minute), test.inWindow)
+			if test.group != "" {
+				item.IndependenceGroup = test.group
+			}
+			if test.mutate != nil {
+				test.mutate(&item)
+			}
+			result, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: []Evidence{item}})
+			if err != nil {
+				t.Fatalf("Analyze: %v", err)
+			}
+			if len(result.Candidates) != 0 || result.Status != StatusInconclusive || (test.missing != "" && !contains(result.MissingRequirements, test.missing)) {
+				t.Fatalf("analysis = %+v, want no candidate and missing %q", result, test.missing)
+			}
+		})
+	}
+}
+
+func TestAnalyzeConfigurationErrorSupportEvidenceIsSorted(t *testing.T) {
+	start := time.Date(2026, 11, 19, 3, 0, 0, 0, time.UTC)
+	first := ruleConfigurationErrorEvidence(t, secondMemoryEvidenceID, "COMPLETE", start, start.Add(5*time.Minute), true)
+	second := ruleConfigurationErrorEvidence(t, configErrorEvidenceID, "COMPLETE", start, start.Add(5*time.Minute), true)
+	result, err := Analyze(context.Background(), AnalysisInput{
+		InvestigationID: ruleTestInvestigationID,
+		Evidence:        []Evidence{first, second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Candidates) != 1 || len(result.Candidates[0].SupportEvidenceIDs) != 2 ||
+		result.Candidates[0].SupportEvidenceIDs[0] != secondMemoryEvidenceID || result.Candidates[0].SupportEvidenceIDs[1] != configErrorEvidenceID {
+		t.Fatalf("configuration signal support order = %+v", result.Candidates)
+	}
+}
+
+func TestAnalyzeConfigurationErrorRejectsMalformedSummaryAndForeignInvestigation(t *testing.T) {
+	start := time.Date(2026, 11, 19, 3, 0, 0, 0, time.UTC)
+	malformed := ruleConfigurationErrorEvidence(t, configErrorEvidenceID, "COMPLETE", start, start.Add(5*time.Minute), true)
+	malformed.ValueSummary = []byte(`{"entries":[`)
+	if _, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: []Evidence{malformed}}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("malformed summary error = %v, want ErrInvalidInput", err)
+	}
+	foreign := ruleConfigurationErrorEvidence(t, configErrorEvidenceID, "COMPLETE", start, start.Add(5*time.Minute), true)
+	foreign.InvestigationID = "88888888-8888-4888-8888-888888888888"
+	if _, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: []Evidence{foreign}}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("foreign Evidence error = %v, want ErrInvalidInput", err)
+	}
+}
+
 func ruleLatencyEvidence(t *testing.T, id, investigationID, serviceID, completeness string, start, end, sampleAt time.Time) Evidence {
 	t.Helper()
 	queryParameters, err := json.Marshal(map[string]any{"template_id": "prometheus.database.query_latency.v1", "template_version": 1})
@@ -447,6 +549,34 @@ func ruleContainerMemoryEvidence(
 		EntityID: stringPointer(ruleTestServiceID), ObservedStart: start, ObservedEnd: end,
 		QueryParameters: queryParameters, ValueSummary: valueSummary, Completeness: completeness,
 		IndependenceGroup: "prometheus:prometheus.container.memory.v1:v1",
+	}
+}
+
+func ruleConfigurationErrorEvidence(t *testing.T, id, completeness string, start, end time.Time, inWindow bool) Evidence {
+	t.Helper()
+	queryParameters, err := json.Marshal(map[string]any{
+		"template_id":      "loki.service.config_errors.v1",
+		"template_version": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []lokiconnector.Entry{}
+	if inWindow {
+		entries = append(entries, lokiconnector.Entry{
+			Timestamp: start.Add(time.Minute),
+			Line:      redact.UntrustedData{Trust: "untrusted_data", Source: "loki", Content: "private configuration error log", OriginalBytes: len("private configuration error log")},
+		})
+	}
+	valueSummary, err := json.Marshal(map[string]any{"entries": entries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Evidence{
+		ID: id, InvestigationID: ruleTestInvestigationID, SourceType: "LOKI", EntityType: "SERVICE",
+		EntityID: stringPointer(ruleTestServiceID), ObservedStart: start, ObservedEnd: end,
+		QueryParameters: queryParameters, ValueSummary: valueSummary, Completeness: completeness,
+		IndependenceGroup: "loki:loki.service.config_errors.v1:v1",
 	}
 }
 

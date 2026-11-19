@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	RuleSetVersion            = "v0.2.0"
-	RuleSlowQueryLatency      = "slow-query-latency-correlation.v1"
-	RuleContainerMemoryGrowth = "container-memory-growth-trend.v1"
+	RuleSetVersion               = "v0.3.0"
+	RuleSlowQueryLatency         = "slow-query-latency-correlation.v1"
+	RuleContainerMemoryGrowth    = "container-memory-growth-trend.v1"
+	RuleConfigurationErrorSignal = "configuration-error-log-signal.v1"
 
 	StatusCandidatesFound = "CANDIDATES_FOUND"
 	StatusInconclusive    = "INCONCLUSIVE"
@@ -25,9 +26,10 @@ const (
 	ConfidenceLow    = "LOW"
 	ConfidenceMedium = "MEDIUM"
 
-	latencyTemplateID         = "prometheus.database.query_latency.v1"
-	containerMemoryTemplateID = "prometheus.container.memory.v1"
-	slowQueryTemplateID       = "loki.service.slow_queries.v1"
+	latencyTemplateID            = "prometheus.database.query_latency.v1"
+	containerMemoryTemplateID    = "prometheus.container.memory.v1"
+	slowQueryTemplateID          = "loki.service.slow_queries.v1"
+	configurationErrorTemplateID = "loki.service.config_errors.v1"
 )
 
 var ErrInvalidInput = errors.New("invalid diagnosis input")
@@ -104,8 +106,8 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 	}
 
 	seenIDs := make(map[string]struct{}, len(input.Evidence))
-	var latencyEvidence, memoryEvidence, slowQueryEvidence []matchedEvidence
-	latencySourcePresent, memorySourcePresent, memoryUsableSourcePresent, slowQuerySourcePresent := false, false, false, false
+	var latencyEvidence, memoryEvidence, slowQueryEvidence, configurationErrorEvidence []matchedEvidence
+	latencySourcePresent, memorySourcePresent, memoryUsableSourcePresent, slowQuerySourcePresent, configurationErrorSourcePresent, configurationErrorUsableSourcePresent := false, false, false, false, false, false
 	independenceMismatch := false
 	for _, item := range input.Evidence {
 		if !domain.IsID(item.ID) || item.InvestigationID != input.InvestigationID {
@@ -189,8 +191,25 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 			if err := json.Unmarshal(item.ValueSummary, &summary); err != nil {
 				return AnalysisResult{}, fmt.Errorf("%w: decode Loki Evidence summary", ErrInvalidInput)
 			}
-			if hasSlowQueryEntry(summary, item.ObservedStart, item.ObservedEnd) {
+			if hasLogEntryInWindow(summary, item.ObservedStart, item.ObservedEnd) {
 				slowQueryEvidence = append(slowQueryEvidence, entry)
+			}
+		case item.SourceType == "LOKI" && metadata.TemplateID == configurationErrorTemplateID:
+			configurationErrorSourcePresent = true
+			if item.Completeness == "MISSING" || item.Completeness == "EXPIRED" {
+				continue
+			}
+			configurationErrorUsableSourcePresent = true
+			if item.IndependenceGroup != "loki:loki.service.config_errors.v1:v1" {
+				independenceMismatch = true
+				continue
+			}
+			var summary lokiSummary
+			if err := json.Unmarshal(item.ValueSummary, &summary); err != nil {
+				return AnalysisResult{}, fmt.Errorf("%w: decode configuration error Evidence summary", ErrInvalidInput)
+			}
+			if hasLogEntryInWindow(summary, item.ObservedStart, item.ObservedEnd) {
+				configurationErrorEvidence = append(configurationErrorEvidence, entry)
 			}
 		}
 	}
@@ -201,6 +220,12 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 	}
 	if !slowQuerySourcePresent {
 		missing["slow_query_log"] = struct{}{}
+	}
+	if !configurationErrorSourcePresent {
+		missing["configuration_error_log"] = struct{}{}
+	}
+	if configurationErrorSourcePresent && !configurationErrorUsableSourcePresent {
+		missing["configuration_error_log_unavailable"] = struct{}{}
 	}
 	if !memorySourcePresent {
 		missing["container_memory_metric"] = struct{}{}
@@ -213,6 +238,9 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 	}
 	if slowQuerySourcePresent && len(slowQueryEvidence) == 0 {
 		missing["slow_query_log_in_window"] = struct{}{}
+	}
+	if configurationErrorUsableSourcePresent && len(configurationErrorEvidence) == 0 {
+		missing["configuration_error_log_in_window"] = struct{}{}
 	}
 	if memoryUsableSourcePresent && len(memoryEvidence) == 0 {
 		missing["container_memory_growth_trend"] = struct{}{}
@@ -307,6 +335,40 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 		sort.Strings(candidate.MissingRequirements)
 		result.Candidates = append(result.Candidates, *candidate)
 	}
+
+	configurationByService := make(map[string]*Candidate)
+	completeConfigurationByService := make(map[string]bool)
+	for _, configurationError := range configurationErrorEvidence {
+		serviceID := *configurationError.evidence.EntityID
+		candidate := configurationByService[serviceID]
+		if candidate == nil {
+			candidate = &Candidate{
+				RuleID: RuleConfigurationErrorSignal, FaultType: "CONFIGURATION_ERROR_LOG_SIGNAL",
+				EntityID: serviceID, Confidence: ConfidenceLow,
+				SupportEvidenceIDs: []string{}, ContradictEvidenceIDs: []string{},
+				MissingRequirements: []string{"independent_configuration_corroboration", "configuration_error_causality_unproven"},
+			}
+			configurationByService[serviceID] = candidate
+		}
+		candidate.SupportEvidenceIDs = appendUnique(candidate.SupportEvidenceIDs, configurationError.evidence.ID)
+		if configurationError.complete {
+			completeConfigurationByService[serviceID] = true
+		}
+	}
+	configurationServiceIDs := make([]string, 0, len(configurationByService))
+	for id := range configurationByService {
+		configurationServiceIDs = append(configurationServiceIDs, id)
+	}
+	sort.Strings(configurationServiceIDs)
+	for _, id := range configurationServiceIDs {
+		candidate := configurationByService[id]
+		if !completeConfigurationByService[id] {
+			candidate.MissingRequirements = append(candidate.MissingRequirements, "complete_configuration_log_evidence")
+		}
+		sort.Strings(candidate.SupportEvidenceIDs)
+		sort.Strings(candidate.MissingRequirements)
+		result.Candidates = append(result.Candidates, *candidate)
+	}
 	sort.Slice(result.Candidates, func(left, right int) bool {
 		if result.Candidates[left].RuleID == result.Candidates[right].RuleID {
 			return result.Candidates[left].EntityID < result.Candidates[right].EntityID
@@ -333,7 +395,7 @@ func registeredTemplate(item Evidence) (queryMetadata, bool, error) {
 	}
 	if item.SourceType == "PROMETHEUS" &&
 		(metadata.TemplateID == latencyTemplateID || metadata.TemplateID == containerMemoryTemplateID) ||
-		item.SourceType == "LOKI" && metadata.TemplateID == slowQueryTemplateID {
+		item.SourceType == "LOKI" && (metadata.TemplateID == slowQueryTemplateID || metadata.TemplateID == configurationErrorTemplateID) {
 		return metadata, true, nil
 	}
 	return metadata, false, nil
@@ -373,7 +435,7 @@ func hasLatencySample(summary prometheusSummary, start, end time.Time) bool {
 	return false
 }
 
-func hasSlowQueryEntry(summary lokiSummary, start, end time.Time) bool {
+func hasLogEntryInWindow(summary lokiSummary, start, end time.Time) bool {
 	for _, entry := range summary.Entries {
 		if !entry.OutsideTimeWindow && inWindow(entry.Timestamp, start, end) {
 			return true
@@ -389,7 +451,7 @@ func hasLatencySampleInWindow(raw json.RawMessage, start, end time.Time) bool {
 
 func hasSlowQueryInWindow(raw json.RawMessage, start, end time.Time) bool {
 	var summary lokiSummary
-	return json.Unmarshal(raw, &summary) == nil && hasSlowQueryEntry(summary, start, end)
+	return json.Unmarshal(raw, &summary) == nil && hasLogEntryInWindow(summary, start, end)
 }
 
 func inWindow(value, start, end time.Time) bool {
