@@ -399,6 +399,66 @@ pre {
 .source-reference {
   color: #65726b;
 }
+.metric-trend {
+  min-width: 0;
+  margin: 1.25rem 0;
+  padding-top: 1rem;
+  border-top: 1px solid #dce4df;
+}
+.metric-trend .section-heading {
+  margin-bottom: 0;
+}
+.metric-trend h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+.metric-trend-meta {
+  margin: 0.4rem 0;
+  overflow-wrap: anywhere;
+}
+.metric-chart {
+  width: 100%;
+  height: 280px;
+  min-width: 0;
+}
+.metric-trend details {
+  margin-top: 0.5rem;
+}
+.metric-trend summary {
+  width: fit-content;
+  cursor: pointer;
+  color: #08688b;
+  font-size: 0.82rem;
+}
+.metric-table-scroll {
+  max-height: 24rem;
+  overflow: auto;
+  margin-top: 0.5rem;
+  border: 1px solid #dce4df;
+}
+.metric-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.75rem;
+  text-align: left;
+}
+.metric-table caption {
+  padding: 0.5rem;
+  text-align: left;
+  color: #65726b;
+}
+.metric-table th,
+.metric-table td {
+  padding: 0.45rem;
+  border-top: 1px solid #dce4df;
+  overflow-wrap: anywhere;
+}
+.metric-table th:first-child {
+  max-width: 16rem;
+}
+.metric-table tbody tr:nth-child(even) {
+  background: #f4f7f5;
+}
 @media (max-width: 760px) {
   .context-layout {
     grid-template-columns: minmax(0, 1fr);
@@ -425,6 +485,13 @@ pre {
     padding: 1.25rem 0 0;
     border-left: none;
     border-top: 1px solid #dce4df;
+  }
+  .metric-chart {
+    height: 240px;
+  }
+  .metric-table th,
+  .metric-table td {
+    padding: 0.35rem;
   }
   .lookup-controls {
     grid-template-columns: minmax(0, 1fr);

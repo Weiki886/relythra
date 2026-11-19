@@ -56,6 +56,84 @@ function timestamp(value: unknown): string {
     : invalid();
 }
 
+const maxMetricSeries = 10;
+const maxMetricSamples = 240;
+const maxMetricLabels = 16;
+const maxMetricLabelLength = 128;
+
+export type MetricTrend = {
+  unit: string;
+  series: {
+    name: string;
+    samples: { timestamp: number; value: number }[];
+  }[];
+};
+
+export function parseMetricTrend(
+  value: unknown,
+  unitValue: unknown,
+  observedStart: string,
+  observedEnd: string,
+): MetricTrend {
+  const summary = object(value);
+  if (!Array.isArray(summary.series) || summary.series.length > maxMetricSeries)
+    return invalid();
+  const unit = text(unitValue);
+  if (unit.length > 32) return invalid();
+  const start = Date.parse(timestamp(observedStart));
+  const end = Date.parse(timestamp(observedEnd));
+  if (end < start) return invalid();
+
+  const usedNames = new Map<string, number>();
+  const series = summary.series.map((value, index) => {
+    const item = object(value);
+    const labels = object(item.labels);
+    const entries = Object.entries(labels);
+    if (entries.length > maxMetricLabels) return invalid();
+    for (const [key, label] of entries) {
+      if (
+        key.length === 0 ||
+        key.length > maxMetricLabelLength ||
+        typeof label !== "string" ||
+        label.length > maxMetricLabelLength
+      )
+        return invalid();
+    }
+    if (!Array.isArray(item.samples) || item.samples.length > maxMetricSamples)
+      return invalid();
+
+    const baseName = entries.length
+      ? entries
+          .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+          .map(([key, label]) => `${key}=${label}`)
+          .join(", ")
+      : `序列 ${index + 1}`;
+    const nameCount = (usedNames.get(baseName) ?? 0) + 1;
+    usedNames.set(baseName, nameCount);
+    const name = nameCount === 1 ? baseName : `${baseName} (${nameCount})`;
+
+    const samples = item.samples.map((sampleValue) => {
+      const sample = object(sampleValue);
+      const sampleTime = Date.parse(timestamp(sample.timestamp));
+      if (
+        sampleTime < start ||
+        sampleTime > end ||
+        typeof sample.value !== "number" ||
+        !Number.isFinite(sample.value)
+      )
+        return invalid();
+      return { timestamp: sampleTime, value: sample.value };
+    });
+    samples.sort((left, right) => left.timestamp - right.timestamp);
+
+    return {
+      name,
+      samples,
+    };
+  });
+  return { unit, series };
+}
+
 function contextEntity(value: unknown) {
   const entity = object(value);
   return {

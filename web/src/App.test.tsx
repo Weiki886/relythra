@@ -230,6 +230,79 @@ describe("investigation workbench", () => {
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
   });
+  it("shows a bounded Prometheus trend for the selected Evidence", async () => {
+    const metricEvidence = {
+      ...evidence,
+      query_parameters: {
+        template_id: "prometheus.service.request_rate.v1",
+        template_version: 1,
+        unit: "requests/second",
+      },
+      value_summary: {
+        series: [
+          {
+            labels: { service: "checkout-api" },
+            samples: [
+              { timestamp: "2026-11-18T01:01:00Z", value: 12 },
+              { timestamp: "2026-11-18T01:02:00Z", value: 14 },
+            ],
+          },
+        ],
+      },
+    };
+    mockAPI({
+      [`/api/v1/evidence/${evidence.id}`]: async () =>
+        response(metricEvidence),
+    });
+    render(<App />);
+    openInvestigation();
+    await screen.findByText("slow-query-latency-correlation.v1");
+    fireEvent.click(
+      screen.getByRole("button", { name: `支持证据 ${evidence.id}` }),
+    );
+    expect(
+      await screen.findByRole("img", { name: "Prometheus 指标趋势图" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("PARTIAL").length).toBeGreaterThanOrEqual(2);
+    fireEvent.click(screen.getByText(/查看序列数据/));
+    expect(screen.getByText("service=checkout-api")).toBeInTheDocument();
+    expect(screen.getByText(/单位：requests\/second/)).toBeInTheDocument();
+  });
+  it.each([
+    {
+      name: "unknown template",
+      evidence: {
+        ...evidence,
+        query_parameters: { template_id: "prometheus.unknown.v1", unit: "bytes" },
+        value_summary: { series: [{ labels: {}, samples: [] }] },
+      },
+    },
+    {
+      name: "empty series",
+      evidence: {
+        ...evidence,
+        query_parameters: {
+          template_id: "prometheus.service.request_rate.v1",
+          unit: "requests_per_second",
+        },
+        value_summary: { series: [] },
+      },
+    },
+  ])("keeps raw evidence without charting $name", async ({ evidence: item }) => {
+    mockAPI({
+      [`/api/v1/evidence/${evidence.id}`]: async () => response(item),
+    });
+    render(<App />);
+    openInvestigation();
+    await screen.findByText("slow-query-latency-correlation.v1");
+    fireEvent.click(
+      screen.getByRole("button", { name: `支持证据 ${evidence.id}` }),
+    );
+    expect(await screen.findByText("select duration from queries")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("img", { name: "Prometheus 指标趋势图" }),
+    ).not.toBeInTheDocument();
+  });
   it("loads a deep link, retains timeline on diagnosis failure and retries independently", async () => {
     window.history.replaceState(null, "", `/?investigation=${investigationID}`);
     let failed = true;
