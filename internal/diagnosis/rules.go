@@ -11,14 +11,16 @@ import (
 
 	lokiconnector "github.com/Weiki886/relythra/internal/connector/loki"
 	prometheusconnector "github.com/Weiki886/relythra/internal/connector/prometheus"
+	runtimeconnector "github.com/Weiki886/relythra/internal/connector/runtime"
 	"github.com/Weiki886/relythra/internal/domain"
 )
 
 const (
-	RuleSetVersion               = "v0.3.0"
+	RuleSetVersion               = "v0.4.0"
 	RuleSlowQueryLatency         = "slow-query-latency-correlation.v1"
 	RuleContainerMemoryGrowth    = "container-memory-growth-trend.v1"
 	RuleConfigurationErrorSignal = "configuration-error-log-signal.v1"
+	RuleHostResourcePressure     = "host-resource-pressure-signal.v1"
 
 	StatusCandidatesFound = "CANDIDATES_FOUND"
 	StatusInconclusive    = "INCONCLUSIVE"
@@ -30,6 +32,9 @@ const (
 	containerMemoryTemplateID    = "prometheus.container.memory.v1"
 	slowQueryTemplateID          = "loki.service.slow_queries.v1"
 	configurationErrorTemplateID = "loki.service.config_errors.v1"
+	hostCPUtemplateID            = "prometheus.runtime.host.cpu.v1"
+	hostMemoryTemplateID         = "prometheus.runtime.host.memory_available.v1"
+	hostLoadTemplateID           = "prometheus.runtime.host.load.v1"
 )
 
 var ErrInvalidInput = errors.New("invalid diagnosis input")
@@ -85,6 +90,15 @@ type lokiSummary struct {
 	Entries []lokiconnector.Entry `json:"entries"`
 }
 
+type runtimeSummary struct {
+	Measurements []struct {
+		EntityType  string                       `json:"entity_type"`
+		EntityID    string                       `json:"entity_id"`
+		HostID      string                       `json:"host_id"`
+		Measurement runtimeconnector.Measurement `json:"measurement"`
+	} `json:"measurements"`
+}
+
 type matchedEvidence struct {
 	evidence Evidence
 	complete bool
@@ -108,6 +122,11 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 	seenIDs := make(map[string]struct{}, len(input.Evidence))
 	var latencyEvidence, memoryEvidence, slowQueryEvidence, configurationErrorEvidence []matchedEvidence
 	latencySourcePresent, memorySourcePresent, memoryUsableSourcePresent, slowQuerySourcePresent, configurationErrorSourcePresent, configurationErrorUsableSourcePresent := false, false, false, false, false, false
+	hostSourcePresent := map[string]bool{}
+	hostUsableSourcePresent := map[string]bool{}
+	hostTrendPresent := map[string]bool{}
+	hostTrendByHost := make(map[string]map[string]matchedEvidence)
+	hostIndependenceMismatch := make(map[string]bool)
 	independenceMismatch := false
 	for _, item := range input.Evidence {
 		if !domain.IsID(item.ID) || item.InvestigationID != input.InvestigationID {
@@ -124,6 +143,41 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 		case "COMPLETE", "PARTIAL", "MISSING", "EXPIRED":
 		default:
 			return AnalysisResult{}, ErrInvalidInput
+		}
+		if item.SourceType == "RUNTIME" && item.EntityType == "HOST" {
+			metadata, recognized, err := registeredTemplate(item)
+			if err != nil {
+				return AnalysisResult{}, err
+			}
+			if !recognized || metadata.TemplateVersion != 1 {
+				continue
+			}
+			if item.EntityID == nil || !validHostID(*item.EntityID) {
+				return AnalysisResult{}, ErrInvalidInput
+			}
+			templateID := metadata.TemplateID
+			hostSourcePresent[templateID] = true
+			if item.Completeness == "MISSING" || item.Completeness == "EXPIRED" {
+				continue
+			}
+			hostUsableSourcePresent[templateID] = true
+			if item.IndependenceGroup != "runtime:"+templateID+":v1" {
+				hostIndependenceMismatch[*item.EntityID] = true
+				independenceMismatch = true
+				continue
+			}
+			trend, err := hasHostResourceTrend(item.ValueSummary, *item.EntityID, item.ObservedStart, item.ObservedEnd, item.ObservedStart, item.ObservedEnd, templateID)
+			if err != nil {
+				return AnalysisResult{}, err
+			}
+			if trend {
+				hostTrendPresent[templateID] = true
+				if hostTrendByHost[*item.EntityID] == nil {
+					hostTrendByHost[*item.EntityID] = make(map[string]matchedEvidence)
+				}
+				hostTrendByHost[*item.EntityID][templateID] = matchedEvidence{evidence: item, complete: item.Completeness == "COMPLETE"}
+			}
+			continue
 		}
 		if item.EntityType != "SERVICE" || item.EntityID == nil || !domain.IsID(*item.EntityID) {
 			continue
@@ -248,6 +302,15 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 	if independenceMismatch {
 		missing["approved_independence_groups"] = struct{}{}
 	}
+	for _, templateID := range []string{hostCPUtemplateID, hostMemoryTemplateID, hostLoadTemplateID} {
+		if !hostSourcePresent[templateID] {
+			missing[hostMetricRequirement(templateID)] = struct{}{}
+		} else if !hostUsableSourcePresent[templateID] {
+			missing[hostMetricRequirement(templateID)+"_unavailable"] = struct{}{}
+		} else if !hostTrendPresent[templateID] {
+			missing[hostMetricRequirement(templateID)+"_trend"] = struct{}{}
+		}
+	}
 
 	byService := make(map[string]*Candidate)
 	completePairByService := make(map[string]bool)
@@ -336,6 +399,57 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 		result.Candidates = append(result.Candidates, *candidate)
 	}
 
+	hostIDs := make([]string, 0, len(hostTrendByHost))
+	for hostID := range hostTrendByHost {
+		hostIDs = append(hostIDs, hostID)
+	}
+	sort.Strings(hostIDs)
+	for _, hostID := range hostIDs {
+		trends := hostTrendByHost[hostID]
+		if hostIndependenceMismatch[hostID] || len(trends) != 3 {
+			continue
+		}
+		items := []matchedEvidence{trends[hostCPUtemplateID], trends[hostMemoryTemplateID], trends[hostLoadTemplateID]}
+		windowStart := items[0].evidence.ObservedStart
+		windowEnd := items[0].evidence.ObservedEnd
+		for _, item := range items[1:] {
+			windowStart = maxTime(windowStart, item.evidence.ObservedStart)
+			windowEnd = minTime(windowEnd, item.evidence.ObservedEnd)
+		}
+		if windowEnd.Before(windowStart) {
+			missing["host_resource_observation_overlap"] = struct{}{}
+			continue
+		}
+		validOverlap := true
+		for index, templateID := range []string{hostCPUtemplateID, hostMemoryTemplateID, hostLoadTemplateID} {
+			trend, err := hasHostResourceTrend(items[index].evidence.ValueSummary, hostID, items[index].evidence.ObservedStart, items[index].evidence.ObservedEnd, windowStart, windowEnd, templateID)
+			if err != nil {
+				return AnalysisResult{}, err
+			}
+			if !trend {
+				validOverlap = false
+				missing[hostMetricRequirement(templateID)+"_trend_in_overlap"] = struct{}{}
+			}
+		}
+		if !validOverlap {
+			continue
+		}
+		candidate := &Candidate{
+			RuleID: RuleHostResourcePressure, FaultType: "HOST_RESOURCE_PRESSURE_SIGNAL", EntityID: hostID, Confidence: ConfidenceLow,
+			SupportEvidenceIDs: []string{}, ContradictEvidenceIDs: []string{},
+			MissingRequirements: []string{"independent_resource_corroboration", "host_pressure_causality_unproven"},
+		}
+		for _, item := range items {
+			candidate.SupportEvidenceIDs = append(candidate.SupportEvidenceIDs, item.evidence.ID)
+			if !item.complete {
+				candidate.MissingRequirements = append(candidate.MissingRequirements, "complete_host_resource_evidence")
+			}
+		}
+		sort.Strings(candidate.SupportEvidenceIDs)
+		sort.Strings(candidate.MissingRequirements)
+		result.Candidates = append(result.Candidates, *candidate)
+	}
+
 	configurationByService := make(map[string]*Candidate)
 	completeConfigurationByService := make(map[string]bool)
 	for _, configurationError := range configurationErrorEvidence {
@@ -383,7 +497,7 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 }
 
 func registeredTemplate(item Evidence) (queryMetadata, bool, error) {
-	if item.SourceType != "PROMETHEUS" && item.SourceType != "LOKI" {
+	if item.SourceType != "PROMETHEUS" && item.SourceType != "LOKI" && item.SourceType != "RUNTIME" {
 		return queryMetadata{}, false, nil
 	}
 	var metadata queryMetadata
@@ -395,10 +509,81 @@ func registeredTemplate(item Evidence) (queryMetadata, bool, error) {
 	}
 	if item.SourceType == "PROMETHEUS" &&
 		(metadata.TemplateID == latencyTemplateID || metadata.TemplateID == containerMemoryTemplateID) ||
-		item.SourceType == "LOKI" && (metadata.TemplateID == slowQueryTemplateID || metadata.TemplateID == configurationErrorTemplateID) {
+		item.SourceType == "LOKI" && (metadata.TemplateID == slowQueryTemplateID || metadata.TemplateID == configurationErrorTemplateID) ||
+		item.SourceType == "RUNTIME" && (metadata.TemplateID == hostCPUtemplateID || metadata.TemplateID == hostMemoryTemplateID || metadata.TemplateID == hostLoadTemplateID) {
 		return metadata, true, nil
 	}
 	return metadata, false, nil
+}
+
+func validHostID(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for index, character := range value {
+		valid := character >= 'A' && character <= 'Z' || character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '_' || character == '.' || character == ':' || character == '-'
+		if !valid || (index == 0 && !(character >= 'A' && character <= 'Z' || character >= 'a' && character <= 'z' || character >= '0' && character <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+func hostMetricRequirement(templateID string) string {
+	switch templateID {
+	case hostCPUtemplateID:
+		return "host_cpu_metric"
+	case hostMemoryTemplateID:
+		return "host_memory_available_metric"
+	default:
+		return "host_load_metric"
+	}
+}
+
+func hasHostResourceTrend(raw json.RawMessage, hostID string, evidenceStart, evidenceEnd, windowStart, windowEnd time.Time, templateID string) (bool, error) {
+	var summary runtimeSummary
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		return false, fmt.Errorf("%w: decode host runtime Evidence summary", ErrInvalidInput)
+	}
+	for _, observation := range summary.Measurements {
+		if observation.EntityType != "HOST" || observation.EntityID != hostID || observation.HostID != hostID {
+			continue
+		}
+		samples := make([]prometheusconnector.Sample, 0, len(observation.Measurement.Samples))
+		for _, sample := range observation.Measurement.Samples {
+			if sample.Timestamp.IsZero() || sample.Timestamp.Before(evidenceStart) || sample.Timestamp.After(evidenceEnd) || math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) || sample.Value < 0 {
+				return false, fmt.Errorf("%w: invalid host resource sample", ErrInvalidInput)
+			}
+			if sample.Timestamp.Before(windowStart) || sample.Timestamp.After(windowEnd) {
+				continue
+			}
+			samples = append(samples, sample)
+		}
+		sort.SliceStable(samples, func(left, right int) bool {
+			return samples[left].Timestamp.Before(samples[right].Timestamp)
+		})
+		for index := 2; index < len(samples); index++ {
+			first, second, third := samples[index-2], samples[index-1], samples[index]
+			if !first.Timestamp.Before(second.Timestamp) || !second.Timestamp.Before(third.Timestamp) {
+				continue
+			}
+			if hostResourceTrend(templateID, first.Value, second.Value, third.Value) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func hostResourceTrend(templateID string, first, second, third float64) bool {
+	switch templateID {
+	case hostCPUtemplateID, hostLoadTemplateID:
+		return first < second && second < third
+	case hostMemoryTemplateID:
+		return first > second && second > third
+	default:
+		return false
+	}
 }
 
 func hasIncreasingMemoryTrend(summary prometheusSummary, start, end time.Time) (bool, error) {

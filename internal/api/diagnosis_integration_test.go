@@ -16,6 +16,8 @@ import (
 
 	"github.com/Weiki886/relythra/internal/connector/loki"
 	"github.com/Weiki886/relythra/internal/connector/prometheus"
+	runtimeconnector "github.com/Weiki886/relythra/internal/connector/runtime"
+	"github.com/Weiki886/relythra/internal/datasource"
 	"github.com/Weiki886/relythra/internal/diagnosis"
 	"github.com/Weiki886/relythra/internal/evidence"
 	"github.com/Weiki886/relythra/internal/security/redact"
@@ -243,6 +245,75 @@ func TestDiagnosisFromPersistedConfigurationErrorEvidence(t *testing.T) {
 		t.Fatalf("persisted configuration error Evidence candidate exceeded its evidence: %+v", candidate)
 	}
 	for _, private := range []string{logs.Query, logs.SourceReference, "private_configuration_error_log"} {
+		if strings.Contains(response.Body.String(), private) {
+			t.Fatalf("diagnosis leaked %q", private)
+		}
+	}
+}
+
+func TestDiagnosisFromPersistedHostResourceEvidence(t *testing.T) {
+	db := openDiagnosisTestDB(t)
+	ctx := context.Background()
+	investigationID, serviceID := insertDiagnosisFixture(t, db)
+	repository := store.NewPostgres(db)
+	filter, err := redact.NewFilter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 11, 19, 4, 0, 0, 0, time.UTC)
+	measurement := func(values []float64) runtimeconnector.Measurement {
+		samples := make([]prometheus.Sample, 0, len(values))
+		for index, value := range values {
+			samples = append(samples, prometheus.Sample{Timestamp: start.Add(time.Duration(index+1) * time.Minute), Value: value})
+		}
+		return runtimeconnector.Measurement{Samples: samples, SourceReference: "https://prometheus.example.test/private-host-resource-query"}
+	}
+	runtimeResult := runtimeconnector.Result{
+		Runtime: datasource.RuntimeDockerCompose, Service: "checkout", Environment: "test", HostID: "host-1",
+		Start: start, End: start.Add(5 * time.Minute), Duration: time.Second,
+		Hosts: []runtimeconnector.Host{{HostID: "host-1", Instance: "node:9100",
+			CPU:             measurement([]float64{0.4, 0.7, 0.95}),
+			MemoryAvailable: measurement([]float64{1024, 900, 700}),
+			Load:            measurement([]float64{1, 2, 4}),
+		}},
+		Containers: []runtimeconnector.Container{}, Events: []runtimeconnector.Event{}, Gaps: []string{}, Failures: []runtimeconnector.CollectionFailure{},
+	}
+	persisted, _, err := repository.PersistRuntimeEvidence(ctx, runtimeResult, store.RuntimeEvidencePersistenceContext{
+		InvestigationID: investigationID, ServiceID: serviceID, CollectedAt: start.Add(6 * time.Minute),
+	}, filter)
+	if err != nil {
+		t.Fatalf("persist runtime evidence: %v", err)
+	}
+	response := serve(NewHandler(repository, discardLogger()), http.MethodGet,
+		"/api/v1/investigations/"+investigationID+"/diagnosis")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Data investigationDiagnosis `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	result := envelope.Data
+	if result.RuleSetVersion != diagnosis.RuleSetVersion || result.Status != diagnosis.StatusCandidatesFound || len(result.Candidates) != 1 {
+		t.Fatalf("persisted host resource Evidence result = %+v", result)
+	}
+	candidate := result.Candidates[0]
+	if candidate.RuleID != diagnosis.RuleHostResourcePressure || candidate.FaultType != "HOST_RESOURCE_PRESSURE_SIGNAL" ||
+		candidate.EntityID != "host-1" || candidate.Confidence != diagnosis.ConfidenceLow || len(candidate.SupportEvidenceIDs) != 3 ||
+		len(candidate.ContradictEvidenceIDs) != 0 || !slices.Contains(candidate.MissingRequirements, "host_pressure_causality_unproven") {
+		t.Fatalf("persisted host resource candidate exceeded its evidence: %+v", candidate)
+	}
+	var expectedIDs []string
+	for _, item := range persisted[:3] {
+		expectedIDs = append(expectedIDs, item.ID)
+	}
+	slices.Sort(expectedIDs)
+	if !reflect.DeepEqual(candidate.SupportEvidenceIDs, expectedIDs) {
+		t.Fatalf("support Evidence IDs = %v, want %v", candidate.SupportEvidenceIDs, expectedIDs)
+	}
+	for _, private := range []string{"private-host-resource-query", "node:9100", "prometheus.runtime.host.cpu.v1"} {
 		if strings.Contains(response.Body.String(), private) {
 			t.Fatalf("diagnosis leaked %q", private)
 		}

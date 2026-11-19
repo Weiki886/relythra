@@ -9,12 +9,14 @@ import (
 
 	lokiconnector "github.com/Weiki886/relythra/internal/connector/loki"
 	prometheusconnector "github.com/Weiki886/relythra/internal/connector/prometheus"
+	runtimeconnector "github.com/Weiki886/relythra/internal/connector/runtime"
 	"github.com/Weiki886/relythra/internal/security/redact"
 )
 
 const (
 	ruleTestInvestigationID = "11111111-1111-4111-8111-111111111111"
 	ruleTestServiceID       = "22222222-2222-4222-8222-222222222222"
+	ruleTestHostID          = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 	latencyEvidenceID       = "33333333-3333-4333-8333-333333333333"
 	slowQueryEvidenceID     = "44444444-4444-4444-8444-444444444444"
 	memoryEvidenceID        = "55555555-5555-4555-8555-555555555555"
@@ -392,7 +394,7 @@ func TestAnalyzeConfigurationErrorLogSignal(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Analyze: %v", err)
 			}
-			if result.RuleSetVersion != "v0.3.0" || result.Status != StatusCandidatesFound || len(result.Candidates) != 1 {
+			if result.RuleSetVersion != RuleSetVersion || result.Status != StatusCandidatesFound || len(result.Candidates) != 1 {
 				t.Fatalf("analysis result = %+v", result)
 			}
 			candidate := result.Candidates[0]
@@ -481,6 +483,120 @@ func TestAnalyzeConfigurationErrorRejectsMalformedSummaryAndForeignInvestigation
 	foreign.InvestigationID = "88888888-8888-4888-8888-888888888888"
 	if _, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: []Evidence{foreign}}); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("foreign Evidence error = %v, want ErrInvalidInput", err)
+	}
+}
+
+func TestAnalyzeHostResourcePressureSignal(t *testing.T) {
+	start := time.Date(2026, 11, 19, 4, 0, 0, 0, time.UTC)
+	items := ruleHostResourceEvidence(t, "COMPLETE", start, start.Add(5*time.Minute), map[string][]float64{
+		"prometheus.runtime.host.cpu.v1":              {0.4, 0.7, 0.95},
+		"prometheus.runtime.host.memory_available.v1": {1024, 900, 700},
+		"prometheus.runtime.host.load.v1":             {1, 2, 4},
+	})
+	result, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: items})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RuleSetVersion != "v0.4.0" || result.Status != StatusCandidatesFound || len(result.Candidates) != 1 {
+		t.Fatalf("analysis = %+v", result)
+	}
+	candidate := result.Candidates[0]
+	if candidate.RuleID != RuleHostResourcePressure || candidate.FaultType != "HOST_RESOURCE_PRESSURE_SIGNAL" ||
+		candidate.EntityID != ruleTestHostID || candidate.Confidence != ConfidenceLow ||
+		len(candidate.SupportEvidenceIDs) != 3 || candidate.ContradictEvidenceIDs == nil || candidate.TriggerChange != "" ||
+		!contains(candidate.MissingRequirements, "independent_resource_corroboration") ||
+		!contains(candidate.MissingRequirements, "host_pressure_causality_unproven") {
+		t.Fatalf("host resource signal exceeded its evidence: %+v", candidate)
+	}
+}
+
+func TestAnalyzeHostResourcePressureIgnoresSamplesOutsideCommonWindow(t *testing.T) {
+	start := time.Date(2026, 11, 19, 4, 0, 0, 0, time.UTC)
+	items := ruleHostResourceEvidence(t, "COMPLETE", start, start.Add(4*time.Minute), map[string][]float64{
+		"prometheus.runtime.host.cpu.v1":              {0.4, 0.7, 0.95},
+		"prometheus.runtime.host.memory_available.v1": {1024, 900, 700},
+		"prometheus.runtime.host.load.v1":             {1, 2, 4},
+	})
+
+	for index := range items {
+		var metadata queryMetadata
+		if err := json.Unmarshal(items[index].QueryParameters, &metadata); err != nil {
+			t.Fatal(err)
+		}
+		var summary runtimeSummary
+		if err := json.Unmarshal(items[index].ValueSummary, &summary); err != nil {
+			t.Fatal(err)
+		}
+		measurement := &summary.Measurements[0].Measurement
+		samples := measurement.Samples
+		if metadata.TemplateID == hostCPUtemplateID {
+			samples = append(samples, prometheusconnector.Sample{Timestamp: start.Add(3 * time.Minute), Value: 1.1})
+		} else {
+			items[index].ObservedStart = start.Add(time.Minute)
+			lastValue := samples[2].Value + 1
+			if metadata.TemplateID == hostMemoryTemplateID {
+				lastValue = samples[2].Value - 100
+			}
+			samples = append(samples[1:], prometheusconnector.Sample{
+				Timestamp: start.Add(3 * time.Minute), Value: lastValue,
+			})
+		}
+		measurement.Samples = samples
+		valueSummary, err := json.Marshal(summary)
+		if err != nil {
+			t.Fatal(err)
+		}
+		items[index].ValueSummary = valueSummary
+	}
+
+	result, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: items})
+	if err != nil {
+		t.Fatalf("Analyze with valid samples outside the common window: %v", err)
+	}
+	if len(result.Candidates) != 1 || result.Candidates[0].RuleID != RuleHostResourcePressure {
+		t.Fatalf("common-window host pressure signal = %+v", result)
+	}
+}
+
+func TestAnalyzeHostResourcePressureRequiresAllTrendsAndApprovedGroups(t *testing.T) {
+	start := time.Date(2026, 11, 19, 4, 0, 0, 0, time.UTC)
+	missing := ruleHostResourceEvidence(t, "COMPLETE", start, start.Add(5*time.Minute), map[string][]float64{
+		"prometheus.runtime.host.cpu.v1":              {0.4, 0.7, 0.95},
+		"prometheus.runtime.host.memory_available.v1": {1024, 900, 700},
+	})
+	result, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: missing})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Candidates) != 0 || !contains(result.MissingRequirements, "host_load_metric") {
+		t.Fatalf("incomplete host pressure evidence = %+v", result)
+	}
+
+	invalid := ruleHostResourceEvidence(t, "COMPLETE", start, start.Add(5*time.Minute), map[string][]float64{
+		"prometheus.runtime.host.cpu.v1":              {0.4, 0.7, 0.95},
+		"prometheus.runtime.host.memory_available.v1": {1024, 900, 700},
+		"prometheus.runtime.host.load.v1":             {1, 1, 4},
+	})
+	result, err = Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: invalid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Candidates) != 0 || !contains(result.MissingRequirements, "host_load_metric_trend") {
+		t.Fatalf("non-monotonic host pressure evidence = %+v", result)
+	}
+
+	unapproved := ruleHostResourceEvidence(t, "COMPLETE", start, start.Add(5*time.Minute), map[string][]float64{
+		"prometheus.runtime.host.cpu.v1":              {0.4, 0.7, 0.95},
+		"prometheus.runtime.host.memory_available.v1": {1024, 900, 700},
+		"prometheus.runtime.host.load.v1":             {1, 2, 4},
+	})
+	unapproved[0].IndependenceGroup = "shared:unknown"
+	result, err = Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: unapproved})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Candidates) != 0 || !contains(result.MissingRequirements, "approved_independence_groups") {
+		t.Fatalf("unapproved host evidence = %+v", result)
 	}
 }
 
@@ -577,6 +693,52 @@ func ruleConfigurationErrorEvidence(t *testing.T, id, completeness string, start
 		EntityID: stringPointer(ruleTestServiceID), ObservedStart: start, ObservedEnd: end,
 		QueryParameters: queryParameters, ValueSummary: valueSummary, Completeness: completeness,
 		IndependenceGroup: "loki:loki.service.config_errors.v1:v1",
+	}
+}
+
+func ruleHostResourceEvidence(t *testing.T, completeness string, start, end time.Time, values map[string][]float64) []Evidence {
+	t.Helper()
+	items := make([]Evidence, 0, len(values))
+	for templateID, samples := range values {
+		queryParameters, err := json.Marshal(map[string]any{"template_id": templateID, "template_version": 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		metricSamples := make([]prometheusconnector.Sample, 0, len(samples))
+		for index, value := range samples {
+			metricSamples = append(metricSamples, prometheusconnector.Sample{Timestamp: start.Add(time.Duration(index) * time.Minute), Value: value})
+		}
+		valueSummary, err := json.Marshal(map[string]any{
+			"measurements": []map[string]any{{
+				"entity_type": "HOST",
+				"entity_id":   ruleTestHostID,
+				"host_id":     ruleTestHostID,
+				"measurement": runtimeconnector.Measurement{Samples: metricSamples},
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, Evidence{
+			ID: idForHostTemplate(templateID), InvestigationID: ruleTestInvestigationID, SourceType: "RUNTIME", EntityType: "HOST",
+			EntityID: stringPointer(ruleTestHostID), ObservedStart: start, ObservedEnd: end,
+			QueryParameters: queryParameters, ValueSummary: valueSummary, Completeness: completeness,
+			IndependenceGroup: "runtime:" + templateID + ":v1",
+		})
+	}
+	return items
+}
+
+func idForHostTemplate(templateID string) string {
+	switch templateID {
+	case "prometheus.runtime.host.cpu.v1":
+		return "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	case "prometheus.runtime.host.memory_available.v1":
+		return "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	case "prometheus.runtime.host.load.v1":
+		return "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+	default:
+		return "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 	}
 }
 
