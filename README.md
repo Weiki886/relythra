@@ -39,7 +39,7 @@ Web 首页提供基础只读调查工作台。输入已有 Investigation UUID，
 
 时间线支持 `source_type=GRAFANA`。后端提供 `PersistGrafanaAlertEvidence`，将数据库中与调查所属事件关联的规范告警保存为不可变、脱敏的证据快照；持续触发的告警以触发时间为点事件，恢复后追加结束时间已知的区间快照，同一告警的状态快照共享独立性分组。未映射、缺来源引用或恢复时间未知时标记为 `PARTIAL`。此入口尚未接入 Webhook/Worker 自动采集，接收告警不会自动产生这些快照。部署该能力前先执行迁移 `000009`；存在 `GRAFANA` 历史证据时，该迁移拒绝降级以保留数据，回滚应用可以保留扩展后的数据库约束。
 
-`GET /api/v1/investigations/{id}/diagnosis` 对已入库 Evidence 即时执行 v0 固定规则，返回规则集版本、候选、支持/反证 Evidence ID、缺口，以及 `evidence_total`、`evidence_limit=100`、`evidence_truncated`。接口不接受查询参数，不触发外部采集或写入假设/报告；一次读取同一数据库快照中的完整时间线，超过 100 条时返回 `INCONCLUSIVE`、空候选与 `complete_evidence_snapshot` 缺口，避免用截断子集下结论。当前规则包括同服务、重叠时间窗内的数据库耗时样本与慢查询模板日志关联，以及单个容器同一 Prometheus 序列中至少三个严格递增内存样本形成的增长信号。数据库候选不证明 SQL 或发布导致故障，也不判定耗时已超过异常阈值；内存候选固定为 `LOW`，不证明内存泄漏、OOM、重启或根因。数据库 `COMPLETE` 配对的置信度为 `MEDIUM`，只有 `PARTIAL` 配对时为 `LOW`（定性等级，不是概率）；内存规则无论完整度都不超过 `LOW`。`MISSING`、`EXPIRED` 不作为支持证据。没有足够证据时为 `INCONCLUSIVE`；不存在的调查返回 `404`，损坏的规则输入返回通用 `500`。该端点沿用现有只读 API 的本地/受信网络边界。
+`GET /api/v1/investigations/{id}/diagnosis` 对已入库 Evidence 即时执行 v0 固定规则，当前规则集版本为 `v0.3.0`，返回规则集版本、候选、支持/反证 Evidence ID、缺口，以及 `evidence_total`、`evidence_limit=100`、`evidence_truncated`。接口不接受查询参数，不触发外部采集或写入假设/报告；一次读取同一数据库快照中的完整时间线，超过 100 条时返回 `INCONCLUSIVE`、空候选与 `complete_evidence_snapshot` 缺口，避免用截断子集下结论。当前规则包括同服务、重叠时间窗内的数据库耗时样本与慢查询模板日志关联，单个容器同一 Prometheus 序列中至少三个严格递增内存样本形成的增长信号，以及固定配置错误 Loki 模板在服务时间窗内命中日志形成的配置错误信号。数据库候选不证明 SQL 或发布导致故障，也不判定耗时已超过异常阈值；内存候选不证明内存泄漏、OOM、重启或根因；配置错误候选不证明日志信号导致告警或服务故障。配置错误和内存候选固定为 `LOW`（定性等级，不是概率）；数据库 `COMPLETE` 配对为 `MEDIUM`，只有 `PARTIAL` 配对时为 `LOW`。`MISSING`、`EXPIRED` 不作为支持证据。没有足够证据时为 `INCONCLUSIVE`；不存在的调查返回 `404`，损坏的规则输入返回通用 `500`。该端点沿用现有只读 API 的本地/受信网络边界。
 
 - Worker metrics：<http://127.0.0.1:8081/metrics>
 
