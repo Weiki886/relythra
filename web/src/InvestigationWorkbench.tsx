@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { Suspense, lazy, useRef, useState } from "react";
 import {
   completenessStates,
   parseDiagnosis,
@@ -7,9 +7,22 @@ import {
   parseTimeline,
   safeSourceURL,
   sources,
+  parseMetricTrend,
 } from "./investigation";
 import type { Evidence } from "./investigation";
 import { useReadResource } from "./useReadResource";
+
+const MetricTrend = lazy(() => import("./MetricTrend"));
+
+const metricTemplates = new Set([
+  "prometheus.service.latency.v1",
+  "prometheus.service.error_ratio.v1",
+  "prometheus.service.request_rate.v1",
+  "prometheus.container.memory.v1",
+  "prometheus.container.cpu.v1",
+  "prometheus.database.query_latency.v1",
+  "prometheus.node.capacity.v1",
+]);
 
 function Failure({
   status,
@@ -417,6 +430,26 @@ function utc(value: string) {
 
 function EvidenceContent({ item }: { item: Evidence }) {
   const href = safeSourceURL(item.raw_reference);
+  const templateID = item.query_parameters.template_id;
+  let trend = null;
+  if (
+    item.source_type === "PROMETHEUS" &&
+    typeof templateID === "string" &&
+    metricTemplates.has(templateID)
+  ) {
+    try {
+      const parsed = parseMetricTrend(
+        item.value_summary,
+        item.query_parameters.unit,
+        item.observed_start,
+        item.observed_end,
+      );
+      if (parsed.series.some((series) => series.samples.length > 0))
+        trend = parsed;
+    } catch {
+      trend = null;
+    }
+  }
   return (
     <>
       <div className="section-heading">
@@ -463,6 +496,11 @@ function EvidenceContent({ item }: { item: Evidence }) {
       <pre>{item.query_text || "未记录"}</pre>
       <h3>查询参数</h3>
       <pre>{JSON.stringify(item.query_parameters, null, 2)}</pre>
+      {trend && (
+        <Suspense fallback={<p role="status">正在加载指标图表…</p>}>
+          <MetricTrend trend={trend} completeness={item.completeness} />
+        </Suspense>
+      )}
       <h3>观测摘要与缺口</h3>
       <pre>{JSON.stringify(item.value_summary, null, 2)}</pre>
       <h3>原始来源</h3>
