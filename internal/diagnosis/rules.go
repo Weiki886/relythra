@@ -161,7 +161,7 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 				continue
 			}
 			hostUsableSourcePresent[templateID] = true
-			if item.IndependenceGroup != "runtime:"+templateID+":v1" {
+			if item.IndependenceGroup != "prometheus:"+templateID+":v1" {
 				hostIndependenceMismatch[*item.EntityID] = true
 				independenceMismatch = true
 				continue

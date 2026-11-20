@@ -10,7 +10,7 @@ Issue #15 包含机器和容器资源压力的基础规则。Runtime Collector �
 - 仅消费 `RUNTIME` 来源、`HOST` 实体的 `prometheus.runtime.host.cpu.v1`、`prometheus.runtime.host.memory_available.v1` 和 `prometheus.runtime.host.load.v1` Evidence，模板版本固定为 1。
 - 三类证据必须属于同一宿主机，并有相互重叠的有效观测窗口。
 - 每类指标至少存在三个时间严格递增的样本。CPU 与 Load 值严格递增，可用内存值严格递减。
-- 必须使用各模板固定的 Runtime independence group。分组不匹配时不生成该宿主机候选。
+- 必须使用各模板固定的 `prometheus:<template_id>:v1` independence group（Runtime Evidence 的底层 Prometheus 来源分组）。分组不匹配时不生成该宿主机候选。
 - 候选置信等级固定为 `LOW`，支持证据引用三类 Evidence ID，且返回 `independent_resource_corroboration` 与 `host_pressure_causality_unproven` 缺口。非 `COMPLETE` 的支持证据额外返回完整度缺口。
 - 缺少、过期、趋势不成立、时间窗不重叠或独立性组不匹配时不生成宿主机候选，并返回相应缺口。
 - 规则集版本升至 `v0.4.0`。Web 诊断测试夹具与 README 同步版本和规则描述。

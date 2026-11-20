@@ -723,7 +723,7 @@ func ruleHostResourceEvidence(t *testing.T, completeness string, start, end time
 			ID: idForHostTemplate(templateID), InvestigationID: ruleTestInvestigationID, SourceType: "RUNTIME", EntityType: "HOST",
 			EntityID: stringPointer(ruleTestHostID), ObservedStart: start, ObservedEnd: end,
 			QueryParameters: queryParameters, ValueSummary: valueSummary, Completeness: completeness,
-			IndependenceGroup: "runtime:" + templateID + ":v1",
+			IndependenceGroup: "prometheus:" + templateID + ":v1",
 		})
 	}
 	return items
