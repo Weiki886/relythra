@@ -2,7 +2,7 @@ GO_PACKAGES := ./cmd/... ./internal/... ./migrations/...
 GO_FILES := $$(find cmd internal migrations -type f -name '*.go')
 COMPOSE := docker compose --file deploy/compose/compose.yaml
 
-.PHONY: fmt fmt-check vet test build web-install web-check case-check compose-config smoke demo-smoke dev-script-check check
+.PHONY: fmt fmt-check vet test build web-install web-check case-check demo-artifact-check compose-config smoke demo-smoke dev-script-check check
 
 fmt:
 	gofmt -w $(GO_FILES)
@@ -35,6 +35,10 @@ web-check:
 case-check:
 	go run ./cmd/relythra-casecheck test/evaluation/cases
 
+demo-artifact-check:
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'demo_artifacts_test.py'
+	bash -n scripts/demo-smoke.sh
+
 compose-config:
 	$(COMPOSE) config --quiet
 
@@ -48,4 +52,4 @@ dev-script-check:
 	bash -n scripts/dev.sh scripts/dev_test.sh
 	bash scripts/dev_test.sh
 
-check: fmt-check vet test build web-check case-check compose-config dev-script-check
+check: fmt-check vet test build web-check case-check demo-artifact-check compose-config dev-script-check
