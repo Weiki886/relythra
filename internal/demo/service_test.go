@@ -13,12 +13,21 @@ import (
 )
 
 type stockFake struct {
-	quantity int
-	err      error
+	quantity    int
+	err         error
+	slowQueries chan struct{}
 }
 
 func (s stockFake) Stock(context.Context) (int, error) { return s.quantity, s.err }
-func (s stockFake) SlowQuery(context.Context) error    { return s.err }
+func (s stockFake) SlowQuery(context.Context) error {
+	if s.slowQueries != nil {
+		select {
+		case s.slowQueries <- struct{}{}:
+		default:
+		}
+	}
+	return s.err
+}
 func demoConfig(service string) Config {
 	return Config{Service: service, Project: "relythra-demo", Environment: "demo", Release: "baseline", Host: "demo-host", Container: "test-container"}
 }
@@ -110,6 +119,28 @@ func TestRoutesAndFaultGate(t *testing.T) {
 		t.Fatalf("enabled fault = %d", w.Code)
 	}
 }
+
+func TestInventoryStockSlowSQLFaultIsGated(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "disabled", true: "enabled"}[enabled], func(t *testing.T) {
+			slowQueries := make(chan struct{}, 1)
+			cfg := demoConfig("inventory")
+			cfg.EnableFaults = enabled
+			handler, err := NewHandler(cfg, stockFake{quantity: 42, slowQueries: slowQueries}, nil, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if response := request(handler, "/stock"); response.Code != http.StatusOK {
+				t.Fatalf("stock status = %d, body=%s", response.Code, response.Body.String())
+			}
+			if got := len(slowQueries); (got == 1) != enabled {
+				t.Fatalf("slow query calls = %d, fault enabled = %v", got, enabled)
+			}
+		})
+	}
+}
+
 func TestInvalidConfiguration(t *testing.T) {
 	for _, cfg := range []Config{{}, demoConfig("other"), func() Config { c := demoConfig("orders"); c.InventoryURL = "http://user:secret@localhost"; return c }(), func() Config { c := demoConfig("inventory"); c.Host = ""; return c }()} {
 		if _, err := NewHandler(cfg, nil, nil, slog.Default()); err == nil {

@@ -124,7 +124,7 @@ docker compose --file deploy/compose/compose.yaml down --volumes
 ./scripts/demo.sh up
 ```
 
-访问 orders `http://127.0.0.1:18090/orders` 与 Grafana `http://127.0.0.1:13001/d/relythra-demo`。包含 orders → inventory → 独立业务 PostgreSQL、Prometheus、Loki、Alloy、node_exporter 和 cAdvisor；观测查询使用独立只读 Token。`make demo-smoke` 在专用项目验证真实指标/日志、权限、数据库故障隔离和重启恢复。完整端口、卷、资源限制、cgroup 身份缺口及安全清理见 [docs/demo.md](docs/demo.md)。
+访问 orders `http://127.0.0.1:18090/orders` 与 Grafana `http://127.0.0.1:13001/d/relythra-demo`。包含 orders → inventory → 独立业务 PostgreSQL、Prometheus、Loki、Alloy、node_exporter 和 cAdvisor；观测查询使用独立只读 Token。`make demo-smoke` 在专用项目验证慢 SQL 故障/恢复期间的真实请求指标与日志、权限、数据库故障隔离和重启恢复。该 smoke 尚不验证 Grafana 告警到 Investigation/Evidence 的完整自动诊断链路。完整端口、卷、资源限制、cgroup 身份缺口及安全清理见 [docs/demo.md](docs/demo.md)。
 
 ## 数据库迁移
 

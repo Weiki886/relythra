@@ -35,6 +35,14 @@ trap cleanup EXIT
 python3 scripts/demo-assert.py config "$temp_dir/compose.json"
 "${COMPOSE[@]}" up --build --wait --wait-timeout 240
 python3 scripts/demo-assert.py healthy
+DEMO_ENABLE_FAULTS=true \
+  DEMO_INVENTORY_RELEASE=slow-sql-fault \
+  "${COMPOSE[@]}" up --build --force-recreate --no-deps --wait --wait-timeout 120 inventory
+python3 scripts/demo-assert.py slow-sql-fault
+DEMO_ENABLE_FAULTS=false \
+  DEMO_INVENTORY_RELEASE=baseline \
+  "${COMPOSE[@]}" up --force-recreate --no-deps --wait --wait-timeout 120 inventory
+python3 scripts/demo-assert.py slow-sql-recovered
 for service in inventory orders; do
   test "$("${COMPOSE[@]}" exec -T "$service" awk '$1 == "Uid:" { print $2 }' /proc/1/status)" = "10001"
 done
