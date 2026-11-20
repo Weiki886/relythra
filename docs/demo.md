@@ -72,7 +72,7 @@ node_exporter 只读挂载 `/proc` 与 `/sys`，采集 CPU、内存、负载与�
 docker compose -p relythra-demo -f deploy/compose/compose.yaml -f deploy/compose/demo.yaml up -d --build --no-deps inventory
 ```
 
-所有故障测试默认关闭。只有显式设置 `DEMO_ENABLE_FAULTS=true` 并重建 inventory 容器时，容器内 `GET /internal/test/slow-query` 才执行固定 `SELECT pg_sleep(0.2)`，上下文最多 1 秒；无任意 SQL/命令、无公开管理端口。这只验证测试入口边界，不是已经完成慢 SQL 发布回归或评测案例。完整故障注入与恢复将在后续 Issue 实现，不能把控制元数据写进观测日志当根因答案。
+所有故障测试默认关闭。`DEMO_ENABLE_FAULTS=true` 仅对显式重建的 inventory 容器生效：inventory 的真实 `/stock` 调用先执行固定 `SELECT pg_sleep(0.2)`，然后读取种子库存，业务请求总预算为 2 秒；同一开关也启用容器内 `GET /internal/test/slow-query`，该独立测试请求预算为 1 秒。无任意 SQL/命令输入，无公开管理端口。`make demo-smoke` 在自己的隔离 Compose 项目里用 `baseline → slow-sql-fault → baseline` 重建 inventory，经 orders 业务入口发送请求，再核对 orders Prometheus 延迟直方图和 inventory Loki `duration_ms` 日志，最后验证指标/日志回到基线。该受控 SQL 延迟是 Issue #16 的故障夹具切片，不代表 Grafana 告警、Relythra Investigation、Evidence 采集或诊断候选端到端链路已经实现；不能把测试编排状态写进观测日志当根因答案。
 
 数据库断开：inventory/orders 的 `/health/ready` 返回 503，业务请求 503，`/health/live` 保持 200；控制面数据库独立，Relythra readiness 不受演示数据库影响。恢复 demo 数据库后自动重连，不自动执行重启、扩容、回滚。
 
@@ -106,6 +106,6 @@ make demo-smoke
 
 需要 Python 3；脚本创建独立随机项目、随机 Secret、专用端口 28080/28081/23000/25432/28090/29090/23100/23001。验收结束只删除该项目的容器、网络、卷和临时 Secret。不要把这个脚本改成连接共享/生产数据库。
 
-检查项包括真实业务请求、6 个 targets、业务/宿主机/非根 cgroup/Worker 样本、两种服务日志与标签、Viewer 面板、只读拒写、数据库权限、演示数据库中断/恢复、重启保留数据。任何组件没就绪都会失败并报告具体服务/缺失样本。首次下载镜像超时可在网络恢复后重新执行；不把重跑当作解决 flaky。
+检查项包括真实业务请求、慢 SQL 故障与恢复期间的 Prometheus/Loki 信号、6 个 targets、业务/宿主机/非根 cgroup/Worker 样本、两种服务日志与标签、Viewer 面板、只读拒写、数据库权限、演示数据库中断/恢复、重启保留数据。任何组件没就绪都会失败并报告具体服务/缺失样本。首次下载镜像超时可在网络恢复后重新执行；不把重跑当作解决 flaky。
 
 `demo.sh up` 失败后不会清空数据；用 `status` 定位不健康组件，再用相同项目名和两个 compose 文件执行 `logs <service>`。不要输出 Secret、网关渲染文件或完整环境变量。Grafana 初始密码仅在空卷生效，修改 Secret 文件后应通过受控账号管理更新已有密码。
