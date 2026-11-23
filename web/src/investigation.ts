@@ -279,6 +279,21 @@ export function parseTimeline(value: unknown) {
   return { investigation_id, items, total, limit, offset, has_more };
 }
 
+function candidateEntityID(entityType: "SERVICE" | "HOST" | "CONTAINER", value: unknown): string {
+  const result = text(value);
+  if (entityType === "SERVICE") return id(result);
+  if (entityType === "HOST") {
+    return /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(result) ? result : invalid();
+  }
+  const containsControl = [...result].some((character) => {
+    const code = character.charCodeAt(0);
+    return code < 0x20 || code === 0x7f;
+  });
+  return result.length > 0 && result.length <= 4096 && !containsControl
+    ? result
+    : invalid();
+}
+
 export function parseDiagnosis(value: unknown) {
   const result = object(value);
   return {
@@ -294,10 +309,20 @@ export function parseDiagnosis(value: unknown) {
     missing_requirements: list(result.missing_requirements, text),
     candidates: list(result.candidates, (value) => {
       const candidate = object(value);
+      const knownLegacyRuleEntities: Record<string, "SERVICE" | "HOST"> = {
+        "slow-query-latency-correlation.v1": "SERVICE",
+        "container-memory-growth-trend.v1": "SERVICE",
+        "configuration-error-log-signal.v1": "SERVICE",
+        "host-resource-pressure-signal.v1": "HOST",
+      };
+      const entity_type = candidate.entity_type === undefined
+        ? knownLegacyRuleEntities[text(candidate.rule_id)] ?? invalid()
+        : choice(candidate.entity_type, ["SERVICE", "HOST", "CONTAINER"] as const);
       return {
+        entity_type,
         rule_id: text(candidate.rule_id),
         fault_type: text(candidate.fault_type),
-        entity_id: id(candidate.entity_id),
+        entity_id: candidateEntityID(entity_type, candidate.entity_id),
         confidence: choice(candidate.confidence, ["LOW", "MEDIUM"] as const),
         support_evidence_ids: list(candidate.support_evidence_ids, id),
         contradict_evidence_ids: list(candidate.contradict_evidence_ids, id),

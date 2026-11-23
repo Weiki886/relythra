@@ -256,7 +256,7 @@ function Diagnosis({
           {resource.data.candidates.map((candidate, index) => (
             <article
               className="candidate"
-              key={`${candidate.rule_id}:${candidate.entity_id}:${index}`}
+              key={`${candidate.rule_id}:${candidate.entity_type}:${candidate.entity_id}:${index}`}
             >
               <div className="section-heading">
                 <h3>{candidate.fault_type}</h3>
@@ -265,7 +265,7 @@ function Diagnosis({
                 </span>
               </div>
               <p className="mono">{candidate.rule_id}</p>
-              <p className="muted mono">SERVICE · {candidate.entity_id}</p>
+              <p className="muted mono">{candidate.entity_type} · {candidate.entity_id}</p>
               <EvidenceButtons
                 ids={candidate.support_evidence_ids}
                 label="支持证据"

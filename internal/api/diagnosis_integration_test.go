@@ -278,6 +278,10 @@ func TestDiagnosisFromPersistedHostResourceEvidence(t *testing.T) {
 		}},
 		Containers: []runtimeconnector.Container{}, Events: []runtimeconnector.Event{}, Gaps: []string{}, Failures: []runtimeconnector.CollectionFailure{},
 	}
+	_, normalizeErr := evidence.FromRuntimeResult(ctx, runtimeResult, evidence.RuntimeEvidenceContext{InvestigationID: investigationID, CollectedAt: start.Add(11 * time.Minute)}, filter)
+	if normalizeErr != nil {
+		t.Fatalf("normalize runtime test result: %v", normalizeErr)
+	}
 	persisted, _, err := repository.PersistRuntimeEvidence(ctx, runtimeResult, store.RuntimeEvidencePersistenceContext{
 		InvestigationID: investigationID, ServiceID: serviceID, CollectedAt: start.Add(6 * time.Minute),
 	}, filter)
@@ -387,4 +391,114 @@ func insertDiagnosisFixture(t *testing.T, db *sql.DB) (investigationID, serviceI
 		t.Fatal(err)
 	}
 	return investigationID, serviceID
+}
+
+func TestDiagnosisFromPersistedContainerRestartEvidence(t *testing.T) {
+	db := openDiagnosisTestDB(t)
+	ctx := context.Background()
+	investigationID, serviceID := insertDiagnosisFixture(t, db)
+	repository := store.NewPostgres(db)
+	filter, err := redact.NewFilter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 11, 23, 3, 0, 0, 0, time.UTC)
+	oldStart := start.Add(-time.Hour)
+	newStart := start.Add(2 * time.Minute)
+	end := start.Add(4 * time.Minute)
+	const hostID, cgroup = "host-restart-1", "/system.slice/docker-checkout-api.scope"
+	const prometheusReference = "https://prometheus.example.test/api/v1/query_range"
+	const lokiReference = "https://loki.example.test/loki/api/v1/query_range"
+	collector, err := runtimeconnector.NewCollector(
+		diagnosisRuntimeMetrics(func(query datasource.NormalizedQuery) prometheus.Result {
+			result := prometheus.Result{SourceReference: prometheusReference}
+			samples := []prometheus.Sample{{Timestamp: end, Value: 1}}
+			switch query.TemplateID {
+			case "prometheus.runtime.container.start_time.v1":
+				samples = []prometheus.Sample{{Timestamp: start.Add(time.Minute), Value: float64(oldStart.Unix())}, {Timestamp: end, Value: float64(newStart.Unix())}}
+			case "prometheus.runtime.container.cpu.v1", "prometheus.runtime.container.memory.v1", "prometheus.runtime.container.oom_events.v1":
+			default:
+				result.Empty = true
+				return result
+			}
+			result.Series = []prometheus.Series{{Labels: map[string]string{"id": cgroup, "host_id": hostID}, Samples: samples}}
+			return result
+		}), diagnosisRuntimeLogClient{result: loki.Result{SourceReference: lokiReference, Entries: []loki.Entry{{
+			Timestamp: start.Add(2*time.Minute + 30*time.Second),
+			Labels:    map[string]string{"cgroup_id": cgroup, "host_id": hostID, "service": "checkout-api", "env": "prod"},
+			Line:      redact.UntrustedData{Trust: "untrusted_data", Source: "loki", Content: "container restarted", OriginalBytes: len("container restarted")},
+		}}}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeResult, err := collector.Query(ctx, runtimeconnector.Target{}, runtimeconnector.Request{
+		Runtime: datasource.RuntimeDockerCompose, Service: "checkout-api", Environment: "prod", HostID: hostID,
+		MappingVersion: 4, Start: start, End: end, ContainerMappings: []datasource.RuntimeContainerMapping{{HostID: hostID, CgroupID: cgroup}},
+	})
+	if err != nil {
+		t.Fatalf("collect runtime evidence: %v", err)
+	}
+	if len(runtimeResult.Containers) != 1 || len(runtimeResult.Events) != 1 || !slices.Contains(runtimeResult.Gaps, "container_incarnation_ambiguous") {
+		t.Fatalf("collector did not preserve the ambiguous incarnation and log: %+v", runtimeResult)
+	}
+	container := runtimeResult.Containers[0]
+	if container.StartTime != nil || container.InstanceID != "" || container.ID == cgroup || runtimeResult.Events[0].ContainerID != container.ID {
+		t.Fatalf("collector returned unexpected identities: %+v", runtimeResult)
+	}
+	persisted, _, err := repository.PersistRuntimeEvidence(ctx, runtimeResult, store.RuntimeEvidencePersistenceContext{
+		InvestigationID: investigationID, ServiceID: serviceID, CollectedAt: start.Add(11 * time.Minute),
+	}, filter)
+	if err != nil {
+		t.Fatalf("persist runtime evidence: %v", err)
+	}
+	response := serve(NewHandler(repository, discardLogger()), http.MethodGet,
+		"/api/v1/investigations/"+investigationID+"/diagnosis")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Data investigationDiagnosis `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	result := envelope.Data
+	if result.RuleSetVersion != diagnosis.RuleSetVersion || result.Status != diagnosis.StatusCandidatesFound || len(result.Candidates) != 1 {
+		t.Fatalf("persisted container restart Evidence result = %+v", result)
+	}
+	candidate := result.Candidates[0]
+	if candidate.RuleID != diagnosis.RuleContainerRestartSignal || candidate.EntityType != "CONTAINER" ||
+		candidate.EntityID != container.ID || candidate.Confidence != diagnosis.ConfidenceLow ||
+		!slices.Contains(candidate.MissingRequirements, "restart_causality_unproven") ||
+		!slices.Contains(candidate.MissingRequirements, "lifecycle_log_unverified") {
+		t.Fatalf("restart candidate overstates persisted evidence: %+v", candidate)
+	}
+	var expectedIDs []string
+	for _, item := range persisted {
+		if item.QueryParameters != nil && (strings.Contains(string(item.QueryParameters), "container.start_time") || strings.Contains(string(item.QueryParameters), "container.restarts")) {
+			expectedIDs = append(expectedIDs, item.ID)
+		}
+	}
+	slices.Sort(expectedIDs)
+	if len(expectedIDs) != 2 || !reflect.DeepEqual(candidate.SupportEvidenceIDs, expectedIDs) {
+		t.Fatalf("restart support Evidence IDs = %v, want %v", candidate.SupportEvidenceIDs, expectedIDs)
+	}
+	for _, private := range []string{prometheusReference, lokiReference, cgroup} {
+		if strings.Contains(response.Body.String(), private) {
+			t.Fatalf("diagnosis leaked %q", private)
+		}
+	}
+}
+
+type diagnosisRuntimeMetrics func(datasource.NormalizedQuery) prometheus.Result
+
+func (metrics diagnosisRuntimeMetrics) Query(_ context.Context, _ prometheus.Target, query datasource.NormalizedQuery) (prometheus.Result, error) {
+	return metrics(query), nil
+}
+
+type diagnosisRuntimeLogClient struct{ result loki.Result }
+
+func (logs diagnosisRuntimeLogClient) Query(context.Context, loki.Target, datasource.NormalizedQuery) (loki.Result, error) {
+	return logs.result, nil
 }

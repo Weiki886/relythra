@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	lokiconnector "github.com/Weiki886/relythra/internal/connector/loki"
@@ -16,11 +17,12 @@ import (
 )
 
 const (
-	RuleSetVersion               = "v0.4.0"
+	RuleSetVersion               = "v0.5.0"
 	RuleSlowQueryLatency         = "slow-query-latency-correlation.v1"
 	RuleContainerMemoryGrowth    = "container-memory-growth-trend.v1"
 	RuleConfigurationErrorSignal = "configuration-error-log-signal.v1"
 	RuleHostResourcePressure     = "host-resource-pressure-signal.v1"
+	RuleContainerRestartSignal   = "container-restart-signal.v1"
 
 	StatusCandidatesFound = "CANDIDATES_FOUND"
 	StatusInconclusive    = "INCONCLUSIVE"
@@ -35,6 +37,9 @@ const (
 	hostCPUtemplateID            = "prometheus.runtime.host.cpu.v1"
 	hostMemoryTemplateID         = "prometheus.runtime.host.memory_available.v1"
 	hostLoadTemplateID           = "prometheus.runtime.host.load.v1"
+	containerStartTimeTemplateID = "prometheus.runtime.container.start_time.v1"
+	containerRestartTemplateID   = "loki.container.restarts.v1"
+	containerRestartCorrelation  = 5 * time.Minute
 )
 
 var ErrInvalidInput = errors.New("invalid diagnosis input")
@@ -67,6 +72,7 @@ type AnalysisResult struct {
 }
 
 type Candidate struct {
+	EntityType            string   `json:"entity_type"`
 	RuleID                string   `json:"rule_id"`
 	FaultType             string   `json:"fault_type"`
 	EntityID              string   `json:"entity_id"`
@@ -78,8 +84,14 @@ type Candidate struct {
 }
 
 type queryMetadata struct {
-	TemplateID      string `json:"template_id"`
-	TemplateVersion int    `json:"template_version"`
+	TemplateID       string `json:"template_id"`
+	TemplateVersion  int    `json:"template_version"`
+	Runtime          string `json:"runtime"`
+	Service          string `json:"service"`
+	Environment      string `json:"environment"`
+	HostID           string `json:"host_id"`
+	MappingVersion   int    `json:"mapping_version"`
+	UnderlyingSource string `json:"underlying_source"`
 }
 
 type prometheusSummary struct {
@@ -90,18 +102,62 @@ type lokiSummary struct {
 	Entries []lokiconnector.Entry `json:"entries"`
 }
 
+type runtimeMeasurementObservation struct {
+	EntityType     string                       `json:"entity_type"`
+	EntityID       string                       `json:"entity_id"`
+	HostID         string                       `json:"host_id"`
+	Service        string                       `json:"service"`
+	MappingStatus  string                       `json:"mapping_status"`
+	MappingVersion int                          `json:"mapping_version"`
+	StartTime      *time.Time                   `json:"start_time"`
+	LastObservedAt *time.Time                   `json:"last_observed_at"`
+	State          string                       `json:"state"`
+	Stale          *bool                        `json:"stale"`
+	ClockSkew      bool                         `json:"clock_skew"`
+	Measurement    runtimeconnector.Measurement `json:"measurement"`
+}
+
 type runtimeSummary struct {
-	Measurements []struct {
-		EntityType  string                       `json:"entity_type"`
-		EntityID    string                       `json:"entity_id"`
-		HostID      string                       `json:"host_id"`
-		Measurement runtimeconnector.Measurement `json:"measurement"`
-	} `json:"measurements"`
+	Measurements          []runtimeMeasurementObservation         `json:"measurements"`
+	Events                []runtimeconnector.Event                `json:"events"`
+	OOMWindowObservations []runtimeconnector.OOMWindowObservation `json:"oom_window_observations"`
+	Gaps                  []string                                `json:"gaps"`
+	Partial               bool                                    `json:"partial"`
 }
 
 type matchedEvidence struct {
 	evidence Evidence
 	complete bool
+}
+
+type containerRestartScope struct {
+	hostID         string
+	service        string
+	environment    string
+	mappingVersion int
+	containerID    string
+}
+
+type containerStartChange struct {
+	scope         containerRestartScope
+	at            time.Time
+	observedStart time.Time
+	observedEnd   time.Time
+	evidenceID    string
+	complete      bool
+}
+
+type containerRestartEvent struct {
+	scope         containerRestartScope
+	at            time.Time
+	observedStart time.Time
+	observedEnd   time.Time
+	evidenceID    string
+}
+
+type containerRestartIdentity struct {
+	hostID      string
+	containerID string
 }
 
 // Analyze evaluates the bounded v0 slow-query rule without making external calls
@@ -127,6 +183,8 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 	hostTrendPresent := map[string]bool{}
 	hostTrendByHost := make(map[string]map[string]matchedEvidence)
 	hostIndependenceMismatch := make(map[string]bool)
+	containerStartChanges := make([]containerStartChange, 0)
+	containerRestartEvents := make([]containerRestartEvent, 0)
 	independenceMismatch := false
 	for _, item := range input.Evidence {
 		if !domain.IsID(item.ID) || item.InvestigationID != input.InvestigationID {
@@ -155,29 +213,60 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 			if item.EntityID == nil || !validHostID(*item.EntityID) {
 				return AnalysisResult{}, ErrInvalidInput
 			}
-			templateID := metadata.TemplateID
-			hostSourcePresent[templateID] = true
-			if item.Completeness == "MISSING" || item.Completeness == "EXPIRED" {
-				continue
-			}
-			hostUsableSourcePresent[templateID] = true
-			if item.IndependenceGroup != "prometheus:"+templateID+":v1" {
-				hostIndependenceMismatch[*item.EntityID] = true
-				independenceMismatch = true
-				continue
-			}
-			trend, err := hasHostResourceTrend(item.ValueSummary, *item.EntityID, item.ObservedStart, item.ObservedEnd, item.ObservedStart, item.ObservedEnd, templateID)
-			if err != nil {
-				return AnalysisResult{}, err
-			}
-			if trend {
-				hostTrendPresent[templateID] = true
-				if hostTrendByHost[*item.EntityID] == nil {
-					hostTrendByHost[*item.EntityID] = make(map[string]matchedEvidence)
+			switch metadata.TemplateID {
+			case containerStartTimeTemplateID:
+				if item.Completeness == "MISSING" || item.Completeness == "EXPIRED" {
+					continue
 				}
-				hostTrendByHost[*item.EntityID][templateID] = matchedEvidence{evidence: item, complete: item.Completeness == "COMPLETE"}
+				if item.IndependenceGroup != "prometheus:"+containerStartTimeTemplateID+":v1" {
+					independenceMismatch = true
+					continue
+				}
+				changes, err := findContainerStartChanges(item, metadata, *item.EntityID)
+				if err != nil {
+					return AnalysisResult{}, err
+				}
+				containerStartChanges = append(containerStartChanges, changes...)
+				continue
+			case containerRestartTemplateID:
+				if item.Completeness == "MISSING" || item.Completeness == "EXPIRED" {
+					continue
+				}
+				if item.IndependenceGroup != "loki:"+containerRestartTemplateID+":v1" {
+					independenceMismatch = true
+					continue
+				}
+				events, err := findContainerRestartEvents(item, metadata, *item.EntityID)
+				if err != nil {
+					return AnalysisResult{}, err
+				}
+				containerRestartEvents = append(containerRestartEvents, events...)
+				continue
+			default:
+				templateID := metadata.TemplateID
+				hostSourcePresent[templateID] = true
+				if item.Completeness == "MISSING" || item.Completeness == "EXPIRED" {
+					continue
+				}
+				hostUsableSourcePresent[templateID] = true
+				if item.IndependenceGroup != "prometheus:"+templateID+":v1" {
+					hostIndependenceMismatch[*item.EntityID] = true
+					independenceMismatch = true
+					continue
+				}
+				trend, err := hasHostResourceTrend(item.ValueSummary, *item.EntityID, item.ObservedStart, item.ObservedEnd, item.ObservedStart, item.ObservedEnd, templateID)
+				if err != nil {
+					return AnalysisResult{}, err
+				}
+				if trend {
+					hostTrendPresent[templateID] = true
+					if hostTrendByHost[*item.EntityID] == nil {
+						hostTrendByHost[*item.EntityID] = make(map[string]matchedEvidence)
+					}
+					hostTrendByHost[*item.EntityID][templateID] = matchedEvidence{evidence: item, complete: item.Completeness == "COMPLETE"}
+				}
+				continue
 			}
-			continue
 		}
 		if item.EntityType != "SERVICE" || item.EntityID == nil || !domain.IsID(*item.EntityID) {
 			continue
@@ -336,7 +425,7 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 			candidate := byService[serviceID]
 			if candidate == nil {
 				candidate = &Candidate{
-					RuleID: RuleSlowQueryLatency, FaultType: "DATABASE_PERFORMANCE", EntityID: serviceID,
+					EntityType: "SERVICE", RuleID: RuleSlowQueryLatency, FaultType: "DATABASE_PERFORMANCE", EntityID: serviceID,
 					Confidence: ConfidenceMedium, SupportEvidenceIDs: []string{},
 					ContradictEvidenceIDs: []string{}, MissingRequirements: []string{},
 				}
@@ -372,7 +461,7 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 		candidate := memoryByService[serviceID]
 		if candidate == nil {
 			candidate = &Candidate{
-				RuleID: RuleContainerMemoryGrowth, FaultType: "CONTAINER_MEMORY_GROWTH_SIGNAL",
+				EntityType: "SERVICE", RuleID: RuleContainerMemoryGrowth, FaultType: "CONTAINER_MEMORY_GROWTH_SIGNAL",
 				EntityID: serviceID, Confidence: ConfidenceLow,
 				SupportEvidenceIDs: []string{}, ContradictEvidenceIDs: []string{},
 				MissingRequirements: []string{"independent_memory_corroboration", "memory_leak_causality_unproven"},
@@ -435,7 +524,7 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 			continue
 		}
 		candidate := &Candidate{
-			RuleID: RuleHostResourcePressure, FaultType: "HOST_RESOURCE_PRESSURE_SIGNAL", EntityID: hostID, Confidence: ConfidenceLow,
+			EntityType: "HOST", RuleID: RuleHostResourcePressure, FaultType: "HOST_RESOURCE_PRESSURE_SIGNAL", EntityID: hostID, Confidence: ConfidenceLow,
 			SupportEvidenceIDs: []string{}, ContradictEvidenceIDs: []string{},
 			MissingRequirements: []string{"independent_resource_corroboration", "host_pressure_causality_unproven"},
 		}
@@ -457,7 +546,7 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 		candidate := configurationByService[serviceID]
 		if candidate == nil {
 			candidate = &Candidate{
-				RuleID: RuleConfigurationErrorSignal, FaultType: "CONFIGURATION_ERROR_LOG_SIGNAL",
+				EntityType: "SERVICE", RuleID: RuleConfigurationErrorSignal, FaultType: "CONFIGURATION_ERROR_LOG_SIGNAL",
 				EntityID: serviceID, Confidence: ConfidenceLow,
 				SupportEvidenceIDs: []string{}, ContradictEvidenceIDs: []string{},
 				MissingRequirements: []string{"independent_configuration_corroboration", "configuration_error_causality_unproven"},
@@ -483,6 +572,39 @@ func Analyze(ctx context.Context, input AnalysisInput) (AnalysisResult, error) {
 		sort.Strings(candidate.MissingRequirements)
 		result.Candidates = append(result.Candidates, *candidate)
 	}
+	restartCandidates := make(map[containerRestartIdentity]*Candidate)
+	for _, change := range containerStartChanges {
+		for _, event := range containerRestartEvents {
+			windowStart := maxTime(change.observedStart, event.observedStart)
+			windowEnd := minTime(change.observedEnd, event.observedEnd)
+			if event.scope != change.scope || windowEnd.Before(windowStart) ||
+				change.at.Before(windowStart) || change.at.After(windowEnd) || event.at.Before(windowStart) || event.at.After(windowEnd) ||
+				event.at.Before(change.at.Add(-containerRestartCorrelation)) || event.at.After(change.at.Add(containerRestartCorrelation)) {
+				continue
+			}
+			identity := containerRestartIdentity{hostID: change.scope.hostID, containerID: change.scope.containerID}
+			candidate := restartCandidates[identity]
+			if candidate == nil {
+				candidate = &Candidate{
+					EntityType: "CONTAINER", RuleID: RuleContainerRestartSignal, FaultType: "CONTAINER_RESTART_SIGNAL",
+					EntityID: change.scope.containerID, Confidence: ConfidenceLow,
+					SupportEvidenceIDs: []string{}, ContradictEvidenceIDs: []string{},
+					MissingRequirements: []string{"independent_restart_corroboration", "lifecycle_log_unverified", "restart_causality_unproven"},
+				}
+				restartCandidates[identity] = candidate
+			}
+			candidate.SupportEvidenceIDs = appendUnique(candidate.SupportEvidenceIDs, change.evidenceID, event.evidenceID)
+			if !change.complete {
+				candidate.MissingRequirements = appendUnique(candidate.MissingRequirements, "complete_start_time_evidence")
+			}
+		}
+	}
+	for _, candidate := range restartCandidates {
+		sort.Strings(candidate.SupportEvidenceIDs)
+		sort.Strings(candidate.MissingRequirements)
+		result.Candidates = append(result.Candidates, *candidate)
+	}
+
 	sort.Slice(result.Candidates, func(left, right int) bool {
 		if result.Candidates[left].RuleID == result.Candidates[right].RuleID {
 			return result.Candidates[left].EntityID < result.Candidates[right].EntityID
@@ -510,7 +632,7 @@ func registeredTemplate(item Evidence) (queryMetadata, bool, error) {
 	if item.SourceType == "PROMETHEUS" &&
 		(metadata.TemplateID == latencyTemplateID || metadata.TemplateID == containerMemoryTemplateID) ||
 		item.SourceType == "LOKI" && (metadata.TemplateID == slowQueryTemplateID || metadata.TemplateID == configurationErrorTemplateID) ||
-		item.SourceType == "RUNTIME" && (metadata.TemplateID == hostCPUtemplateID || metadata.TemplateID == hostMemoryTemplateID || metadata.TemplateID == hostLoadTemplateID) {
+		item.SourceType == "RUNTIME" && (metadata.TemplateID == hostCPUtemplateID || metadata.TemplateID == hostMemoryTemplateID || metadata.TemplateID == hostLoadTemplateID || metadata.TemplateID == containerStartTimeTemplateID || metadata.TemplateID == containerRestartTemplateID) {
 		return metadata, true, nil
 	}
 	return metadata, false, nil
@@ -538,6 +660,116 @@ func hostMetricRequirement(templateID string) string {
 	default:
 		return "host_load_metric"
 	}
+}
+
+func validContainerEvidenceID(value string) bool {
+	if len(value) != 16 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func findContainerStartChanges(item Evidence, metadata queryMetadata, hostID string) ([]containerStartChange, error) {
+	if metadata.Runtime != "docker-compose" || metadata.HostID != hostID || metadata.MappingVersion < 1 || metadata.UnderlyingSource != "PROMETHEUS" {
+		return nil, nil
+	}
+	var summary runtimeSummary
+	if err := json.Unmarshal(item.ValueSummary, &summary); err != nil {
+		return nil, fmt.Errorf("%w: decode container start-time Evidence", ErrInvalidInput)
+	}
+	changes := make([]containerStartChange, 0)
+	for _, observation := range summary.Measurements {
+		if observation.EntityType != "CONTAINER" || observation.HostID != hostID ||
+			observation.MappingStatus != "explicit_mapping" || observation.MappingVersion != metadata.MappingVersion ||
+			observation.Service != metadata.Service || !validContainerEvidenceID(observation.EntityID) ||
+			observation.Stale == nil || *observation.Stale || observation.ClockSkew || observation.State != "observed" {
+			continue
+		}
+		measurement := observation.Measurement
+		if measurement.Stale || measurement.Partial || measurement.Empty || len(measurement.Samples) < 2 {
+			continue
+		}
+		samples := append([]prometheusconnector.Sample(nil), measurement.Samples...)
+		valid := true
+		for _, sample := range samples {
+			if sample.Timestamp.IsZero() || sample.Timestamp.Before(item.ObservedStart) || sample.Timestamp.After(item.ObservedEnd) ||
+				math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) || sample.Value <= 0 || sample.Value >= float64(math.MaxInt64) {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			continue
+		}
+		sort.SliceStable(samples, func(left, right int) bool { return samples[left].Timestamp.Before(samples[right].Timestamp) })
+		for index := 1; index < len(samples); index++ {
+			previous, current := samples[index-1], samples[index]
+			if !current.Timestamp.After(previous.Timestamp) {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			continue
+		}
+		for index := 1; index < len(samples); index++ {
+			previous, current := samples[index-1], samples[index]
+			if current.Value < previous.Value {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			continue
+		}
+		for index := 1; index < len(samples); index++ {
+			previous, current := samples[index-1], samples[index]
+			if current.Value == previous.Value {
+				continue
+			}
+			startedAt := time.Unix(int64(current.Value), 0).UTC()
+			if !startedAt.After(previous.Timestamp) || startedAt.After(current.Timestamp) {
+				continue
+			}
+			changes = append(changes, containerStartChange{
+				scope: containerRestartScope{hostID: hostID, service: metadata.Service, environment: metadata.Environment,
+					mappingVersion: metadata.MappingVersion, containerID: observation.EntityID},
+				at: startedAt, observedStart: item.ObservedStart, observedEnd: item.ObservedEnd,
+				evidenceID: item.ID, complete: item.Completeness == "COMPLETE",
+			})
+		}
+	}
+	return changes, nil
+}
+
+func findContainerRestartEvents(item Evidence, metadata queryMetadata, hostID string) ([]containerRestartEvent, error) {
+	if metadata.Runtime != "docker-compose" || metadata.HostID != hostID || metadata.MappingVersion < 1 || metadata.UnderlyingSource != "LOKI" {
+		return nil, nil
+	}
+	var summary runtimeSummary
+	if err := json.Unmarshal(item.ValueSummary, &summary); err != nil {
+		return nil, fmt.Errorf("%w: decode container lifecycle Evidence", ErrInvalidInput)
+	}
+	events := make([]containerRestartEvent, 0)
+	for _, event := range summary.Events {
+		if event.Timestamp.IsZero() || event.Timestamp.Before(item.ObservedStart) || event.Timestamp.After(item.ObservedEnd) ||
+			event.OutsideTimeWindow || event.ContainerID == "" || event.MappingVersion != metadata.MappingVersion ||
+			event.Classification != "unverified_log_match" || event.Line.Trust != "untrusted_data" || event.Line.Source != "loki" ||
+			!strings.Contains(strings.ToLower(event.Line.Content), "restart") || event.SourceReference == "" {
+			continue
+		}
+		events = append(events, containerRestartEvent{
+			scope: containerRestartScope{hostID: hostID, service: metadata.Service, environment: metadata.Environment,
+				mappingVersion: metadata.MappingVersion, containerID: event.ContainerID},
+			at: event.Timestamp.UTC(), observedStart: item.ObservedStart, observedEnd: item.ObservedEnd, evidenceID: item.ID,
+		})
+	}
+	return events, nil
 }
 
 func hasHostResourceTrend(raw json.RawMessage, hostID string, evidenceStart, evidenceEnd, windowStart, windowEnd time.Time, templateID string) (bool, error) {

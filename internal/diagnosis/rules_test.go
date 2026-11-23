@@ -497,7 +497,7 @@ func TestAnalyzeHostResourcePressureSignal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.RuleSetVersion != "v0.4.0" || result.Status != StatusCandidatesFound || len(result.Candidates) != 1 {
+	if result.RuleSetVersion != RuleSetVersion || result.Status != StatusCandidatesFound || len(result.Candidates) != 1 {
 		t.Fatalf("analysis = %+v", result)
 	}
 	candidate := result.Candidates[0]
@@ -765,4 +765,137 @@ func contains(values []string, expected string) bool {
 		}
 	}
 	return false
+}
+
+func TestAnalyzeContainerRestartRequiresMappedMetricAndLifecycleEvidence(t *testing.T) {
+	start := time.Date(2026, 11, 23, 3, 0, 0, 0, time.UTC)
+	containerID := "0123456789abcdef"
+	hostID := ruleTestHostID
+	service := "checkout-api"
+	metricEvidenceID := "88888888-8888-4888-8888-888888888888"
+	lifecycleEvidenceID := "99999999-9999-4999-8999-999999999999"
+
+	makeEvidence := func(metricSamples [][2]any, eventContainer string, eventAt time.Time, mappingStatus string) []Evidence {
+		t.Helper()
+		observations := make([]map[string]any, 0, len(metricSamples))
+		for _, sample := range metricSamples {
+			observations = append(observations, map[string]any{
+				"timestamp": sample[0], "value": sample[1],
+			})
+		}
+		metricSummary, err := json.Marshal(map[string]any{
+			"measurements": []any{map[string]any{
+				"entity_type": "CONTAINER", "entity_id": containerID, "host_id": hostID,
+				"service":        service,
+				"mapping_status": mappingStatus, "mapping_version": 1,
+				"last_observed_at": start.Add(3 * time.Minute),
+				"state":            "observed", "stale": false, "clock_skew": false,
+				"measurement": map[string]any{
+					"samples": observations, "source_reference": "https://prometheus.example.test/query",
+				},
+			}}, "events": []any{}, "gaps": []string{}, "partial": false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lifecycleSummary, err := json.Marshal(map[string]any{
+			"measurements": []any{},
+			"events": []any{map[string]any{
+				"timestamp": eventAt, "container_id": eventContainer, "mapping_version": 1,
+				"classification": "unverified_log_match", "outside_time_window": false,
+				"source_reference": "https://loki.example.test/query",
+				"line":             map[string]any{"trust": "untrusted_data", "source": "loki", "content": "container restarted"},
+			}}, "gaps": []string{"container_lifecycle_events_unverified"}, "partial": true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		queryParameters := func(template string) json.RawMessage {
+			underlyingSource := "PROMETHEUS"
+			if template == "loki.container.restarts.v1" {
+				underlyingSource = "LOKI"
+			}
+			value, marshalErr := json.Marshal(map[string]any{
+				"template_id": template, "template_version": 1, "runtime": "docker-compose",
+				"service": service, "environment": "prod", "host_id": hostID,
+				"mapping_version": 1, "underlying_source": underlyingSource,
+			})
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			return value
+		}
+		return []Evidence{
+			{ID: metricEvidenceID, InvestigationID: ruleTestInvestigationID, SourceType: "RUNTIME", EntityType: "HOST", EntityID: stringPointer(hostID),
+				ObservedStart: start, ObservedEnd: start.Add(2 * time.Hour), QueryParameters: queryParameters("prometheus.runtime.container.start_time.v1"),
+				ValueSummary: metricSummary, Completeness: "COMPLETE", IndependenceGroup: "prometheus:prometheus.runtime.container.start_time.v1:v1"},
+			{ID: lifecycleEvidenceID, InvestigationID: ruleTestInvestigationID, SourceType: "RUNTIME", EntityType: "HOST", EntityID: stringPointer(hostID),
+				ObservedStart: start, ObservedEnd: start.Add(2 * time.Hour), QueryParameters: queryParameters("loki.container.restarts.v1"),
+				ValueSummary: lifecycleSummary, Completeness: "PARTIAL", IndependenceGroup: "loki:loki.container.restarts.v1:v1"},
+		}
+	}
+	oldStart := start.Add(-time.Hour).Unix()
+	newStart := start.Add(2 * time.Minute).Unix()
+	samples := [][2]any{
+		{start.Add(time.Minute), float64(oldStart)},
+		{start.Add(3 * time.Minute), float64(newStart)},
+	}
+
+	t.Run("corroborated signal", func(t *testing.T) {
+		result, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID,
+			Evidence: makeEvidence(samples, containerID, start.Add(2*time.Minute+30*time.Second), "explicit_mapping")})
+		if err != nil {
+			t.Fatalf("Analyze: %v", err)
+		}
+		if result.Status != StatusCandidatesFound || len(result.Candidates) != 1 {
+			t.Fatalf("result = %+v", result)
+		}
+		candidate := result.Candidates[0]
+		if candidate.RuleID != RuleContainerRestartSignal || candidate.FaultType != "CONTAINER_RESTART_SIGNAL" ||
+			candidate.EntityType != "CONTAINER" || candidate.EntityID != containerID || candidate.Confidence != ConfidenceLow {
+			t.Fatalf("candidate = %+v", candidate)
+		}
+		if !contains(candidate.SupportEvidenceIDs, metricEvidenceID) || !contains(candidate.SupportEvidenceIDs, lifecycleEvidenceID) ||
+			!contains(candidate.MissingRequirements, "restart_causality_unproven") || !contains(candidate.MissingRequirements, "lifecycle_log_unverified") {
+			t.Fatalf("candidate evidence or uncertainty = %+v", candidate)
+		}
+	})
+
+	for _, test := range []struct {
+		name           string
+		samples        [][2]any
+		eventContainer string
+		mapping        string
+		eventAt        time.Time
+		lifecycleStart time.Time
+	}{
+		{name: "unchanged start time", samples: [][2]any{{start.Add(time.Minute), float64(oldStart)}, {start.Add(3 * time.Minute), float64(oldStart)}}, eventContainer: containerID, mapping: "explicit_mapping"},
+		{name: "unmapped container", samples: samples, eventContainer: containerID, mapping: "raw_cgroup_only"},
+		{name: "different container event", samples: samples, eventContainer: "fedcba9876543210", mapping: "explicit_mapping"},
+		{name: "outside correlation window", samples: samples, eventContainer: containerID, mapping: "explicit_mapping", eventAt: start.Add(12 * time.Minute)},
+		{name: "evaluation near log but reported start too early", samples: [][2]any{{start.Add(time.Minute), float64(oldStart)}, {start.Add(15 * time.Minute), float64(newStart)}}, eventContainer: containerID, mapping: "explicit_mapping", eventAt: start.Add(15 * time.Minute)},
+		{name: "reported start predates common window", samples: samples, eventContainer: containerID, mapping: "explicit_mapping", eventAt: start.Add(4 * time.Minute), lifecycleStart: start.Add(3 * time.Minute)},
+		{name: "disjoint evidence windows", samples: samples, eventContainer: containerID, mapping: "explicit_mapping", eventAt: start.Add(4 * time.Minute), lifecycleStart: start.Add(4 * time.Minute)},
+		{name: "contradictory start-time regression", samples: append(append([][2]any{}, samples...), [2]any{start.Add(4 * time.Minute), float64(oldStart)}), eventContainer: containerID, mapping: "explicit_mapping"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.eventAt.IsZero() {
+				test.eventAt = start.Add(2*time.Minute + 30*time.Second)
+			}
+			items := makeEvidence(test.samples, test.eventContainer, test.eventAt, test.mapping)
+			if !test.lifecycleStart.IsZero() {
+				items[1].ObservedStart = test.lifecycleStart
+			}
+			if test.name == "disjoint evidence windows" {
+				items[0].ObservedEnd = start.Add(3 * time.Minute)
+			}
+			result, err := Analyze(context.Background(), AnalysisInput{InvestigationID: ruleTestInvestigationID, Evidence: items})
+			if err != nil {
+				t.Fatalf("Analyze: %v", err)
+			}
+			if len(result.Candidates) != 0 {
+				t.Fatalf("unverified restart produced candidate: %+v", result.Candidates)
+			}
+		})
+	}
 }

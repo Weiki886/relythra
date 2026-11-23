@@ -230,6 +230,26 @@ describe("investigation workbench", () => {
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
   });
+  it("renders container identity for the low-confidence restart signal", async () => {
+    mockAPI({
+      [`/api/v1/investigations/${investigationID}/diagnosis`]: async () => response({
+        ...diagnosis,
+        candidates: [{
+          ...diagnosis.candidates[0],
+          entity_type: "CONTAINER",
+          entity_id: "system.slice/docker-checkout-api.scope",
+          rule_id: "container-restart-signal.v1",
+          fault_type: "CONTAINER_RESTART_SIGNAL",
+          confidence: "LOW",
+        }],
+      }),
+    });
+    render(<App />);
+    openInvestigation();
+    expect(await screen.findByText("container-restart-signal.v1")).toBeInTheDocument();
+    expect(screen.getByText("CONTAINER · system.slice/docker-checkout-api.scope")).toBeInTheDocument();
+    expect(screen.getByText("LOW · 定性等级")).toBeInTheDocument();
+  });
   it("shows a bounded Prometheus trend for the selected Evidence", async () => {
     const metricEvidence = {
       ...evidence,
