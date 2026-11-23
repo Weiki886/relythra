@@ -77,6 +77,34 @@ describe("read-only API contracts", () => {
   ])("rejects malformed diagnosis instead of inferring success", (input) => {
     expect(() => parseDiagnosis(input)).toThrow();
   });
+  it("decodes known legacy candidates without entity_type and rejects unknown entities", () => {
+    const legacy = { ...diagnosis.candidates[0] };
+    delete (legacy as Partial<typeof legacy> & { entity_type?: string }).entity_type;
+    expect(parseDiagnosis({ ...diagnosis, candidates: [legacy] }).candidates[0].entity_type).toBe("SERVICE");
+    const hostCandidate = { ...legacy, rule_id: "host-resource-pressure-signal.v1" };
+    expect(parseDiagnosis({ ...diagnosis, candidates: [hostCandidate] }).candidates[0].entity_type).toBe("HOST");
+    expect(() => parseDiagnosis({ ...diagnosis, candidates: [{ ...legacy, rule_id: "unknown.v1" }] })).toThrow("Invalid API response");
+    expect(() => parseDiagnosis({ ...diagnosis, candidates: [{ ...legacy, entity_type: "INVALID" }] })).toThrow("Invalid API response");
+  });
+  it("accepts bounded container restart candidate identities and rejects invalid entities", () => {
+    const candidate = diagnosis.candidates[0];
+    expect(parseDiagnosis({
+      ...diagnosis,
+      candidates: [{
+        ...candidate,
+        entity_type: "CONTAINER",
+        entity_id: "system.slice/docker-abc.scope",
+      }],
+    }).candidates[0].entity_id).toBe("system.slice/docker-abc.scope");
+    expect(() => parseDiagnosis({
+      ...diagnosis,
+      candidates: [{ ...candidate, entity_type: "CONTAINER", entity_id: "bad\nidentity" }],
+    })).toThrow("Invalid API response");
+    expect(() => parseDiagnosis({
+      ...diagnosis,
+      candidates: [{ ...candidate, entity_type: "SERVICE", entity_id: "container-id" }],
+    })).toThrow("Invalid API response");
+  });
   it("rejects malformed timeline and Evidence", () => {
     expect(() => parseTimeline({ ...timeline, has_more: "false" })).toThrow();
     expect(() => parseTimeline({ ...timeline, offset: -1 })).toThrow();

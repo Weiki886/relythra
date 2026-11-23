@@ -60,11 +60,12 @@ export const diagnosis = {
   evidence_total: 2,
   evidence_limit: 100,
   evidence_truncated: false,
-  rule_set_version: "v0.4.0",
+  rule_set_version: "v0.5.0",
   status: "CANDIDATES_FOUND",
   missing_requirements: null,
   candidates: [
     {
+      entity_type: "SERVICE",
       rule_id: "slow-query-latency-correlation.v1",
       fault_type: "DATABASE_QUERY_LATENCY",
       entity_id: evidence.entity_id,
