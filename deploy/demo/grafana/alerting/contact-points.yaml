@@ -1,0 +1,14 @@
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: relythra
+    receivers:
+      - uid: relythra-webhook
+        type: webhook
+        settings:
+          url: http://api:8080/api/v1/alerts/grafana
+          hmacConfig:
+            # Read from the independent Secret file by the Grafana bootstrap.
+            secret: $DEMO_GRAFANA_WEBHOOK_SECRET
+            header: X-Relythra-Signature
+            timestampHeader: X-Relythra-Timestamp
