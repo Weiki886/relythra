@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from demo_artifacts import MAX_CAPTURE_BYTES, capture_compose, collect, collect_http, compose_command, redact, remove_partial_secret, safe_compose_output, write_capture
+from demo_artifacts import MAX_CAPTURE_BYTES, capture_compose, collect, collect_http, compose_command, read_secrets, redact, remove_partial_secret, safe_compose_output, write_capture
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -29,6 +29,14 @@ class FakeResponse:
 
 
 class DemoArtifactTests(unittest.TestCase):
+    def test_grafana_webhook_secret_is_redacted_from_failure_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key = "grafana-hmac-canary-value"
+            (Path(directory) / "grafana_webhook_secret").write_text(key, encoding="utf-8")
+            known_secrets = read_secrets(directory)
+            self.assertIn(key, known_secrets)
+            self.assertNotIn(key, redact("webhook=" + key, known_secrets))
+
     def test_redact_removes_known_and_structured_credentials(self):
         value = 'Authorization: Bearer abc123 password="hunter2"'
 

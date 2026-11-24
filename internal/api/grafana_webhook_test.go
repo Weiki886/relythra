@@ -1,7 +1,11 @@
 package api
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -83,7 +87,7 @@ func TestGrafanaWebhookRequiresValidSignatureAndRejectsReplay(t *testing.T) {
 	}, discardLogger())
 	body := `{"receiver":"relythra","status":"firing","alerts":[{"status":"firing","labels":{"project":"store","service":"checkout-api","env":"prod","alertname":"HighLatency"},"annotations":{"summary":"high"},"startsAt":"2026-11-05T20:00:00.123+08:00"}]}`
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	signature := SignDeploymentRequest([]byte("grafana-secret"), timestamp, []byte(body))
+	signature := signGrafanaNativeRequest([]byte("grafana-secret"), timestamp, []byte(body))
 	request := func(sig string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/alerts/grafana", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -219,6 +223,53 @@ func TestParseGrafanaWebhookRejectsMalformedOrUnboundedInput(t *testing.T) {
 			t.Parallel()
 			if _, err := ParseGrafanaWebhook([]byte(testCase.body)); err == nil {
 				t.Fatal("ParseGrafanaWebhook() error = nil, want validation error")
+			}
+		})
+	}
+}
+
+func signGrafanaNativeRequest(secret []byte, timestamp string, body []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = fmt.Fprintf(mac, "%s:", timestamp)
+	_, _ = mac.Write(body)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func TestParseGrafanaNativeEnvelopeWithLoopbackSource(t *testing.T) {
+	body := `{"receiver":"relythra","status":"firing","title":"Target down","message":"Inspect target","state":"alerting","appVersion":"13.3.0","alerts":[{"status":"firing","labels":{"project":"demo","service":"inventory","env":"demo","alertname":"TargetDown"},"ruleUID":"demo-target-down","orgId":1,"startsAt":"2026-11-24T00:00:00Z","generatorURL":"http://127.0.0.1:13001/alerting/grafana/demo-target-down/view"}]}`
+	parsed, err := ParseGrafanaWebhook([]byte(body))
+	if err != nil {
+		t.Fatalf("native Grafana envelope: %v", err)
+	}
+	if parsed.Alerts[0].GeneratorURL != "http://127.0.0.1:13001/alerting/grafana/demo-target-down/view" {
+		t.Fatal("source link lost")
+	}
+	if _, err := ParseGrafanaWebhook([]byte(strings.ReplaceAll(body, "http://127.0.0.1:13001/alerting/grafana/demo-target-down/view", "http://[::1]:13001/alerting/grafana/demo-target-down/view"))); err != nil {
+		t.Fatalf("IPv6 loopback source rejected: %v", err)
+	}
+	if _, err := ParseGrafanaWebhook([]byte(strings.ReplaceAll(body, `"ruleUID":"demo-target-down"`, `"ruleUID":"`+strings.Repeat("a", 129)+`"`))); err == nil {
+		t.Fatal("oversized ruleUID accepted")
+	}
+	for _, source := range []string{"http://example.com/alert", "http://127.0.0.1.example.com/alert", "http://user:password@127.0.0.1/alert", "javascript:alert(1)"} {
+		t.Run(source, func(t *testing.T) {
+			if _, err := ParseGrafanaWebhook([]byte(strings.ReplaceAll(body, "http://127.0.0.1:13001/alerting/grafana/demo-target-down/view", source))); err == nil {
+				t.Fatal("unsafe source accepted")
+			}
+		})
+	}
+	for field, limit := range map[string]int{"title": 4096, "message": 4096, "state": 32, "appVersion": 128} {
+		t.Run("oversized "+field, func(t *testing.T) {
+			var envelope map[string]any
+			if err := json.Unmarshal([]byte(body), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			envelope[field] = strings.Repeat("a", limit+1)
+			encoded, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ParseGrafanaWebhook(encoded); err == nil {
+				t.Fatal("oversized envelope field accepted")
 			}
 		})
 	}

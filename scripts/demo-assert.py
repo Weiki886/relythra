@@ -110,15 +110,41 @@ def healthy():
                 assert json.loads(line)["msg"] == "request completed"
         assert seen == {"orders", "inventory"}, seen
     eventually(logs)
-    status, raw = http(23001, "/api/dashboards/uid/relythra-demo")
-    assert status == 200 and len(json.loads(raw)["dashboard"]["panels"]) == 6, "Grafana dashboard"
-    status, raw = http(23001, "/api/datasources")
-    assert status == 200 and len(json.loads(raw)) == 2, "Grafana datasources"
-    assert b"secureJsonData" not in raw and b"Bearer " not in raw, "Grafana exposed credentials"
-    status, raw = http(23001, "/api/v1/provisioning/alert-rules", admin=True)
-    assert status == 200 and any(rule["uid"] == "demo-target-down" for rule in json.loads(raw)), "Grafana alert provisioning"
+    def grafana_provisioned():
+        status, raw = http(23001, "/api/dashboards/uid/relythra-demo")
+        assert status == 200 and len(json.loads(raw)["dashboard"]["panels"]) == 6, "Grafana dashboard"
+        status, raw = http(23001, "/api/datasources")
+        assert status == 200 and len(json.loads(raw)) == 2, "Grafana datasources"
+        assert b"secureJsonData" not in raw and b"Bearer " not in raw, "Grafana exposed credentials"
+        status, raw = http(23001, "/api/v1/provisioning/alert-rules", admin=True)
+        assert status == 200 and any(rule["uid"] == "demo-target-down" for rule in json.loads(raw)), "Grafana alert provisioning"
+    eventually(grafana_provisioned)
     assert http(23001, "/api/dashboards/db", method="POST")[0] in (401, 403), "Viewer can write dashboards"
     print("Real telemetry verified: six healthy scrape targets, business/node/cgroup/worker samples, labeled JSON logs and Grafana dashboard")
+
+
+def grafana_delivery(investigation_id, expected_status):
+    def delivered():
+        status, raw = http(28080, f"/api/v1/investigations/{investigation_id}")
+        assert status == 200, ("Investigation read", status)
+        context = json.loads(raw)["data"]
+        assert context["project"]["slug"] == "relythra-demo", "Project mapping"
+        assert context["service"]["slug"] == "inventory", "Service mapping"
+        assert context["environment"] == "demo", "Environment mapping"
+        assert context["alert"]["status"] == expected_status, ("Alert transition", context["alert"]["status"])
+        alert_id = context["alert"]["id"]
+        status, raw = http(28080, f"/api/v1/investigations/{investigation_id}/timeline")
+        assert status == 200, ("Evidence timeline read", status)
+        observations = [item for item in json.loads(raw)["data"]["items"] if item["source_type"] == "GRAFANA" and item["value_summary"]["alert_id"] == alert_id]
+        transitions = {item["value_summary"]["status"] for item in observations}
+        required = {"FIRING", expected_status}
+        assert required <= transitions, ("Missing Grafana evidence transition", transitions)
+        for item in observations:
+            assert item["raw_reference"].startswith("http://127.0.0.1:23001/alerting/"), "Grafana source link"
+            status, raw = http(28080, f"/api/v1/evidence/{item['id']}")
+            assert status == 200 and json.loads(raw)["data"]["id"] == item["id"], "Evidence deep link"
+    eventually(delivered, timeout=120)
+    print(f"Grafana signed {expected_status} delivery and Evidence verified for Investigation {investigation_id}")
 
 
 def prometheus_scalar(query):
@@ -211,6 +237,8 @@ if __name__ == "__main__":
         print("Demo database loss: orders not ready, still live; control plane healthy")
     elif mode == "recovered":
         eventually(recovered)
+    elif mode == "grafana-delivery":
+        grafana_delivery(sys.argv[2], sys.argv[3])
     elif mode == "slow-sql-fault":
         slow_sql_fault()
     elif mode == "slow-sql-recovered":

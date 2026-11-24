@@ -31,10 +31,12 @@ services:
     environment:
       RELYTHRA_DATASOURCE_ALLOWED_HOSTS: observability-gateway,grafana
       RELYTHRA_DATASOURCE_ALLOWED_PORTS: 9090,3100,3000
+      RELYTHRA_GRAFANA_WEBHOOK_SECRET_REF: file:/run/secrets/grafana_webhook_secret
     secrets:
       - postgres_password
       - management_token
       - observability_token
+      - grafana_webhook_secret
   worker:
     <<: *limits
     networks: [control, diagnosis, telemetry]
@@ -189,8 +191,9 @@ services:
       GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
       GF_NEWS_NEWS_FEED_ENABLED: "false"
       GF_PLUGINS_PREINSTALL_DISABLED: "true"
-      GF_ALERTING_ENABLED: "false"
-    secrets: [grafana_admin_password, observability_token]
+      GF_SERVER_ROOT_URL: http://127.0.0.1:${DEMO_GRAFANA_PORT:-13001}
+      GF_UNIFIED_ALERTING_ENABLED: "true"
+    secrets: [grafana_admin_password, observability_token, grafana_webhook_secret]
     volumes:
       - grafana-data:/var/lib/grafana
       - ../demo/grafana-entrypoint.sh:/etc/grafana/demo-entrypoint.sh:ro
@@ -258,3 +261,5 @@ secrets:
     file: ${DEMO_OBSERVABILITY_TOKEN_FILE:?Set DEMO_OBSERVABILITY_TOKEN_FILE}
   grafana_admin_password:
     file: ${DEMO_GRAFANA_PASSWORD_FILE:?Set DEMO_GRAFANA_PASSWORD_FILE}
+  grafana_webhook_secret:
+    file: ${DEMO_GRAFANA_WEBHOOK_SECRET_FILE:?Set DEMO_GRAFANA_WEBHOOK_SECRET_FILE}

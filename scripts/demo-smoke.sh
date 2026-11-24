@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/relythra-demo-smoke.XXXXXX")"
 chmod 700 "$temp_dir"
 project="relythra-demo-smoke-$$"
-for name in postgres_password management_token demo_owner_password demo_reader_password observability_token grafana_admin_password; do
+for name in postgres_password management_token demo_owner_password demo_reader_password observability_token grafana_admin_password grafana_webhook_secret; do
   (umask 077; od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$temp_dir/$name")
 done
 export RELYTHRA_POSTGRES_PASSWORD_FILE="$temp_dir/postgres_password"
@@ -15,6 +15,7 @@ export DEMO_OWNER_PASSWORD_FILE="$temp_dir/demo_owner_password"
 export DEMO_READER_PASSWORD_FILE="$temp_dir/demo_reader_password"
 export DEMO_OBSERVABILITY_TOKEN_FILE="$temp_dir/observability_token"
 export DEMO_GRAFANA_PASSWORD_FILE="$temp_dir/grafana_admin_password"
+export DEMO_GRAFANA_WEBHOOK_SECRET_FILE="$temp_dir/grafana_webhook_secret"
 export RELYTHRA_API_PORT=28080 RELYTHRA_WORKER_PORT=28081 RELYTHRA_WEB_PORT=23000 RELYTHRA_POSTGRES_PORT=25432
 export DEMO_ORDERS_PORT=28090 DEMO_PROMETHEUS_PORT=29090 DEMO_LOKI_PORT=23100 DEMO_GRAFANA_PORT=23001
 export DEMO_ENABLE_FAULTS=false DEMO_ORDERS_RELEASE=baseline DEMO_INVENTORY_RELEASE=baseline
@@ -49,12 +50,38 @@ stage="render and verify Compose configuration"
 python3 scripts/demo-assert.py config "$temp_dir/compose.json"
 stage="build and start demo services"
 "${COMPOSE[@]}" up --build --wait --wait-timeout 240
+stage="seed isolated Grafana webhook project and service"
+"${COMPOSE[@]}" exec -T postgres psql -U relythra -d relythra -v ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO projects (slug, name) VALUES ('relythra-demo', 'Relythra isolated demo')
+ON CONFLICT (slug) DO NOTHING;
+INSERT INTO services (project_id, slug, name)
+SELECT id, 'inventory', 'Inventory demo service' FROM projects WHERE slug = 'relythra-demo'
+ON CONFLICT (project_id, slug) DO NOTHING;
+INSERT INTO services (project_id, slug, name)
+SELECT id, 'orders', 'Orders demo service' FROM projects WHERE slug = 'relythra-demo'
+ON CONFLICT (project_id, slug) DO NOTHING;
+SQL
 stage="baseline telemetry assertions"
+python3 scripts/demo-assert.py healthy
+stage="Grafana HMAC webhook delivery assertions"
+webhook_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+"${COMPOSE[@]}" stop inventory
+investigation_id=""
+for attempt in $(seq 1 60); do
+  investigation_id="$("${COMPOSE[@]}" exec -T postgres psql -U relythra -d relythra -Atc "SELECT i.id FROM alert_deliveries d JOIN alerts a ON a.id=d.alert_id JOIN projects p ON p.id=a.project_id JOIN services s ON s.id=a.service_id JOIN incidents n ON n.alert_id=a.id JOIN investigations i ON i.incident_id=n.id WHERE p.slug='relythra-demo' AND s.slug='inventory' AND d.delivery_status='FIRING' AND d.mapping_status='MATCHED' AND d.received_at >= '$webhook_started_at'::timestamptz ORDER BY d.received_at LIMIT 1")"
+  if [ -n "$investigation_id" ]; then break; fi
+  sleep 2
+done
+test -n "$investigation_id" || { printf 'Grafana alert did not reach Relythra via signed webhook.\n' >&2; exit 1; }
+python3 scripts/demo-assert.py grafana-delivery "$investigation_id" FIRING
+"${COMPOSE[@]}" start --wait inventory
+stage="Grafana resolved webhook and evidence assertions"
+python3 scripts/demo-assert.py grafana-delivery "$investigation_id" RESOLVED
 python3 scripts/demo-assert.py healthy
 stage="deploy slow SQL fault fixture"
 DEMO_ENABLE_FAULTS=true \
   DEMO_INVENTORY_RELEASE=slow-sql-fault \
-  "${COMPOSE[@]}" up --build --force-recreate --no-deps --wait --wait-timeout 120 inventory
+  "${COMPOSE[@]}" up --force-recreate --no-build --no-deps --wait --wait-timeout 120 inventory
 stage="slow SQL fault telemetry assertions"
 python3 scripts/demo-assert.py slow-sql-fault
 stage="restore baseline inventory fixture"

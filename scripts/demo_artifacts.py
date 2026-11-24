@@ -99,7 +99,7 @@ def collect_http(url, output, token, secrets):
 def read_secrets(directory):
     values = []
     if directory and Path(directory).is_dir():
-        for name in ("postgres_password", "management_token", "demo_owner_password", "demo_reader_password", "observability_token", "grafana_admin_password"):
+        for name in ("postgres_password", "management_token", "demo_owner_password", "demo_reader_password", "observability_token", "grafana_admin_password", "grafana_webhook_secret"):
             path = Path(directory) / name
             if path.is_file():
                 try:
