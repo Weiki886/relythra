@@ -27,11 +27,19 @@ Relythra 是一个面向发布后异常排查的只读诊断系统：关联发�
 
 - Web：<http://127.0.0.1:5173>
 - API readiness：<http://127.0.0.1:8080/health/ready>
-- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/deployments/{id}`
+- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/investigations/{id}/diagnosis`、`/api/v1/deployments/{id}`
 
-`GET /api/v1/investigations/{id}/timeline` 返回该 Investigation 已持久化的 Evidence，支持 `source_type`、`entity_id`、`completeness`、`stance`、`limit` 和 `offset`。`stance=SUPPORTS` 或 `stance=CONTRADICTS` 筛选与该调查中任意假设存在对应立场关联的证据；多次关联仅返回一次，当前不支持指定假设筛选。每个时间线项的 `relations` 返回所有关联假设 ID 与立场，包括筛选条件相反的关系；无关系时为空数组。关联本身不代表根因已确定。完整度包括 `COMPLETE`、`PARTIAL`、`MISSING` 和 `EXPIRED`；Evidence 会分别保留 UTC 事件区间、来源原始时间/时区和采集时间，无法追溯的历史记录 `collected_at` 为空；新采集记录还保存经过脱敏的查询文本、参数快照与来源引用。默认 `limit=50`，最大 `100`，`offset` 最大 `10000`；按事件开始/结束时间及来源、实体、内容摘要和 ID 稳定排序，计数与当前页在同一只读数据库快照中读取。不存在的 Investigation 返回 `404`，存在但没有匹配证据时返回空 `items`。此端点不合成尚未持久化的查询失败或缺口。
+Web 首页提供基础只读调查工作台。输入已有 Investigation UUID，或打开 `/?investigation=<uuid>`，可查看固定规则候选、定性置信等级、证据缺口及 UTC 时间线；时间线支持来源/完整度筛选和每页 50 条分页。点击候选的支持/反证引用或时间线项目，查看 Evidence 的查询、参数、观测摘要、完整度和原始来源。只有不带 userinfo 的绝对 HTTP(S) 引用可点击，其他引用保留为文本。
 
-时间线支持 `source_type=GRAFANA`。后端提供 `PersistGrafanaAlertEvidence`，将数据库中与调查所属事件关联的规范告警保存为不可变、脱敏的证据快照；持续触发的告警以触发时间为点事件，恢复后追加结束时间已知的区间快照，同一告警的状态快照共享独立性分组。未映射、缺来源引用或恢复时间未知时标记为 `PARTIAL`。此入口尚未接入 Webhook/Worker 自动采集，接收告警不会自动产生这些快照。部署该能力前先执行迁移 `000009`；存在 `GRAFANA` 历史证据时，该迁移拒绝降级以保留数据，回滚应用可以保留扩展后的数据库约束。
+顶部调查摘要展示项目、服务、环境、调查生命周期和可选关联告警（状态、级别、摘要、UTC 时间及来源）。摘要、诊断和时间线各自读取、独立失败与重试，切换调查隐藏旧数据。`GET /api/v1/investigations/{id}` 不接受查询参数；通过一个数据库语句读取当前登记状态，字段只包含展示所需信息，不返回 labels、annotations、Webhook payload、SecretRef 或数据源配置。`mapping_status` 只描述调查/Incident/告警的实体关联：`MATCHED` 表示服务与环境一致，`NEEDS_MAPPING` 表示缺失，`CONFLICT` 表示记录间不一致或服务不属于项目（隐藏服务与环境，返回 `mapping_conflict`）。无告警时 `alert=null` 并标记 `alert_not_linked`，不伪造告警。实体映射不证明数据源就绪；告警恢复不代表调查已结束或根因已确认。摘要是当前状态，Evidence 仍是独立的历史观测快照。待映射 Grafana 告警按 ADR 0008 不会自动创建 Investigation，本摘要仅能读取已存在的调查，不能代替待映射告警管理入口。
+
+诊断、时间线与 Evidence 详情独立加载和重试，单次请求最多等待 15 秒；页面筛选不改变诊断输入。各区域是分别读取的快照，不能当作同一时刻的原子结果。空时间线或 `INCONCLUSIVE` 都不代表服务健康。当前按 ID 查询已有记录，不提供调查列表、部署候选独立视图或自动采集；已持久化的 Prometheus Evidence 可查看趋势。没有真实记录时不展示模拟结果。Vite 与 Compose 的 Web 入口转发 `/api/` 到 API，沿用本地/受信网络访问边界，不增加生产认证能力，也不需要在浏览器保存管理 Token。
+
+`GET /api/v1/investigations/{id}/timeline` 返回该 Investigation 已持久化的 Evidence，支持 `source_type`、`entity_id`、`container_id`、`completeness`、`stance`、`limit` 和 `offset`。`container_id` 按不透明 ID 精确匹配运行时 Evidence `value_summary.measurements` 中 `entity_type=CONTAINER` 的测量项，最多 256 字节；该过滤器不改变顶层 `entity_id` 的筛选语义。`stance=SUPPORTS` 或 `stance=CONTRADICTS` 筛选与该调查中任意假设存在对应立场关联的证据；多次关联仅返回一次，当前不支持指定假设筛选。每个时间线项的 `relations` 返回所有关联假设 ID 与立场，包括筛选条件相反的关系；无关系时为空数组。关联本身不代表根因已确定。完整度包括 `COMPLETE`、`PARTIAL`、`MISSING` 和 `EXPIRED`；Evidence 会分别保留 UTC 事件区间、来源原始时间/时区和采集时间，无法追溯的历史记录 `collected_at` 为空；新采集记录还保存经过脱敏的查询文本、参数快照与来源引用。默认 `limit=50`，最大 `100`，`offset` 最大 `10000`；按事件开始/结束时间及来源、实体、内容摘要和 ID 稳定排序，计数与当前页在同一只读数据库快照中读取。不存在的 Investigation 返回 `404`，存在但没有匹配证据时返回空 `items`。此端点不合成尚未持久化的查询失败或缺口。
+
+时间线支持 `source_type=GRAFANA`。后端提供 `PersistGrafanaAlertEvidence`，将数据库中与调查所属事件关联的规范告警保存为不可变、脱敏的证据快照；持续触发的告警以触发时间为点事件，恢复后追加结束时间已知的区间快照，同一告警的状态快照共享独立性分组。未映射、缺来源引用或恢复时间未知时标记为 `PARTIAL`。接收告警会保存 Grafana Alert/Incident Evidence 与部署候选快照；当前尚未自动调用 Prometheus、Loki、GitHub 或 Runtime 连接器。演示 Compose 已配置 Grafana 原生 HMAC Webhook，并在隔离 smoke 中验证真实告警送达；它不代表完整故障诊断链已接通。部署该能力前先执行迁移 `000009`；存在 `GRAFANA` 历史证据时，该迁移拒绝降级以保留数据，回滚应用可以保留扩展后的数据库约束。
+
+`GET /api/v1/investigations/{id}/diagnosis` 对已入库 Evidence 即时执行 v0 固定规则，当前规则集版本为 `v0.5.0`，返回规则集版本、候选实体类型与 ID、支持/反证 Evidence ID、缺口，以及 `evidence_total`、`evidence_limit=100`、`evidence_truncated`。接口不接受查询参数，不触发外部采集或写入假设/报告；一次读取同一数据库快照中的完整时间线，超过 100 条时返回 `INCONCLUSIVE`、空候选与 `complete_evidence_snapshot` 缺口，避免用截断子集下结论。当前规则包括同服务、重叠时间窗内的数据库耗时样本与慢查询模板日志关联，单个容器同一 Prometheus 序列中至少三个严格递增内存样本形成的增长信号，固定配置错误 Loki 模板在服务时间窗内命中日志形成的配置错误信号，同一宿主机重叠时间窗内 CPU 与 Load 严格递增且可用内存严格递减的资源压力信号，以及明确映射容器的原始启动时间样本显示 incarnation 更新（报告启动时刻晚于前一评估且不晚于当前评估）、同容器 Loki 生命周期日志在两份 Evidence 时间窗交集内且与报告启动时刻相差不超过五分钟时产生的低置信重启信号；该规则不依赖采集器无法唯一判定时留空的 `StartTime`/`InstanceID`。宿主机与容器规则只消费已持久化的固定 `RUNTIME` Evidence，不发起查询。重启候选标记为 `CONTAINER`、置信等级固定 `LOW`，并保留生命周期日志未经核验、独立重启佐证缺失和重启原因未明的缺口；不表示 Docker 已确认重启，也不说明影响、OOM 或发布因果。数据库候选不证明 SQL 或发布导致故障，也不判定耗时已超过异常阈值；内存候选不证明内存泄漏、OOM、重启或根因；配置错误候选不证明日志信号导致告警或服务故障；宿主机候选不证明机器故障、资源耗尽、OOM、应用受影响或发布因果。配置错误、内存、宿主机和容器重启候选固定为 `LOW`（定性等级，不是概率）；数据库 `COMPLETE` 配对为 `MEDIUM`，只有 `PARTIAL` 配对时为 `LOW`。`MISSING`、`EXPIRED` 不作为支持证据。没有足够证据时为 `INCONCLUSIVE`；不存在的调查返回 `404`，损坏的规则输入返回通用 `500`。该端点沿用现有只读 API 的本地/受信网络边界。
 
 - Worker metrics：<http://127.0.0.1:8081/metrics>
 
@@ -92,7 +100,7 @@ docker compose --file deploy/compose/compose.yaml up --build
 - Web：<http://localhost:3000>
 - API liveness：<http://localhost:8080/health/live>
 - API readiness：<http://localhost:8080/health/ready>
-- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/deployments/{id}`
+- API 只读领域端点：`/api/v1/reports/{id}`、`/api/v1/evidence/{id}`、`/api/v1/investigations/{id}`、`/api/v1/investigations/{id}/timeline`、`/api/v1/investigations/{id}/diagnosis`、`/api/v1/deployments/{id}`
 - API 数据源映射：<http://localhost:8080/api/v1/data-source-mappings>
 - Worker metrics：<http://localhost:8081/metrics>
 
@@ -116,7 +124,7 @@ docker compose --file deploy/compose/compose.yaml down --volumes
 ./scripts/demo.sh up
 ```
 
-访问 orders `http://127.0.0.1:18090/orders` 与 Grafana `http://127.0.0.1:13001/d/relythra-demo`。包含 orders → inventory → 独立业务 PostgreSQL、Prometheus、Loki、Alloy、node_exporter 和 cAdvisor；观测查询使用独立只读 Token。`make demo-smoke` 在专用项目验证真实指标/日志、权限、数据库故障隔离和重启恢复。完整端口、卷、资源限制、cgroup 身份缺口及安全清理见 [docs/demo.md](docs/demo.md)。
+访问 orders `http://127.0.0.1:18090/orders` 与 Grafana `http://127.0.0.1:13001/d/relythra-demo`。包含 orders → inventory → 独立业务 PostgreSQL、Prometheus、Loki、Alloy、node_exporter 和 cAdvisor；观测查询使用独立只读 Token。`make demo-smoke` 在专用项目验证 Grafana 签名目标不可用告警及恢复通知、Investigation 和 Grafana Evidence 读取，以及慢 SQL 故障/恢复期间的真实请求指标与日志、权限、数据库故障隔离和重启恢复。该 smoke 尚不验证 Grafana 告警到 Investigation/Evidence 的完整自动诊断链路。完整端口、卷、资源限制、cgroup 身份缺口及安全清理见 [docs/demo.md](docs/demo.md)。
 
 ## 数据库迁移
 
@@ -132,7 +140,7 @@ docker compose --file deploy/compose/compose.yaml run --rm migrate down
 
 `down` 会回滚一个版本，执行前应确认影响。领域迁移的 `down` 会删除领域表和其中的数据，只允许用于隔离的本地或测试环境。API 启动不会自动迁移。
 
-三个领域端点只读，并返回统一请求 ID 和错误包络。数据库为空或资源不存在时返回 `404`，路径 ID 非法时在查询数据库前返回 `400`。当前没有创建这些资源的公开写接口。
+上述领域读取端点返回统一请求 ID 和错误包络。数据库为空或资源不存在时返回 `404`，路径 ID 非法时在查询数据库前返回 `400`。资源接入仍使用专用部署与告警入口，读取不会创建资源或触发采集。
 
 ## 数据源映射管理 API
 
@@ -205,7 +213,9 @@ API 不接受原始 PromQL、LogQL、SQL、shell、任意 Header 或任意 HTTP 
 
 ## Grafana 告警接入
 
-配置专用 `RELYTHRA_GRAFANA_WEBHOOK_SECRET_REF` 后，Grafana 通用 Webhook contact point 向 `POST /api/v1/alerts/grafana` 发送 JSON，并附带 `X-Relythra-Timestamp`、`X-Relythra-Signature` 两个由发送端按 HMAC-SHA256 规则生成的 Header。签名覆盖 Unix 秒时间戳和原始 body，验证窗口为 ±5 分钟；重复签名、超大 body、非法 schema 均在业务写入前拒绝。Webhook 支持最多 100 条 alert，标签、annotation、`values` 数量与字段长度均有限制。告警时间统一按 UTC 比较，同时保留来源 RFC3339 时间文本和时区偏移。
+配置专用 `RELYTHRA_GRAFANA_WEBHOOK_SECRET_REF` 后，Grafana 通用 Webhook contact point 向 `POST /api/v1/alerts/grafana` 发送 JSON，并附带 `X-Relythra-Timestamp`、`X-Relythra-Signature` 两个由发送端按 HMAC-SHA256 规则生成的 Header。Grafana 原生签名使用 `timestamp:body` 的 HMAC-SHA256 十六进制值，兼容原有 `timestamp.body` 与 `sha256=` 前缀格式。必须启用时间戳 Header，验证窗口为 ±5 分钟；重复签名、超大 body、非法 schema 均在业务写入前拒绝。Webhook 支持最多 100 条 alert，标签、annotation、`values` 数量与字段长度均有限制。告警时间统一按 UTC 比较，同时保留来源 RFC3339 时间文本和时区偏移。
+
+默认 Grafana JSON 的 `title`、`message`、`state`、`appVersion` 和逐条 alert 的 `ruleUID` 元数据有长度上限，未知字段继续拒绝。告警来源链接要求 HTTPS，本地演示额外允许 `http://127.0.0.1` 和 `http://[::1]` 的字面回环地址，接收端仅保存来源引用。
 
 告警通过 `project`、`service`、`env` 标签精确匹配 Project slug、Service slug 和环境。缺少/不匹配 Service 或环境时会记录待映射 Alert/Incident，不猜测服务、不创建 Investigation，也不启动 Agent。缺少有效 Project slug 时返回 `422 needs_mapping`，不写入业务对象。缺失 fingerprint 时使用排序标签和告警开始时间派生版本化 SHA-256 指纹。
 

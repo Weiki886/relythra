@@ -126,6 +126,99 @@ func TestFromRuntimePreservesPrimaryObservations(t *testing.T) {
 	}
 }
 
+func TestFromRuntimeResultEmitsMissingEvidenceForFailedTemplate(t *testing.T) {
+	result, metadata := runtimeObservation()
+	result.Hosts[0].MemoryAvailable = runtimeconnector.Measurement{Samples: []prometheus.Sample{}, Empty: true, Stale: true}
+	result.Failures = []runtimeconnector.CollectionFailure{{
+		SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.memory_available.v1", TemplateVersion: 1,
+		ReasonCode: runtimeconnector.CollectionFailureTimeout,
+	}}
+	filter, _ := redact.NewFilter()
+	records, err := FromRuntimeResult(context.Background(), result, metadata, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != len(expectedRuntimeTemplates) {
+		t.Fatalf("record count = %d, want one record per template", len(records))
+	}
+	var failed Record
+	for _, record := range records {
+		var parameters struct {
+			TemplateID string `json:"template_id"`
+		}
+		if err := json.Unmarshal(record.QueryParameters, &parameters); err != nil {
+			t.Fatal(err)
+		}
+		if parameters.TemplateID == result.Failures[0].TemplateID {
+			failed = record
+			continue
+		}
+		if record.Completeness == CompletenessMissing {
+			t.Fatalf("unfailed template became missing: %+v", record)
+		}
+	}
+	if failed.ContentHash == "" || failed.SourceType != SourcePrometheus || failed.Completeness != CompletenessMissing ||
+		failed.EntityType != "HOST" || failed.EntityID == nil || *failed.EntityID != result.HostID || failed.InvestigationID != metadata.InvestigationID ||
+		failed.ObservedStart != result.Start || failed.ObservedEnd != result.End || failed.CollectedAt != metadata.CollectedAt {
+		t.Fatalf("failed template evidence = %+v", failed)
+	}
+	var summary map[string]any
+	if err := json.Unmarshal(failed.ValueSummary, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary["kind"] != "collection_gap" || summary["reason_code"] != string(CollectionFailureTimeout) {
+		t.Fatalf("gap summary = %s", failed.ValueSummary)
+	}
+	replayed, err := FromRuntimeResult(context.Background(), result, metadata, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range records {
+		if records[index].ContentHash != replayed[index].ContentHash {
+			t.Fatalf("replay changed evidence hash at index %d", index)
+		}
+	}
+}
+
+func TestFromRuntimeResultRejectsInvalidOrDuplicateCollectionFailures(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		failures []runtimeconnector.CollectionFailure
+	}{
+		{
+			name: "invalid template",
+			failures: []runtimeconnector.CollectionFailure{{
+				SourceType: "PROMETHEUS", TemplateID: "prometheus.anything.v1", TemplateVersion: 1,
+				ReasonCode: runtimeconnector.CollectionFailureTimeout,
+			}},
+		},
+		{
+			name: "unknown reason",
+			failures: []runtimeconnector.CollectionFailure{{
+				SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.cpu.v1", TemplateVersion: 1,
+				ReasonCode: runtimeconnector.CollectionFailureCode("raw secret value"),
+			}},
+		},
+		{
+			name: "duplicate template",
+			failures: []runtimeconnector.CollectionFailure{
+				{SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.cpu.v1", TemplateVersion: 1, ReasonCode: runtimeconnector.CollectionFailureTimeout},
+				{SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.cpu.v1", TemplateVersion: 1, ReasonCode: runtimeconnector.CollectionFailureTimeout},
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			result, metadata := runtimeObservation()
+			result.Failures = testCase.failures
+			filter, _ := redact.NewFilter()
+			records, err := FromRuntimeResult(context.Background(), result, metadata, filter)
+			if !errors.Is(err, ErrInvalidInput) || records != nil {
+				t.Fatalf("records=%t err=%v, want invalid input and no records", records != nil, err)
+			}
+		})
+	}
+}
+
 func TestFromRuntimePreservesContainerMappingVersion(t *testing.T) {
 	result, meta := runtimeObservation()
 	result.MappingVersion = 7
@@ -149,6 +242,236 @@ func TestFromRuntimePreservesContainerMappingVersion(t *testing.T) {
 			!strings.Contains(string(record.ValueSummary), `"mapping_version":7`) {
 			t.Fatalf("container mapping version missing from evidence: %s", record.ValueSummary)
 		}
+	}
+}
+
+func mappedRuntimePeerObservation() (runtimeconnector.Result, RuntimeEvidenceContext) {
+	result, meta := runtimeObservation()
+	result.MappingVersion = 7
+	result.Containers[0].MappingStatus = "explicit_mapping"
+	result.Containers[0].MappingVersion = 7
+	result.Containers[0].Service = result.Service
+	result.Containers[0].PeerContainerIDs = []string{"peer-z", "peer-a"}
+	peerA := result.Containers[0]
+	peerA.ID = "peer-a"
+	peerA.InstanceID = "peer-a-instance"
+	peerA.PeerContainerIDs = []string{"peer-z", result.Containers[0].ID}
+	peerZ := result.Containers[0]
+	peerZ.ID = "peer-z"
+	peerZ.InstanceID = "peer-z-instance"
+	peerZ.PeerContainerIDs = []string{peerA.ID, result.Containers[0].ID}
+	result.Containers = append(result.Containers, peerA, peerZ)
+	return result, meta
+}
+
+func TestFromRuntimePreservesRuntimeStateMetadata(t *testing.T) {
+	result, meta := runtimeObservation()
+	zone := time.FixedZone("runtime-source", 2*60*60)
+	hostObservedAt := result.End.Add(-time.Minute).In(zone)
+	containerObservedAt := result.End.Add(-30 * time.Second).In(zone)
+	started := result.Start.Add(-time.Hour).In(zone)
+	result.Hosts[0].LastObservedAt = &hostObservedAt
+	result.Hosts[0].ClockSkew = true
+	result.Containers[0].StartTime = &started
+	result.Containers[0].LastObservedAt = &containerObservedAt
+	result.Containers[0].State = "unknown"
+	result.Containers[0].Stale = true
+	result.Containers[0].ClockSkew = true
+	filter, _ := redact.NewFilter()
+	records, err := FromRuntimeResult(nil, result, meta, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, record := range records {
+		var summary struct {
+			Measurements []struct {
+				EntityType     string     `json:"entity_type"`
+				EntityID       string     `json:"entity_id"`
+				StartTime      *time.Time `json:"start_time"`
+				LastObservedAt *time.Time `json:"last_observed_at"`
+				State          string     `json:"state"`
+				Stale          *bool      `json:"stale"`
+				ClockSkew      bool       `json:"clock_skew"`
+			} `json:"measurements"`
+		}
+		if err := json.Unmarshal(record.ValueSummary, &summary); err != nil {
+			t.Fatal(err)
+		}
+		for _, measurement := range summary.Measurements {
+			switch measurement.EntityType {
+			case "HOST":
+				if i > 2 || measurement.LastObservedAt == nil || !measurement.LastObservedAt.Equal(hostObservedAt.UTC()) || !measurement.ClockSkew || measurement.Stale != nil {
+					t.Fatalf("host metadata not preserved for template %d: %+v", i, measurement)
+				}
+			case "CONTAINER":
+				if i < 3 || measurement.LastObservedAt == nil || !measurement.LastObservedAt.Equal(containerObservedAt.UTC()) ||
+					measurement.State != "unknown" ||
+					measurement.Stale == nil || !*measurement.Stale || !measurement.ClockSkew {
+					t.Fatalf("container metadata not preserved for template %d: %+v", i, measurement)
+				}
+				if (i == 6) != (measurement.StartTime != nil) || (measurement.StartTime != nil && !measurement.StartTime.Equal(started.UTC())) {
+					t.Fatalf("start time changed its evidence scope for template %d: %+v", i, measurement)
+				}
+			default:
+				t.Fatalf("unexpected entity type: %+v", measurement)
+			}
+		}
+	}
+	_, hostOffset := result.Hosts[0].LastObservedAt.Zone()
+	_, containerOffset := result.Containers[0].LastObservedAt.Zone()
+	_, startOffset := result.Containers[0].StartTime.Zone()
+	if hostOffset != 2*60*60 || containerOffset != 2*60*60 || startOffset != 2*60*60 {
+		t.Fatal("metadata canonicalization mutated connector result")
+	}
+}
+
+func TestFromRuntimePreservesFalseStaleState(t *testing.T) {
+	result, meta := runtimeObservation()
+	filter, _ := redact.NewFilter()
+	records, err := FromRuntimeResult(nil, result, meta, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records[3:7] {
+		var summary struct {
+			Measurements []struct {
+				State     string `json:"state"`
+				Stale     *bool  `json:"stale"`
+				ClockSkew bool   `json:"clock_skew"`
+			} `json:"measurements"`
+		}
+		if err := json.Unmarshal(record.ValueSummary, &summary); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(record.ValueSummary), `"stale":false`) || !strings.Contains(string(record.ValueSummary), `"clock_skew":false`) {
+			t.Fatalf("false state values were not serialized explicitly: %s", record.ValueSummary)
+		}
+		measurement := summary.Measurements[0]
+		if measurement.State != "observed" || measurement.Stale == nil || *measurement.Stale || measurement.ClockSkew {
+			t.Fatalf("false runtime state metadata was omitted or changed: %+v", measurement)
+		}
+	}
+}
+
+func TestFromRuntimeRejectsInvalidContainerStateAndObservationTime(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*runtimeconnector.Result)
+	}{
+		{name: "unknown value", mutate: func(r *runtimeconnector.Result) { r.Containers[0].State = "healthy" }},
+		{name: "stale without stale flag", mutate: func(r *runtimeconnector.Result) { r.Containers[0].State = "stale" }},
+		{name: "observed with clock skew", mutate: func(r *runtimeconnector.Result) { r.Containers[0].ClockSkew = true }},
+		{name: "host future observation without skew", mutate: func(r *runtimeconnector.Result) {
+			future := r.End.Add(time.Second)
+			r.Hosts[0].LastObservedAt = &future
+		}},
+		{name: "container future observation without skew", mutate: func(r *runtimeconnector.Result) {
+			future := r.End.Add(time.Second)
+			r.Containers[0].LastObservedAt = &future
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, meta := runtimeObservation()
+			tc.mutate(&result)
+			filter, _ := redact.NewFilter()
+			if records, err := FromRuntimeResult(nil, result, meta, filter); !errors.Is(err, ErrInvalidInput) || records != nil {
+				t.Fatalf("records=%t err=%v, want invalid input", records != nil, err)
+			}
+		})
+	}
+}
+
+func TestFromRuntimePreservesCanonicalMappedContainerPeers(t *testing.T) {
+	result, meta := mappedRuntimePeerObservation()
+	before, _ := json.Marshal(result)
+	filter, _ := redact.NewFilter()
+	records, err := FromRuntimeResult(nil, result, meta, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records[3:7] {
+		var summary struct {
+			Measurements []struct {
+				EntityID         string   `json:"entity_id"`
+				PeerContainerIDs []string `json:"peer_container_ids"`
+			} `json:"measurements"`
+		}
+		if err := json.Unmarshal(record.ValueSummary, &summary); err != nil {
+			t.Fatal(err)
+		}
+		if len(summary.Measurements) != 3 {
+			t.Fatalf("template %s measurements=%+v", record.QueryParameters, summary.Measurements)
+		}
+		for _, measurement := range summary.Measurements {
+			var want []string
+			switch measurement.EntityID {
+			case "opaque-cgroup":
+				want = []string{"peer-a", "peer-z"}
+			case "peer-a":
+				want = []string{"opaque-cgroup", "peer-z"}
+			case "peer-z":
+				want = []string{"opaque-cgroup", "peer-a"}
+			default:
+				t.Fatalf("unexpected entity: %+v", measurement)
+			}
+			if !reflect.DeepEqual(measurement.PeerContainerIDs, want) {
+				t.Fatalf("entity %s peers=%v want=%v", measurement.EntityID, measurement.PeerContainerIDs, want)
+			}
+		}
+	}
+	after, _ := json.Marshal(result)
+	if string(before) != string(after) {
+		t.Fatal("peer canonicalization mutated connector result")
+	}
+	shuffled := result
+	shuffled.Containers = []runtimeconnector.Container{result.Containers[2], result.Containers[0], result.Containers[1]}
+	replayed, err := FromRuntimeResult(nil, shuffled, meta, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range records {
+		if records[i].ContentHash != replayed[i].ContentHash {
+			t.Fatalf("container ordering changed evidence hash at record %d", i)
+		}
+	}
+}
+
+func TestFromRuntimeRejectsInvalidMappedContainerPeers(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*runtimeconnector.Result)
+	}{
+		{"raw cgroup", func(r *runtimeconnector.Result) { r.Containers[0].PeerContainerIDs = []string{"other"} }},
+		{"self reference", func(r *runtimeconnector.Result) { r.Containers[0].PeerContainerIDs = []string{r.Containers[0].ID} }},
+		{"unknown peer", func(r *runtimeconnector.Result) { r.Containers[0].PeerContainerIDs = []string{"unknown"} }},
+		{"duplicate peer", func(r *runtimeconnector.Result) { r.Containers[0].PeerContainerIDs = []string{"peer-a", "peer-a"} }},
+		{"ambiguous peer identity", func(r *runtimeconnector.Result) {
+			duplicate := r.Containers[1]
+			r.Containers = append(r.Containers, duplicate)
+		}},
+		{"asymmetric relation", func(r *runtimeconnector.Result) { r.Containers[1].PeerContainerIDs = []string{"peer-z"} }},
+		{"incomplete symmetric set", func(r *runtimeconnector.Result) {
+			r.Containers[0].PeerContainerIDs = []string{"peer-a"}
+			r.Containers[1].PeerContainerIDs = []string{r.Containers[0].ID}
+			r.Containers[2].PeerContainerIDs = nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, meta := mappedRuntimePeerObservation()
+			if tc.name == "raw cgroup" {
+				result.Containers = result.Containers[:1]
+				result.MappingVersion = 0
+				result.Containers[0].MappingStatus = "raw_cgroup_only"
+				result.Containers[0].MappingVersion = 0
+				result.Containers[0].Service = ""
+			}
+			tc.mutate(&result)
+			filter, _ := redact.NewFilter()
+			records, err := FromRuntimeResult(nil, result, meta, filter)
+			if !errors.Is(err, ErrInvalidInput) || records != nil {
+				t.Fatalf("unexpected records or validation error: records=%t err=%v", records != nil, err)
+			}
+		})
 	}
 }
 

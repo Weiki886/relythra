@@ -44,6 +44,10 @@ type GrafanaWebhook struct {
 	GroupKey          string                `json:"groupKey"`
 	TruncatedAlerts   int                   `json:"truncatedAlerts"`
 	OrgID             int                   `json:"orgId"`
+	AppVersion        string                `json:"appVersion"`
+	Title             string                `json:"title"`
+	Message           string                `json:"message"`
+	State             string                `json:"state"`
 }
 
 type GrafanaWebhookAlert struct {
@@ -59,6 +63,8 @@ type GrafanaWebhookAlert struct {
 	ValueString        string             `json:"valueString"`
 	Values             map[string]float64 `json:"values"`
 	Fingerprint        string             `json:"fingerprint"`
+	RuleUID            string             `json:"ruleUID"`
+	OrgID              int64              `json:"orgId"`
 	SourceTimezone     string             `json:"-"`
 	SourceTimeText     string             `json:"-"`
 	ProjectSlug        string             `json:"-"`
@@ -135,7 +141,8 @@ func ParseGrafanaWebhook(data []byte) (GrafanaWebhook, error) {
 		!validGrafanaStringMapAllowEmpty(payload.GroupLabels, maxGrafanaLabelLength) ||
 		!validGrafanaStringMapAllowEmpty(payload.CommonLabels, maxGrafanaLabelLength) ||
 		!validGrafanaStringMapAllowEmpty(payload.CommonAnnotations, maxGrafanaAnnotationLength) || len(payload.ExternalURL) > 2048 ||
-		len(payload.Receiver) > 256 || len(payload.GroupKey) > 512 || payload.TruncatedAlerts < 0 {
+		len(payload.Receiver) > 256 || len(payload.GroupKey) > 512 || payload.TruncatedAlerts < 0 ||
+		len(payload.Title) > maxGrafanaAnnotationLength || len(payload.Message) > maxGrafanaAnnotationLength || len(payload.State) > 32 || len(payload.AppVersion) > 128 {
 		return GrafanaWebhook{}, errInvalidGrafanaWebhook
 	}
 	if payload.Status != "firing" && payload.Status != "resolved" && payload.Status != "mixed" && payload.Status != "" {
@@ -162,12 +169,15 @@ func ParseGrafanaWebhook(data []byte) (GrafanaWebhook, error) {
 		if alert.EndsAt != nil && alert.EndsAt.Before(alert.StartsAt) {
 			return GrafanaWebhook{}, errInvalidGrafanaWebhook
 		}
-		if len(alert.GeneratorURL) > 2048 || len(alert.Fingerprint) > 128 {
+		if len(alert.GeneratorURL) > 2048 || len(alert.Fingerprint) > 128 || len(alert.RuleUID) > 128 {
 			return GrafanaWebhook{}, errInvalidGrafanaWebhook
 		}
 		if alert.GeneratorURL != "" {
 			parsed, err := url.ParseRequestURI(alert.GeneratorURL)
-			if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
+			// Plain HTTP source links are allowed only for literal loopback demo URLs.
+			// The source reference is stored as evidence and is never fetched here.
+			if err != nil || parsed.Host == "" || parsed.User != nil ||
+				(parsed.Scheme != "https" && !(parsed.Scheme == "http" && (parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "::1"))) {
 				return GrafanaWebhook{}, errInvalidGrafanaWebhook
 			}
 		}
@@ -277,7 +287,7 @@ func (handler *handler) receiveGrafanaWebhook(w http.ResponseWriter, r *http.Req
 	}
 	timestamp := r.Header.Get("X-Relythra-Timestamp")
 	signature := r.Header.Get("X-Relythra-Signature")
-	if err := VerifyDeploymentSignature([]byte(handler.grafanaWebhookSecret), timestamp, signature, body, time.Now().UTC()); err != nil {
+	if err := VerifyGrafanaWebhookSignature([]byte(handler.grafanaWebhookSecret), timestamp, signature, body, time.Now().UTC()); err != nil {
 		handler.recordGrafanaWebhookError(w, r, http.StatusUnauthorized, "invalid_signature", audit.ResultDenied)
 		return
 	}
@@ -286,7 +296,7 @@ func (handler *handler) receiveGrafanaWebhook(w http.ResponseWriter, r *http.Req
 		handler.recordGrafanaWebhookError(w, r, http.StatusBadRequest, "invalid_grafana_payload", audit.ResultFailed)
 		return
 	}
-	replayKey, err := DeploymentSignatureReplayKey(signature)
+	replayKey, err := GrafanaWebhookReplayKey(signature)
 	if err != nil {
 		handler.recordGrafanaWebhookError(w, r, http.StatusUnauthorized, "invalid_signature", audit.ResultDenied)
 		return
@@ -356,7 +366,7 @@ func (handler *handler) receiveGrafanaWebhook(w http.ResponseWriter, r *http.Req
 			SourceTimezone: alert.SourceTimezone, SourceTimeText: alert.SourceTimeText,
 		})
 	}
-	results, err := handler.grafanaAlerts.IngestGrafanaAlerts(r.Context(), inputs, RequestIDFromContext(r.Context()))
+	results, err := handler.grafanaAlerts.IngestGrafanaAlerts(r.Context(), inputs, RequestIDFromContext(r.Context()), handler.filter)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			handler.recordGrafanaWebhookError(w, r, http.StatusUnprocessableEntity, "needs_mapping", audit.ResultDenied)
@@ -455,7 +465,7 @@ func (handler *handler) remapGrafanaAlert(w http.ResponseWriter, r *http.Request
 			writeError(w, r, http.StatusBadRequest, "invalid_request", "alert remapping request is invalid")
 			return
 		}
-		result, err := handler.grafanaAlerts.RemapGrafanaAlert(r.Context(), alertID, request.ExpectedVersion, request.ServiceID, request.Environment)
+		result, err := handler.grafanaAlerts.RemapGrafanaAlert(r.Context(), alertID, request.ExpectedVersion, request.ServiceID, request.Environment, handler.filter)
 		if err != nil {
 			handler.writeStoreError(w, r, err)
 			return

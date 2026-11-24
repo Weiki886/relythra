@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Weiki886/relythra/internal/domain"
+	"github.com/Weiki886/relythra/internal/security/redact"
 	"github.com/Weiki886/relythra/migrations"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
@@ -317,7 +318,8 @@ func TestIngestGrafanaAlertCreatesIncidentAndReusesItOnDuplicate(t *testing.T) {
 		Annotations:     json.RawMessage(`{"summary":"Checkout latency is high"}`),
 		RedactedPayload: json.RawMessage(`{"status":"firing","alerts":[]}`),
 	}
-	first, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-request-1")
+	filter := mustGrafanaEvidenceFilter(t)
+	first, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-request-1", filter)
 	if err != nil {
 		t.Fatalf("ingest firing alert: %v", err)
 	}
@@ -327,7 +329,7 @@ func TestIngestGrafanaAlertCreatesIncidentAndReusesItOnDuplicate(t *testing.T) {
 	if first[0].Alert.SourceTimezone != input.SourceTimezone || first[0].Alert.SourceTimeText != input.SourceTimeText {
 		t.Fatalf("persisted source timestamp = %q / %q", first[0].Alert.SourceTimezone, first[0].Alert.SourceTimeText)
 	}
-	second, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-request-2")
+	second, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-request-2", filter)
 	if err != nil {
 		t.Fatalf("ingest duplicate alert: %v", err)
 	}
@@ -340,7 +342,7 @@ func TestIngestGrafanaAlertCreatesIncidentAndReusesItOnDuplicate(t *testing.T) {
 	resolvedAt := fixture.startedAt.Add(5 * time.Minute)
 	input.Status = "RESOLVED"
 	input.EndsAt = &resolvedAt
-	resolved, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-request-3")
+	resolved, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "grafana-request-3", filter)
 	if err != nil {
 		t.Fatalf("ingest resolved alert: %v", err)
 	}
@@ -370,7 +372,7 @@ func TestIngestGrafanaAlertAllowsRepeatedFingerprintWithinOneRequest(t *testing.
 	input := fixtureAlertInput(fixture, "same-envelope-fingerprint")
 	input.ProjectSlug = "grafana-batch-duplicate"
 
-	results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input, input}, "grafana-shared-request")
+	results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input, input}, "grafana-shared-request", mustGrafanaEvidenceFilter(t))
 	if err != nil {
 		t.Fatalf("ingest repeated fingerprint in one request: %v", err)
 	}
@@ -398,7 +400,7 @@ func TestIngestGrafanaAlertLeavesUnknownServiceForMappingAndRollsBackWholeBatch(
 		Labels: json.RawMessage(`{"alertname":"Unmapped"}`), Annotations: json.RawMessage(`{"summary":"Unmapped alert"}`),
 		RedactedPayload: json.RawMessage(`{"alerts":[]}`),
 	}
-	results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "unmapped-request-1")
+	results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "unmapped-request-1", mustGrafanaEvidenceFilter(t))
 	if err != nil {
 		t.Fatalf("ingest unmapped alert: %v", err)
 	}
@@ -416,7 +418,7 @@ func TestIngestGrafanaAlertLeavesUnknownServiceForMappingAndRollsBackWholeBatch(
 	valid := fixtureAlertInput(fixture, "batch-rollback-valid")
 	invalid := valid
 	invalid.ProjectSlug = "project-that-does-not-exist"
-	if _, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{valid, invalid}, "batch-rollback-request"); !errors.Is(err, ErrNotFound) {
+	if _, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{valid, invalid}, "batch-rollback-request", mustGrafanaEvidenceFilter(t)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("batch with unresolved project error = %v, want ErrNotFound", err)
 	}
 	var count int
@@ -444,6 +446,7 @@ func TestIngestGrafanaAlertDeduplicatesConcurrentFingerprints(t *testing.T) {
 	repository := NewPostgres(db)
 	input := fixtureAlertInput(fixture, "concurrent-fingerprint")
 	input.ProjectSlug = "grafana-concurrent"
+	filter := mustGrafanaEvidenceFilter(t)
 
 	const writers = 8
 	var group sync.WaitGroup
@@ -453,7 +456,7 @@ func TestIngestGrafanaAlertDeduplicatesConcurrentFingerprints(t *testing.T) {
 		group.Add(1)
 		go func(index int) {
 			defer group.Done()
-			results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, fmt.Sprintf("concurrent-request-%d", index))
+			results, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, fmt.Sprintf("concurrent-request-%d", index), filter)
 			if err != nil {
 				errorsChannel <- err
 				return
@@ -507,19 +510,71 @@ func TestRemapGrafanaAlertUsesVersionAndCreatesInvestigation(t *testing.T) {
 	input.ProjectSlug = "grafana-remap"
 	input.ServiceSlug = "missing-service"
 	input.Environment = "bad Env"
-	created, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "remap-request-1")
+	created, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "remap-request-1", mustGrafanaEvidenceFilter(t))
 	if err != nil {
 		t.Fatalf("ingest unmapped alert: %v", err)
 	}
-	result, err := repository.RemapGrafanaAlert(ctx, created[0].Alert.ID, created[0].Alert.EventVersion, fixture.serviceID, "prod")
+	if _, err := repository.RemapGrafanaAlert(ctx, created[0].Alert.ID, created[0].Alert.EventVersion, fixture.serviceID, "prod", nil); !errors.Is(err, redact.ErrUnsafeOutput) {
+		t.Fatalf("remap without redaction filter = %v, want ErrUnsafeOutput", err)
+	}
+	filter := mustGrafanaEvidenceFilter(t)
+	result, err := repository.RemapGrafanaAlert(ctx, created[0].Alert.ID, created[0].Alert.EventVersion, fixture.serviceID, "prod", filter)
 	if err != nil {
 		t.Fatalf("remap Grafana alert: %v", err)
 	}
 	if result.MatchState != "MATCHED" || result.InvestigationID == "" || result.Alert.EventVersion != 2 {
 		t.Fatalf("remapped alert result = %+v", result)
 	}
-	if _, err := repository.RemapGrafanaAlert(ctx, result.Alert.ID, 1, fixture.serviceID, "prod"); !errors.Is(err, ErrConflict) {
+	assertGrafanaEvidenceCount(t, ctx, db, result.InvestigationID, 1)
+	var summaryJSON []byte
+	if err := db.QueryRowContext(ctx, `SELECT value_summary FROM evidence WHERE investigation_id=$1`, result.InvestigationID).Scan(&summaryJSON); err != nil {
+		t.Fatalf("read remapped Grafana evidence: %v", err)
+	}
+	var summary map[string]any
+	if err := json.Unmarshal(summaryJSON, &summary); err != nil {
+		t.Fatalf("decode remapped Grafana evidence summary: %v", err)
+	}
+	if summary["mapping_status"] != "MATCHED" || summary["event_version"] != float64(result.Alert.EventVersion) || summary["service_id"] != fixture.serviceID {
+		t.Fatalf("remapped Grafana evidence summary = %#v", summary)
+	}
+	if _, err := repository.RemapGrafanaAlert(ctx, result.Alert.ID, 1, fixture.serviceID, "prod", filter); !errors.Is(err, ErrConflict) {
 		t.Fatalf("stale remap error = %v, want ErrConflict", err)
+	}
+}
+
+func TestRemapGrafanaAlertUpdatesExistingInvestigationEvidence(t *testing.T) {
+	db := openStoreTestDB(t)
+	ctx := context.Background()
+	fixture := insertStoreFixture(t, ctx, db, "grafana-remap-existing")
+	repository := NewPostgres(db)
+	input := fixtureAlertInput(fixture, "remap-existing-fingerprint")
+	input.ProjectSlug = "grafana-remap-existing"
+	input.ServiceSlug = "checkout-api"
+	filter := mustGrafanaEvidenceFilter(t)
+	created, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{input}, "remap-existing-request", filter)
+	if err != nil {
+		t.Fatalf("ingest mapped alert: %v", err)
+	}
+	var remappedServiceID string
+	if err := db.QueryRowContext(ctx, `
+		INSERT INTO services (project_id, slug, name) VALUES ($1, 'billing-api', 'Billing API') RETURNING id::text
+	`, fixture.projectID).Scan(&remappedServiceID); err != nil {
+		t.Fatalf("insert remapped service: %v", err)
+	}
+	result, err := repository.RemapGrafanaAlert(ctx, created[0].Alert.ID, created[0].Alert.EventVersion, remappedServiceID, "prod", filter)
+	if err != nil {
+		t.Fatalf("remap alert with existing investigation: %v", err)
+	}
+	if result.InvestigationID == "" {
+		t.Fatal("remapped alert result has no investigation")
+	}
+	assertGrafanaEvidenceCount(t, ctx, db, result.InvestigationID, 2)
+	var investigationServiceID string
+	if err := db.QueryRowContext(ctx, `SELECT service_id::text FROM investigations WHERE id=$1`, result.InvestigationID).Scan(&investigationServiceID); err != nil {
+		t.Fatalf("read remapped investigation service: %v", err)
+	}
+	if investigationServiceID != remappedServiceID {
+		t.Fatalf("investigation service = %s, want %s", investigationServiceID, remappedServiceID)
 	}
 }
 
@@ -901,6 +956,8 @@ func TestGetInvestigationTimelineRejectsInvalidInputsBeforeDatabaseAccess(t *tes
 		{name: "bad source", id: validID, filter: InvestigationTimelineFilter{SourceType: "UNKNOWN"}, limit: 1},
 		{name: "bad completeness", id: validID, filter: InvestigationTimelineFilter{Completeness: "INVALID"}, limit: 1},
 		{name: "bad stance", id: validID, filter: InvestigationTimelineFilter{Stance: "INVALID"}, limit: 1},
+		{name: "bad hypothesis ID", id: validID, filter: InvestigationTimelineFilter{HypothesisID: "bad"}, limit: 1},
+		{name: "oversized container ID", id: validID, filter: InvestigationTimelineFilter{ContainerID: strings.Repeat("x", maxInvestigationTimelineContainerID+1)}, limit: 1},
 		{name: "oversized page", id: validID, limit: 101},
 		{name: "negative offset", id: validID, limit: 1, offset: -1},
 		{name: "oversized offset", id: validID, limit: 1, offset: 10001},
@@ -958,11 +1015,12 @@ func TestTimelineStanceFiltersRelationsWithoutDuplicates(t *testing.T) {
 	unlinked := insertEvidence(fixture, "RUNTIME", "e")
 	foreign := insertEvidence(other, "LOKI", "c")
 	h1, h2 := insertHypothesis(fixture, 1), insertHypothesis(fixture, 2)
+	hForeign := insertHypothesis(other, 1)
 	link(fixture, h1, first, "SUPPORTS")
 	link(fixture, h2, first, "CONTRADICTS")
 	link(fixture, h1, second, "CONTRADICTS")
 	link(fixture, h2, third, "SUPPORTS")
-	link(other, insertHypothesis(other, 1), foreign, "SUPPORTS")
+	link(other, hForeign, foreign, "SUPPORTS")
 	repository := NewPostgres(db)
 	for _, tc := range []struct{ stance, source, want string }{
 		{"CONTRADICTS", "PROMETHEUS", second}, {"CONTRADICTS", "LOKI", first}, {"SUPPORTS", "LOKI", first},
@@ -996,6 +1054,29 @@ func TestTimelineStanceFiltersRelationsWithoutDuplicates(t *testing.T) {
 		InvestigationTimelineFilter{}, 10, 0)
 	if err != nil || page.Total != 4 {
 		t.Fatalf("unfiltered page: got %+v, err %v", page, err)
+	}
+	page, err = repository.GetInvestigationTimeline(ctx, fixture.investigationID,
+		InvestigationTimelineFilter{HypothesisID: h1}, 10, 0)
+	if err != nil || page.Total != 2 || len(page.Items) != 2 || page.HasMore {
+		t.Fatalf("hypothesis %s page: got %+v, err %v", h1, page, err)
+	}
+	for _, item := range page.Items {
+		if item.ID != first && item.ID != second {
+			t.Fatalf("hypothesis %s returned unrelated evidence %s", h1, item.ID)
+		}
+		if item.ID == first && len(item.Relations) != 2 {
+			t.Fatalf("hypothesis-filtered evidence lost its full relation set: %+v", item.Relations)
+		}
+	}
+	page, err = repository.GetInvestigationTimeline(ctx, fixture.investigationID,
+		InvestigationTimelineFilter{HypothesisID: h2, Stance: "CONTRADICTS"}, 10, 0)
+	if err != nil || page.Total != 1 || len(page.Items) != 1 || page.Items[0].ID != first {
+		t.Fatalf("hypothesis and stance page: got %+v, err %v", page, err)
+	}
+	foreignPage, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID,
+		InvestigationTimelineFilter{HypothesisID: hForeign}, 10, 0)
+	if err != nil || foreignPage.Total != 0 || len(foreignPage.Items) != 0 {
+		t.Fatalf("foreign hypothesis page: got %+v, err %v", foreignPage, err)
 	}
 	for _, item := range page.Items {
 		if item.ID == unlinked && (item.Relations == nil || len(item.Relations) != 0) {

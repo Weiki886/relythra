@@ -124,7 +124,12 @@ func NewHandler(cfg Config, store StockStore, client *http.Client, logger *slog.
 		var quantity int
 		var err error
 		if cfg.Service == "inventory" {
-			quantity, err = store.Stock(ctx)
+			if cfg.EnableFaults {
+				err = store.SlowQuery(ctx)
+			}
+			if err == nil {
+				quantity, err = store.Stock(ctx)
+			}
 		} else {
 			quantity, err = fetch(ctx, "/stock")
 		}

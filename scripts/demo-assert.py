@@ -110,15 +110,117 @@ def healthy():
                 assert json.loads(line)["msg"] == "request completed"
         assert seen == {"orders", "inventory"}, seen
     eventually(logs)
-    status, raw = http(23001, "/api/dashboards/uid/relythra-demo")
-    assert status == 200 and len(json.loads(raw)["dashboard"]["panels"]) == 6, "Grafana dashboard"
-    status, raw = http(23001, "/api/datasources")
-    assert status == 200 and len(json.loads(raw)) == 2, "Grafana datasources"
-    assert b"secureJsonData" not in raw and b"Bearer " not in raw, "Grafana exposed credentials"
-    status, raw = http(23001, "/api/v1/provisioning/alert-rules", admin=True)
-    assert status == 200 and any(rule["uid"] == "demo-target-down" for rule in json.loads(raw)), "Grafana alert provisioning"
+    def grafana_provisioned():
+        status, raw = http(23001, "/api/dashboards/uid/relythra-demo")
+        assert status == 200 and len(json.loads(raw)["dashboard"]["panels"]) == 6, "Grafana dashboard"
+        status, raw = http(23001, "/api/datasources")
+        assert status == 200 and len(json.loads(raw)) == 2, "Grafana datasources"
+        assert b"secureJsonData" not in raw and b"Bearer " not in raw, "Grafana exposed credentials"
+        status, raw = http(23001, "/api/v1/provisioning/alert-rules", admin=True)
+        assert status == 200 and any(rule["uid"] == "demo-target-down" for rule in json.loads(raw)), "Grafana alert provisioning"
+    eventually(grafana_provisioned)
     assert http(23001, "/api/dashboards/db", method="POST")[0] in (401, 403), "Viewer can write dashboards"
     print("Real telemetry verified: six healthy scrape targets, business/node/cgroup/worker samples, labeled JSON logs and Grafana dashboard")
+
+
+def grafana_delivery(investigation_id, expected_status):
+    def delivered():
+        status, raw = http(28080, f"/api/v1/investigations/{investigation_id}")
+        assert status == 200, ("Investigation read", status)
+        context = json.loads(raw)["data"]
+        assert context["project"]["slug"] == "relythra-demo", "Project mapping"
+        assert context["service"]["slug"] == "inventory", "Service mapping"
+        assert context["environment"] == "demo", "Environment mapping"
+        assert context["alert"]["status"] == expected_status, ("Alert transition", context["alert"]["status"])
+        alert_id = context["alert"]["id"]
+        status, raw = http(28080, f"/api/v1/investigations/{investigation_id}/timeline")
+        assert status == 200, ("Evidence timeline read", status)
+        observations = [item for item in json.loads(raw)["data"]["items"] if item["source_type"] == "GRAFANA" and item["value_summary"]["alert_id"] == alert_id]
+        transitions = {item["value_summary"]["status"] for item in observations}
+        required = {"FIRING", expected_status}
+        assert required <= transitions, ("Missing Grafana evidence transition", transitions)
+        for item in observations:
+            assert item["raw_reference"].startswith("http://127.0.0.1:23001/alerting/"), "Grafana source link"
+            status, raw = http(28080, f"/api/v1/evidence/{item['id']}")
+            assert status == 200 and json.loads(raw)["data"]["id"] == item["id"], "Evidence deep link"
+    eventually(delivered, timeout=120)
+    print(f"Grafana signed {expected_status} delivery and Evidence verified for Investigation {investigation_id}")
+
+
+def prometheus_scalar(query):
+    status, raw = http(29090, "/api/v1/query?" + urllib.parse.urlencode({"query": query}), True)
+    assert status == 200, ("Prometheus query", query, status)
+    result = json.loads(raw)["data"]["result"]
+    return float(result[0]["value"][1]) if result else 0.0
+
+
+def inventory_request_logs(release, started_ns, slow):
+    selector = '{project="relythra-demo",service="inventory",env="demo",release="' + release + '"} |= "request completed"'
+    status, raw = http(23100, "/loki/api/v1/query_range?" + urllib.parse.urlencode({
+        "query": selector,
+        "limit": 100,
+        "direction": "backward",
+        "start": str(started_ns),
+        "end": str(time.time_ns()),
+    }), True)
+    assert status == 200, ("Loki slow SQL query", status, raw[:200])
+    result = json.loads(raw)["data"]["result"]
+    entries = [
+        json.loads(line)
+        for stream in result
+        for _, line in stream["values"]
+        if json.loads(line).get("route") == "/stock"
+    ]
+    if slow:
+        assert any(float(entry.get("duration_ms", 0)) >= 150 for entry in entries), ("slow SQL log missing", entries)
+    else:
+        assert any(float(entry.get("duration_ms", 10000)) < 150 for entry in entries), ("recovered SQL log missing", entries)
+
+
+def slow_sql_fault():
+    total_query = 'demo_http_request_duration_seconds_bucket{service="orders",route="/orders",le="+Inf"}'
+    fast_query = 'demo_http_request_duration_seconds_bucket{service="orders",route="/orders",le="0.1"}'
+    before_total = prometheus_scalar(total_query)
+    before_fast = prometheus_scalar(fast_query)
+    started_ns = time.time_ns()
+    durations = []
+    for _ in range(8):
+        started = time.monotonic()
+        status, raw = http(28090, "/orders")
+        durations.append(time.monotonic() - started)
+        assert status == 200 and json.loads(raw)["available"] == 42, ("slow SQL orders request", status, raw[:200])
+    assert min(durations) >= 0.15, ("orders path did not observe the slow SQL fault", durations)
+
+    def fault_metrics():
+        total = prometheus_scalar(total_query)
+        fast = prometheus_scalar(fast_query)
+        assert total >= before_total + 8, ("orders request histogram did not record all fault requests", before_total, total)
+        assert fast == before_fast, ("fault requests unexpectedly landed in the <=100ms bucket", before_fast, fast)
+
+    eventually(fault_metrics)
+    eventually(lambda: inventory_request_logs("slow-sql-fault", started_ns, True))
+    print("Slow SQL fault verified: orders latency histogram and inventory query log show the same workload")
+
+
+def slow_sql_recovered():
+    total_query = 'demo_http_request_duration_seconds_bucket{service="orders",route="/orders",le="+Inf"}'
+    fast_query = 'demo_http_request_duration_seconds_bucket{service="orders",route="/orders",le="0.1"}'
+    before_total = prometheus_scalar(total_query)
+    before_fast = prometheus_scalar(fast_query)
+    started_ns = time.time_ns()
+    for _ in range(8):
+        status, raw = http(28090, "/orders")
+        assert status == 200 and json.loads(raw)["available"] == 42, ("recovered orders request", status, raw[:200])
+
+    def recovered_metrics():
+        total = prometheus_scalar(total_query)
+        fast = prometheus_scalar(fast_query)
+        assert total >= before_total + 8, ("orders recovery histogram is incomplete", before_total, total)
+        assert fast >= before_fast + 8, ("orders latency did not return to the <=100ms bucket", before_fast, fast)
+
+    eventually(recovered_metrics)
+    eventually(lambda: inventory_request_logs("baseline", started_ns, False))
+    print("Slow SQL recovery verified: orders latency and inventory query logs returned to baseline")
 
 
 if __name__ == "__main__":
@@ -135,5 +237,11 @@ if __name__ == "__main__":
         print("Demo database loss: orders not ready, still live; control plane healthy")
     elif mode == "recovered":
         eventually(recovered)
+    elif mode == "grafana-delivery":
+        grafana_delivery(sys.argv[2], sys.argv[3])
+    elif mode == "slow-sql-fault":
+        slow_sql_fault()
+    elif mode == "slow-sql-recovered":
+        slow_sql_recovered()
     else:
         raise ValueError("Unknown assertion mode")

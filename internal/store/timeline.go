@@ -10,16 +10,19 @@ import (
 )
 
 const (
-	maxInvestigationTimelinePageSize = 100
-	maxInvestigationTimelineOffset   = 10000
-	maxInvestigationTimelineEntityID = 256
+	maxInvestigationTimelinePageSize    = 100
+	maxInvestigationTimelineOffset      = 10000
+	maxInvestigationTimelineEntityID    = 256
+	maxInvestigationTimelineContainerID = 256
 )
 
 type InvestigationTimelineFilter struct {
 	SourceType   string
 	EntityID     string
+	ContainerID  string
 	Completeness string
 	Stance       string
+	HypothesisID string
 }
 
 type InvestigationTimeline struct {
@@ -187,9 +190,16 @@ func ValidateInvestigationTimelineFilter(filter InvestigationTimelineFilter) err
 	if filter.Stance != "" && filter.Stance != "SUPPORTS" && filter.Stance != "CONTRADICTS" {
 		return fmt.Errorf("%w: invalid timeline stance", ErrInvalidInput)
 	}
+	if filter.HypothesisID != "" && !domain.IsID(filter.HypothesisID) {
+		return fmt.Errorf("%w: invalid timeline hypothesis ID", ErrInvalidInput)
+	}
 	if filter.EntityID != strings.TrimSpace(filter.EntityID) ||
 		len(filter.EntityID) > maxInvestigationTimelineEntityID {
 		return fmt.Errorf("%w: invalid timeline entity ID", ErrInvalidInput)
+	}
+	if filter.ContainerID != strings.TrimSpace(filter.ContainerID) ||
+		len(filter.ContainerID) > maxInvestigationTimelineContainerID {
+		return fmt.Errorf("%w: invalid timeline container ID", ErrInvalidInput)
 	}
 	return nil
 }
@@ -208,6 +218,14 @@ func investigationTimelineWhere(
 		arguments = append(arguments, filter.EntityID)
 		conditions = append(conditions, fmt.Sprintf("entity_id = $%d", len(arguments)))
 	}
+	if filter.ContainerID != "" {
+		arguments = append(arguments, filter.ContainerID)
+		conditions = append(conditions, fmt.Sprintf(`value_summary @> jsonb_build_object(
+			'measurements', jsonb_build_array(jsonb_build_object(
+				'entity_type', 'CONTAINER', 'entity_id', $%d::text
+			))
+		)`, len(arguments)))
+	}
 	if filter.Completeness != "" {
 		arguments = append(arguments, filter.Completeness)
 		conditions = append(conditions, fmt.Sprintf("completeness = $%d", len(arguments)))
@@ -218,6 +236,14 @@ func investigationTimelineWhere(
 			SELECT 1 FROM hypothesis_evidence he
 			WHERE he.investigation_id = evidence.investigation_id
 			  AND he.evidence_id = evidence.id AND he.stance = $%d
+		)`, len(arguments)))
+	}
+	if filter.HypothesisID != "" {
+		arguments = append(arguments, filter.HypothesisID)
+		conditions = append(conditions, fmt.Sprintf(`EXISTS (
+			SELECT 1 FROM hypothesis_evidence he
+			WHERE he.investigation_id = evidence.investigation_id
+			  AND he.evidence_id = evidence.id AND he.hypothesis_id = $%d
 		)`, len(arguments)))
 	}
 	return " WHERE " + strings.Join(conditions, " AND "), arguments

@@ -1,17 +1,17 @@
 # Compose 业务与观测演示
 
-这是 Issue #6 的本地可信环境：orders → inventory → 独立 demo PostgreSQL；Prometheus 采集业务/Worker/node/cgroup 指标；Alloy 采集业务 JSON 日志到 Loki；Grafana 提供 Viewer 面板和初始告警。真实诊断、部署回调、告警接收与通知仍由后续 Issue 实现。
+这是 Issue #6 的本地可信环境：orders → inventory → 独立 demo PostgreSQL；Prometheus 采集业务/Worker/node/cgroup 指标；Alloy 采集业务 JSON 日志到 Loki；Grafana 提供 Viewer 面板、目标不可用告警和签名 Webhook Contact Point；`make demo-smoke` 会在隔离项目中停止并恢复 inventory，验证经过 HMAC 验签的 FIRING/RESOLVED 通知、同一 Investigation 的 Grafana Evidence 和读取链接。此演示尚未自动触发指标、日志、GitHub 或运行时采集，也不代表完整慢 SQL 诊断链已经实现。
 
 ## 启动
 
 基础 API/Worker/Web 的无 Docker 入口仍是 `./scripts/dev.sh`。下面的完整演示需要 Docker Compose v2、约 4 GiB 可用内存与 Linux cgroup。Docker Desktop 指标代表其 Linux VM，不能代表 macOS/Windows 物理宿主机。
 
-先按 README 创建 `secrets/postgres_password`、`secrets/management_token` 并复制 `.env.example` 为 `.env`，再创建四份独立随机演示凭据。重复启动不要重新生成已有凭据：数据库与 Grafana 初始化密码保存在卷内，覆盖文件不会自动修改已有账号。
+先按 README 创建 `secrets/postgres_password`、`secrets/management_token` 并复制 `.env.example` 为 `.env`，再创建五份独立随机演示凭据。重复启动不要重新生成已有凭据：数据库与 Grafana 初始化密码保存在卷内，覆盖文件不会自动修改已有账号。
 
 ```bash
 mkdir -p secrets
 chmod 700 secrets
-for name in demo_owner_password demo_reader_password observability_token grafana_admin_password; do
+for name in demo_owner_password demo_reader_password observability_token grafana_admin_password grafana_webhook_secret; do
   if [ ! -e "secrets/$name" ]; then
     (umask 077; openssl rand -hex 32 | tr -d '\n' > "secrets/$name")
   fi
@@ -19,6 +19,8 @@ done
 ./scripts/demo.sh up
 ./scripts/demo.sh status
 ```
+
+签名 Webhook 使用独立的 `grafana_webhook_secret` 文件，分别挂载给 API 与 Grafana。API 使用 `file:/run/secrets/grafana_webhook_secret`，Grafana bootstrap 导出变量供 Contact Point provisioning 使用。`DEMO_GRAFANA_WEBHOOK_SECRET_FILE` 必须指向该文件。Grafana 的本地来源链接使用 `DEMO_GRAFANA_PORT` 对应的回环端口。
 
 旧 `.env` 需从 `.env.example` 补充 `DEMO_*_FILE`。Secret 路径相对于 `deploy/compose/`；不要提交 `.env`、`secrets/` 或含 Token 的截图/命令历史。只读 Token 限制为至少 32 个字母、数字、下划线或连字符。
 
@@ -34,7 +36,7 @@ done
 
 所有发布端口仅绑定回环。inventory、演示数据库、Alloy、node_exporter、cAdvisor 和原始存储不发布端口。控制面 PostgreSQL 仍在 15432；演示数据库使用不同实例、网络、卷、账号和凭据。
 
-Grafana 管理员用户名为 `admin`，密码来自 `secrets/grafana_admin_password`，仅用于人工管理。数据源和面板由文件配置且不可在 UI 修改。初始告警 `Demo target unavailable` 检查每个示例服务的抓取可用性；它不表示数据库 readiness，也不向 Relythra 创建 Incident。查看/编辑告警需要管理员，Viewer 用于浏览面板。
+Grafana 管理员用户名为 `admin`，密码来自 `secrets/grafana_admin_password`，仅用于人工管理。数据源和面板由文件配置且不可在 UI 修改。初始告警 `Demo target unavailable` 检查每个示例服务的抓取可用性；它不表示数据库 readiness。告警 Contact Point 将事件发送到 Relythra 的 Grafana Webhook，使用 Grafana 原生 HMAC-SHA256 与时间戳签名；签名密钥由本地准备步骤随机生成，并通过独立 Secret 文件提供。普通 `demo.sh` 环境需要先在控制面创建 `relythra-demo` Project 及同名 Service，才能匹配并创建 Investigation。查看/编辑告警需要管理员，Viewer 用于浏览面板。
 
 ## 产生与核验观测数据
 
@@ -72,7 +74,7 @@ node_exporter 只读挂载 `/proc` 与 `/sys`，采集 CPU、内存、负载与�
 docker compose -p relythra-demo -f deploy/compose/compose.yaml -f deploy/compose/demo.yaml up -d --build --no-deps inventory
 ```
 
-所有故障测试默认关闭。只有显式设置 `DEMO_ENABLE_FAULTS=true` 并重建 inventory 容器时，容器内 `GET /internal/test/slow-query` 才执行固定 `SELECT pg_sleep(0.2)`，上下文最多 1 秒；无任意 SQL/命令、无公开管理端口。这只验证测试入口边界，不是已经完成慢 SQL 发布回归或评测案例。完整故障注入与恢复将在后续 Issue 实现，不能把控制元数据写进观测日志当根因答案。
+所有故障测试默认关闭。`DEMO_ENABLE_FAULTS=true` 仅对显式重建的 inventory 容器生效：inventory 的真实 `/stock` 调用先执行固定 `SELECT pg_sleep(0.2)`，然后读取种子库存，业务请求总预算为 2 秒；同一开关也启用容器内 `GET /internal/test/slow-query`，该独立测试请求预算为 1 秒。无任意 SQL/命令输入，无公开管理端口。`make demo-smoke` 在自己的隔离 Compose 项目里用 `baseline → slow-sql-fault → baseline` 重建 inventory，经 orders 业务入口发送请求，再核对 orders Prometheus 延迟直方图和 inventory Loki `duration_ms` 日志，最后验证指标/日志回到基线。该受控 SQL 延迟是 Issue #16 的故障夹具切片，不代表 Grafana 告警、Relythra Investigation、Evidence 采集或诊断候选端到端链路已经实现；不能把测试编排状态写进观测日志当根因答案。
 
 数据库断开：inventory/orders 的 `/health/ready` 返回 503，业务请求 503，`/health/live` 保持 200；控制面数据库独立，Relythra readiness 不受演示数据库影响。恢复 demo 数据库后自动重连，不自动执行重启、扩容、回滚。
 
@@ -106,6 +108,10 @@ make demo-smoke
 
 需要 Python 3；脚本创建独立随机项目、随机 Secret、专用端口 28080/28081/23000/25432/28090/29090/23100/23001。验收结束只删除该项目的容器、网络、卷和临时 Secret。不要把这个脚本改成连接共享/生产数据库。
 
-检查项包括真实业务请求、6 个 targets、业务/宿主机/非根 cgroup/Worker 样本、两种服务日志与标签、Viewer 面板、只读拒写、数据库权限、演示数据库中断/恢复、重启保留数据。任何组件没就绪都会失败并报告具体服务/缺失样本。首次下载镜像超时可在网络恢复后重新执行；不把重跑当作解决 flaky。
+smoke 失败时，脚本会在系统临时目录（`$TMPDIR`，未设置时为 `/tmp`）下的 `relythra-demo-smoke-artifacts/` 创建一个权限为 `0700` 的运行目录，记录失败阶段与退出码，保存 Compose 服务状态、最近 100 行服务日志、Prometheus 的 `up`/订单延迟/服务身份查询、最近 15 分钟的 Loki 业务和 inventory 日志响应，以及运行中 Grafana 的健康响应。单文件最多 1 MiB；未运行或无法访问的数据源会留下对应的 `.error.txt`。所有文件权限为 `0600`，落盘前会移除本次随机 Secret 和常见 Authorization、token、password 字段。渲染后的 Compose 配置、环境变量与 Secret 文件不会进入诊断包；临时 Secret 仍会在退出时清理。
+
+可通过环境变量 `RELYTHRA_DEMO_ARTIFACT_DIR` 指定诊断包的父目录。成功运行不会创建诊断包。CI 中演示验收失败会上传诊断包并保留 3 天。失败诊断包可能包含演示日志和遥测数据，脱敏仅覆盖已知凭据和常见字段，应按诊断材料保管，分享前检查内容，不要提交到公开仓库或附加未脱敏的业务数据。
+
+检查项包括真实 Grafana 告警经 HMAC Webhook 写入控制面、真实业务请求、慢 SQL 故障与恢复期间的 Prometheus/Loki 信号、6 个 targets、业务/宿主机/非根 cgroup/Worker 样本、两种服务日志与标签、Viewer 面板、只读拒写、数据库权限、演示数据库中断/恢复、重启保留数据。Webhook 检查覆盖 FIRING/RESOLVED delivery、同一 Investigation 的 Grafana Evidence 与公开读取链接。其他数据源的自动采集和诊断候选仍由后续任务验证。任何组件没就绪都会失败并报告具体服务/缺失样本。首次下载镜像超时可在网络恢复后重新执行；不把重跑当作解决 flaky。
 
 `demo.sh up` 失败后不会清空数据；用 `status` 定位不健康组件，再用相同项目名和两个 compose 文件执行 `logs <service>`。不要输出 Secret、网关渲染文件或完整环境变量。Grafana 初始密码仅在空卷生效，修改 Secret 文件后应通过受控账号管理更新已有密码。

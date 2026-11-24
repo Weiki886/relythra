@@ -1,0 +1,8 @@
+apiVersion: 1
+policies:
+  - orgId: 1
+    receiver: relythra
+    group_by: [alertname, project, service, env]
+    group_wait: 0s
+    group_interval: 30s
+    repeat_interval: 1h

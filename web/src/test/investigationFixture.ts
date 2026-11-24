@@ -1,0 +1,78 @@
+export const investigationID = "11111111-1111-4111-8111-111111111111";
+export const investigationContext = {
+  investigation_id: investigationID,
+  incident_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+  status: "RECEIVED",
+  started_at: "2026-11-18T01:01:00Z",
+  completed_at: null,
+  project: {
+    id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    slug: "synthetic-shop",
+    name: "Synthetic Shop",
+  },
+  service: {
+    id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    slug: "checkout-api",
+    name: "Checkout API",
+  },
+  environment: "prod",
+  mapping_status: "MATCHED",
+  context_gaps: [],
+  alert: {
+    id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+    status: "FIRING",
+    severity: "ERROR",
+    summary: "Checkout latency rose",
+    starts_at: "2026-11-18T01:00:00Z",
+    ends_at: null,
+    source_reference: "https://grafana.example.test/alert",
+  },
+};
+export const evidence = {
+  id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  investigation_id: investigationID,
+  source_type: "PROMETHEUS",
+  entity_type: "SERVICE",
+  entity_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  observed_start: "2026-11-18T01:00:00Z",
+  observed_end: "2026-11-18T01:05:00Z",
+  collected_at: null,
+  completeness: "PARTIAL",
+  query_text: "select duration from queries",
+  query_parameters: { template_id: "synthetic-template.v1" },
+  value_summary: { gaps: ["synthetic_source_gap"] },
+  raw_reference: "https://observability.example.test/explore",
+  source_timezone: "UTC",
+  source_time_text: "2026-11-18T01:00:00Z",
+  independence_group: "synthetic:metrics",
+  freshness_seconds: null,
+};
+export const timeline = {
+  investigation_id: investigationID,
+  items: [{ ...evidence, relations: [] }],
+  total: 1,
+  limit: 50,
+  offset: 0,
+  has_more: false,
+};
+export const diagnosis = {
+  investigation_id: investigationID,
+  evidence_total: 2,
+  evidence_limit: 100,
+  evidence_truncated: false,
+  rule_set_version: "v0.5.0",
+  status: "CANDIDATES_FOUND",
+  missing_requirements: null,
+  candidates: [
+    {
+      entity_type: "SERVICE",
+      rule_id: "slow-query-latency-correlation.v1",
+      fault_type: "DATABASE_QUERY_LATENCY",
+      entity_id: evidence.entity_id,
+      confidence: "MEDIUM",
+      support_evidence_ids: [evidence.id],
+      contradict_evidence_ids: null,
+      missing_requirements: ["release_causality_unproven"],
+    },
+  ],
+};

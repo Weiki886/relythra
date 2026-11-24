@@ -116,6 +116,25 @@ type Event struct {
 	Line              redact.UntrustedData `json:"line"`
 }
 
+type CollectionFailureCode string
+
+const (
+	CollectionFailureTimeout          CollectionFailureCode = "timeout"
+	CollectionFailureRateLimited      CollectionFailureCode = "rate_limited"
+	CollectionFailurePermissionDenied CollectionFailureCode = "permission_denied"
+	CollectionFailureUnavailable      CollectionFailureCode = "unavailable"
+	CollectionFailureInvalidResponse  CollectionFailureCode = "invalid_response"
+	CollectionFailureRequestRejected  CollectionFailureCode = "request_rejected"
+	CollectionFailureUnknown          CollectionFailureCode = "unknown"
+)
+
+type CollectionFailure struct {
+	SourceType      string                `json:"source_type"`
+	TemplateID      string                `json:"template_id"`
+	TemplateVersion int                   `json:"template_version"`
+	ReasonCode      CollectionFailureCode `json:"reason_code"`
+}
+
 type Result struct {
 	Runtime        datasource.RuntimeType `json:"runtime"`
 	Service        string                 `json:"service"`
@@ -129,6 +148,7 @@ type Result struct {
 	Containers     []Container            `json:"containers"`
 	Events         []Event                `json:"events"`
 	Gaps           []string               `json:"gaps"`
+	Failures       []CollectionFailure    `json:"collection_failures"`
 	Partial        bool                   `json:"partial"`
 }
 
@@ -173,7 +193,7 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 		Runtime: request.Runtime, Service: request.Service, Environment: request.Environment, HostID: request.HostID,
 		MappingVersion: request.MappingVersion,
 		Start:          request.Start, End: request.End,
-		Hosts: []Host{}, Containers: []Container{}, Events: []Event{}, Gaps: []string{},
+		Hosts: []Host{}, Containers: []Container{}, Events: []Event{}, Gaps: []string{}, Failures: []CollectionFailure{},
 	}
 
 	metricResults := make(map[string]prometheus.Result, 7)
@@ -196,6 +216,10 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 			}
 			result.Partial = true
 			result.Gaps = append(result.Gaps, specification.gap)
+			result.Failures = append(result.Failures, CollectionFailure{
+				SourceType: "PROMETHEUS", TemplateID: specification.id, TemplateVersion: 1,
+				ReasonCode: prometheusCollectionFailureCode(queryErr),
+			})
 			continue
 		}
 		metricResult.Series = rejectDuplicateSeries(metricResult.Series, &result)
@@ -217,6 +241,9 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 		result.Containers = result.Containers[:request.MaxSeries]
 		result.Gaps = append(result.Gaps, "runtime_entities_truncated")
 		result.Partial = true
+		if prunePeerContainerIDs(result.Containers) {
+			result.Gaps = append(result.Gaps, "runtime_peer_links_truncated")
+		}
 	}
 	if len(result.Hosts) > request.MaxSeries {
 		result.Hosts = result.Hosts[:request.MaxSeries]
@@ -234,10 +261,26 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 		}
 		result.Partial = true
 		result.Gaps = append(result.Gaps, "container_lifecycle_events_unavailable")
+		result.Failures = append(result.Failures, CollectionFailure{
+			SourceType: "LOKI", TemplateID: logQuery.TemplateID, TemplateVersion: 1,
+			ReasonCode: lokiCollectionFailureCode(err),
+		})
 	} else {
 		result.Events = normalizeEvents(logResult, request, result.Containers)
 		result.Partial = true
 		result.Gaps = append(result.Gaps, "container_lifecycle_events_unverified")
+		if logResult.Partial || logResult.NextCursor != "" {
+			result.Gaps = append(result.Gaps, "container_lifecycle_events_truncated")
+		}
+		if logResult.TimeSkew {
+			result.Gaps = append(result.Gaps, "container_lifecycle_events_time_skewed")
+		}
+		for _, event := range result.Events {
+			if event.OutsideTimeWindow {
+				result.Gaps = append(result.Gaps, "container_lifecycle_events_outside_window")
+				break
+			}
+		}
 		if logResult.Partial || logResult.TimeSkew || logResult.Empty {
 			result.Partial = true
 		}
@@ -270,6 +313,26 @@ func (collector *Collector) Query(ctx context.Context, target Target, request Re
 	result.Gaps = compactGaps(result.Gaps)
 	result.Duration = time.Since(started)
 	return result, nil
+}
+
+func prunePeerContainerIDs(containers []Container) bool {
+	returned := make(map[string]struct{}, len(containers))
+	for _, container := range containers {
+		returned[container.ID] = struct{}{}
+	}
+	pruned := false
+	for index := range containers {
+		peers := containers[index].PeerContainerIDs[:0]
+		for _, peerID := range containers[index].PeerContainerIDs {
+			if _, exists := returned[peerID]; !exists || peerID == containers[index].ID {
+				pruned = true
+				continue
+			}
+			peers = append(peers, peerID)
+		}
+		containers[index].PeerContainerIDs = peers
+	}
+	return pruned
 }
 
 type metricTemplate struct{ id, gap string }
@@ -496,6 +559,7 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 			}
 		}
 	}
+	linkMappedContainerPeers(containers)
 	ordered := make([]Container, 0, len(containers))
 	for _, container := range containers {
 		container.OOMWindowObservations = summarizeOOMWindows(*container, request, result)
@@ -534,6 +598,37 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 	}
 	sort.Slice(ordered, func(left, right int) bool { return ordered[left].ID < ordered[right].ID })
 	return ordered
+}
+
+func linkMappedContainerPeers(containers map[string]*Container) {
+	type peerGroupKey struct {
+		hostID         string
+		service        string
+		mappingVersion int
+	}
+	groups := make(map[peerGroupKey][]*Container)
+	for _, container := range containers {
+		if container.MappingStatus != "explicit_mapping" || container.Service == "" || container.MappingVersion < 1 {
+			continue
+		}
+		key := peerGroupKey{hostID: container.HostID, service: container.Service, mappingVersion: container.MappingVersion}
+		groups[key] = append(groups[key], container)
+	}
+	for _, group := range groups {
+		if len(group) < 2 {
+			continue
+		}
+		for _, container := range group {
+			peers := make([]string, 0, len(group)-1)
+			for _, candidate := range group {
+				if candidate.ID != container.ID {
+					peers = append(peers, candidate.ID)
+				}
+			}
+			sort.Strings(peers)
+			container.PeerContainerIDs = peers
+		}
+	}
 }
 
 func normalizeEvents(result loki.Result, request Request, containers []Container) []Event {
@@ -683,4 +778,52 @@ func measurementDelay(samples []prometheus.Sample, end time.Time) time.Duration 
 func opaqueIdentity(raw string) string {
 	digest := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(digest[:8])
+}
+
+func prometheusCollectionFailureCode(err error) CollectionFailureCode {
+	switch {
+	case prometheus.IsErrorCategory(err, prometheus.ErrorTimeout):
+		return CollectionFailureTimeout
+	case prometheus.IsErrorCategory(err, prometheus.ErrorRateLimited):
+		return CollectionFailureRateLimited
+	case prometheus.IsErrorCategory(err, prometheus.ErrorUnauthorized):
+		return CollectionFailurePermissionDenied
+	case prometheus.IsErrorCategory(err, prometheus.ErrorInvalidResponse),
+		prometheus.IsErrorCategory(err, prometheus.ErrorResponseTooLarge):
+		return CollectionFailureInvalidResponse
+	case prometheus.IsErrorCategory(err, prometheus.ErrorPolicyRejected),
+		prometheus.IsErrorCategory(err, prometheus.ErrorInvalidQuery):
+		return CollectionFailureRequestRejected
+	case prometheus.IsErrorCategory(err, prometheus.ErrorNetwork),
+		prometheus.IsErrorCategory(err, prometheus.ErrorRemoteUnavailable),
+		prometheus.IsErrorCategory(err, prometheus.ErrorSecretUnavailable):
+		return CollectionFailureUnavailable
+	default:
+		return CollectionFailureUnknown
+	}
+}
+
+func lokiCollectionFailureCode(err error) CollectionFailureCode {
+	switch {
+	case loki.IsErrorCategory(err, loki.ErrorTimeout):
+		return CollectionFailureTimeout
+	case loki.IsErrorCategory(err, loki.ErrorRateLimited):
+		return CollectionFailureRateLimited
+	case loki.IsErrorCategory(err, loki.ErrorUnauthorized):
+		return CollectionFailurePermissionDenied
+	case loki.IsErrorCategory(err, loki.ErrorInvalidResponse),
+		loki.IsErrorCategory(err, loki.ErrorResponseTooLarge):
+		return CollectionFailureInvalidResponse
+	case loki.IsErrorCategory(err, loki.ErrorPolicyRejected),
+		loki.IsErrorCategory(err, loki.ErrorInvalidQuery),
+		loki.IsErrorCategory(err, loki.ErrorInvalidCursor),
+		loki.IsErrorCategory(err, loki.ErrorCursorExpired):
+		return CollectionFailureRequestRejected
+	case loki.IsErrorCategory(err, loki.ErrorNetwork),
+		loki.IsErrorCategory(err, loki.ErrorRemoteUnavailable),
+		loki.IsErrorCategory(err, loki.ErrorSecretUnavailable):
+		return CollectionFailureUnavailable
+	default:
+		return CollectionFailureUnknown
+	}
 }

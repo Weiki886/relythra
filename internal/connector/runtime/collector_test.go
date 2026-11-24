@@ -2,7 +2,11 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +91,190 @@ func TestQueryKeepsContainerInstancesSeparateAndMarksUnmappedEvidence(t *testing
 	}
 }
 
+func TestQueryRecordsPerTemplateCollectionFailures(t *testing.T) {
+	metrics := &fakeMetrics{
+		series: map[string][]prometheus.Series{
+			"prometheus.runtime.host.cpu.v1": {hostSeries("host-a", 2.5)},
+		},
+		errorsByTemplate: map[string]error{
+			"prometheus.runtime.host.memory_available.v1": &prometheus.QueryError{Category: prometheus.ErrorTimeout},
+		},
+	}
+	logs := &fakeLogs{err: &loki.QueryError{Category: loki.ErrorUnauthorized}}
+	collector, err := NewCollector(metrics, logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := collector.Query(context.Background(), Target{}, validRequest(nil))
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if !result.Partial || len(result.Failures) != 2 {
+		t.Fatalf("partial failures = %+v, want two bounded failures", result)
+	}
+	want := []CollectionFailure{
+		{SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.memory_available.v1", TemplateVersion: 1, ReasonCode: CollectionFailureTimeout},
+		{SourceType: "LOKI", TemplateID: "loki.container.restarts.v1", TemplateVersion: 1, ReasonCode: CollectionFailurePermissionDenied},
+	}
+	if !reflect.DeepEqual(result.Failures, want) {
+		t.Fatalf("failures = %+v, want %+v", result.Failures, want)
+	}
+	if len(result.Hosts) != 1 || result.Hosts[0].CPU.Empty {
+		t.Fatalf("successful host evidence was not retained: %+v", result.Hosts)
+	}
+	encoded, err := json.Marshal(result.Failures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "sensitive") || strings.Contains(string(encoded), "token") {
+		t.Fatalf("raw error escaped into failure metadata: %s", encoded)
+	}
+}
+
+func TestQueryMapsUnclassifiedCollectionFailureToUnknown(t *testing.T) {
+	metrics := &fakeMetrics{err: errors.New("sensitive endpoint and token must not escape")}
+	collector, err := NewCollector(metrics, &fakeLogs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := collector.Query(context.Background(), Target{}, validRequest(nil))
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(result.Failures) != len(runtimeMetricTemplates) {
+		t.Fatalf("failures = %+v, want one entry per failed Prometheus template", result.Failures)
+	}
+	for _, failure := range result.Failures {
+		if failure.ReasonCode != CollectionFailureUnknown {
+			t.Fatalf("failure = %+v, want unknown reason", failure)
+		}
+	}
+}
+
+func TestQueryCancellationDoesNotBecomeCollectionFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	metrics := &fakeMetrics{}
+	logs := &fakeLogs{}
+	collector, err := NewCollector(metrics, logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := collector.Query(ctx, Target{}, validRequest(nil))
+	if !errors.Is(err, context.Canceled) || len(result.Failures) != 0 || metrics.calls != 0 || logs.calls != 0 {
+		t.Fatalf("result=%+v err=%v metric_calls=%d log_calls=%d", result, err, metrics.calls, logs.calls)
+	}
+}
+
+func TestQueryLinksOnlyExplicitlyMappedContainersAsPeers(t *testing.T) {
+	firstCPU := metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1)
+	secondCPU := metricSeries("cgroup-b", "host-a", "raw_cgroup_only", 2)
+	thirdCPU := metricSeries("cgroup-z", "host-a", "raw_cgroup_only", 5)
+	unmappedCPU := metricSeries("cgroup-c", "host-a", "raw_cgroup_only", 3)
+	foreignCPU := metricSeries("cgroup-d", "host-b", "raw_cgroup_only", 4)
+	// Exporter labels alone do not establish a trusted service identity.
+	unmappedCPU.Labels["container_label_com_docker_compose_service"] = "checkout-api"
+	metrics := &fakeMetrics{series: map[string][]prometheus.Series{
+		"prometheus.runtime.container.cpu.v1":        {firstCPU, secondCPU, thirdCPU, unmappedCPU, foreignCPU},
+		"prometheus.runtime.container.memory.v1":     {firstCPU, secondCPU, thirdCPU, unmappedCPU, foreignCPU},
+		"prometheus.runtime.container.oom_events.v1": {},
+	}}
+	collector, err := NewCollector(metrics, &fakeLogs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validRequest(nil)
+	request.MappingVersion = 3
+	request.ContainerMappings = []datasource.RuntimeContainerMapping{
+		{HostID: "host-a", CgroupID: "cgroup-a"},
+		{HostID: "host-a", CgroupID: "cgroup-b"},
+		{HostID: "host-a", CgroupID: "cgroup-z"},
+		{HostID: "host-b", CgroupID: "cgroup-d"},
+	}
+	result, err := collector.Query(context.Background(), Target{}, request)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(result.Containers) != 4 {
+		t.Fatalf("containers = %+v", result.Containers)
+	}
+	var mapped []Container
+	for _, container := range result.Containers {
+		if container.MappingStatus == "explicit_mapping" {
+			mapped = append(mapped, container)
+			continue
+		}
+		if container.Service != "" || len(container.PeerContainerIDs) != 0 {
+			t.Fatalf("unmapped cgroup gained a trusted peer identity: %+v", container)
+		}
+	}
+	if len(mapped) != 3 {
+		t.Fatalf("mapped containers = %+v", mapped)
+	}
+	for i, container := range mapped {
+		wantPeers := make([]string, 0, len(mapped)-1)
+		for j, candidate := range mapped {
+			if i != j {
+				wantPeers = append(wantPeers, candidate.ID)
+			}
+		}
+		slices.Sort(wantPeers)
+		if container.MappingVersion != request.MappingVersion || container.State != "observed" ||
+			!slices.Equal(container.PeerContainerIDs, wantPeers) {
+			t.Fatalf("container %s peers/state = %v/%s, want %v/observed at mapping version %d", container.ID, container.PeerContainerIDs, container.State, wantPeers, request.MappingVersion)
+		}
+	}
+}
+
+func TestQueryTruncatesPeerReferencesWithContainerBudget(t *testing.T) {
+	series := []prometheus.Series{
+		metricSeries("cgroup-a", "host-a", "raw_cgroup_only", 1),
+		metricSeries("cgroup-b", "host-a", "raw_cgroup_only", 2),
+		metricSeries("cgroup-c", "host-a", "raw_cgroup_only", 3),
+	}
+	metrics := &fakeMetrics{series: map[string][]prometheus.Series{
+		"prometheus.runtime.container.cpu.v1":    series,
+		"prometheus.runtime.container.memory.v1": series,
+	}}
+	collector, err := NewCollector(metrics, &fakeLogs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validRequest(nil)
+	request.MappingVersion = 4
+	request.MaxSeries = 2
+	request.ContainerMappings = []datasource.RuntimeContainerMapping{
+		{HostID: "host-a", CgroupID: "cgroup-a"},
+		{HostID: "host-a", CgroupID: "cgroup-b"},
+		{HostID: "host-a", CgroupID: "cgroup-c"},
+	}
+
+	result, err := collector.Query(context.Background(), Target{}, request)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(result.Containers) != request.MaxSeries || !result.Partial ||
+		!containsGap(result.Gaps, "runtime_entities_truncated") || !containsGap(result.Gaps, "runtime_peer_links_truncated") {
+		t.Fatalf("container budget was not reported: %+v", result)
+	}
+
+	returned := make(map[string]struct{}, len(result.Containers))
+	for _, container := range result.Containers {
+		returned[container.ID] = struct{}{}
+	}
+	for _, container := range result.Containers {
+		if len(container.PeerContainerIDs) != 1 {
+			t.Fatalf("container %s peers = %v, want the other returned instance", container.ID, container.PeerContainerIDs)
+		}
+		for _, peerID := range container.PeerContainerIDs {
+			if _, exists := returned[peerID]; !exists || peerID == container.ID {
+				t.Fatalf("container %s has peer %s outside the returned result: %+v", container.ID, peerID, result.Containers)
+			}
+		}
+	}
+}
+
 func TestQueryMapsOnlyExactHostAndCgroupUsingVersionedAdminMapping(t *testing.T) {
 	metrics := &fakeMetrics{series: map[string][]prometheus.Series{
 		"prometheus.runtime.container.cpu.v1": {
@@ -167,7 +355,8 @@ func TestQueryDoesNotReportServiceMappingGapWhenAllContainersAreExplicitlyMapped
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	if len(result.Containers) != 1 || result.Containers[0].MappingStatus != "explicit_mapping" || containsGap(result.Gaps, "container_service_mapping_unavailable") {
+	if len(result.Containers) != 1 || result.Containers[0].MappingStatus != "explicit_mapping" ||
+		len(result.Containers[0].PeerContainerIDs) != 0 || containsGap(result.Gaps, "container_service_mapping_unavailable") {
 		t.Fatalf("mapped result still reports missing mapping: %+v", result)
 	}
 }
@@ -280,13 +469,17 @@ func TestQueryDoesNotTrustMappedLabelsWithoutIdentityContract(t *testing.T) {
 }
 
 type fakeMetrics struct {
-	calls  int
-	series map[string][]prometheus.Series
-	err    error
+	calls            int
+	series           map[string][]prometheus.Series
+	err              error
+	errorsByTemplate map[string]error
 }
 
 func (fake *fakeMetrics) Query(_ context.Context, _ prometheus.Target, query datasource.NormalizedQuery) (prometheus.Result, error) {
 	fake.calls++
+	if err := fake.errorsByTemplate[query.TemplateID]; err != nil {
+		return prometheus.Result{}, err
+	}
 	if fake.err != nil {
 		return prometheus.Result{}, fake.err
 	}
@@ -298,9 +491,12 @@ func (fake *fakeMetrics) Query(_ context.Context, _ prometheus.Target, query dat
 }
 
 type fakeLogs struct {
-	calls   int
-	entries []loki.Entry
-	err     error
+	calls      int
+	entries    []loki.Entry
+	err        error
+	partial    bool
+	timeSkew   bool
+	nextCursor string
 }
 
 func (fake *fakeLogs) Query(_ context.Context, _ loki.Target, query datasource.NormalizedQuery) (loki.Result, error) {
@@ -310,7 +506,8 @@ func (fake *fakeLogs) Query(_ context.Context, _ loki.Target, query datasource.N
 	}
 	return loki.Result{
 		TemplateID: query.TemplateID, SourceReference: "http://loki.example.test/explore",
-		Entries: fake.entries, Empty: len(fake.entries) == 0,
+		Entries: fake.entries, NextCursor: fake.nextCursor, Empty: len(fake.entries) == 0,
+		Partial: fake.partial, TimeSkew: fake.timeSkew,
 	}, nil
 }
 
@@ -436,6 +633,61 @@ func TestQueryCorrelatesLifecycleEventOnlyByExplicitCgroupMapping(t *testing.T) 
 		if event.ContainerID == "cgroup-a" || event.ContainerID == "cgroup-b" {
 			t.Fatalf("raw cgroup identifier escaped in event: %+v", event)
 		}
+	}
+}
+
+func TestQuerySurfacesLifecycleLogCollectionGaps(t *testing.T) {
+	request := validRequest(nil)
+	baseEntry := loki.Entry{
+		Timestamp: request.End.Add(-time.Minute),
+		Labels:    map[string]string{"host_id": request.HostID, "service": request.Service, "env": request.Environment},
+	}
+	cases := []struct {
+		name   string
+		mutate func(*fakeLogs, *loki.Entry)
+		gap    string
+	}{
+		{
+			name:   "partial result",
+			mutate: func(logs *fakeLogs, _ *loki.Entry) { logs.partial = true },
+			gap:    "container_lifecycle_events_truncated",
+		},
+		{
+			name:   "continuation cursor",
+			mutate: func(logs *fakeLogs, _ *loki.Entry) { logs.nextCursor = "opaque-next-page" },
+			gap:    "container_lifecycle_events_truncated",
+		},
+		{
+			name:   "clock skew",
+			mutate: func(logs *fakeLogs, _ *loki.Entry) { logs.timeSkew = true },
+			gap:    "container_lifecycle_events_time_skewed",
+		},
+		{
+			name:   "outside query window",
+			mutate: func(_ *fakeLogs, entry *loki.Entry) { entry.OutsideTimeWindow = true },
+			gap:    "container_lifecycle_events_outside_window",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			entry := baseEntry
+			logs := &fakeLogs{entries: []loki.Entry{entry}}
+			testCase.mutate(logs, &logs.entries[0])
+			collector, err := NewCollector(&fakeMetrics{}, logs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := collector.Query(context.Background(), Target{}, request)
+			if err != nil {
+				t.Fatalf("Query: %v", err)
+			}
+			if !result.Partial || !containsGap(result.Gaps, "container_lifecycle_events_unverified") || !containsGap(result.Gaps, testCase.gap) {
+				t.Fatalf("lifecycle gaps = %v", result.Gaps)
+			}
+			if len(result.Events) != 1 || result.Events[0].Classification != "unverified_log_match" {
+				t.Fatalf("lifecycle event = %+v", result.Events)
+			}
+		})
 	}
 }
 
