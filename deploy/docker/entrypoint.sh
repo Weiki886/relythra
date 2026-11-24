@@ -5,9 +5,12 @@ source_database_secret=/run/secrets/postgres_password
 runtime_database_secret=/run/relythra-secrets/postgres_password
 source_management_secret=/run/secrets/management_token
 runtime_management_secret=/run/relythra-secrets/management_token
+source_grafana_secret=/run/secrets/grafana_webhook_secret
+runtime_grafana_secret=/run/relythra-secrets/grafana_webhook_secret
 
 if [ "${RELYTHRA_DATABASE_PASSWORD_REF:-}" = "file:${source_database_secret}" ] ||
-   [ "${RELYTHRA_ADMIN_TOKEN_REF:-}" = "file:${source_management_secret}" ]; then
+   [ "${RELYTHRA_ADMIN_TOKEN_REF:-}" = "file:${source_management_secret}" ] ||
+   [ "${RELYTHRA_GRAFANA_WEBHOOK_SECRET_REF:-}" = "file:${source_grafana_secret}" ]; then
   mkdir -p /run/relythra-secrets
   chown root:relythra /run/relythra-secrets
   chmod 0710 /run/relythra-secrets
@@ -25,6 +28,13 @@ if [ "${RELYTHRA_ADMIN_TOKEN_REF:-}" = "file:${source_management_secret}" ]; the
   chown relythra:relythra "${runtime_management_secret}"
   chmod 0440 "${runtime_management_secret}"
   export RELYTHRA_ADMIN_TOKEN_REF="file:${runtime_management_secret}"
+fi
+
+if [ "${RELYTHRA_GRAFANA_WEBHOOK_SECRET_REF:-}" = "file:${source_grafana_secret}" ]; then
+  cp "${source_grafana_secret}" "${runtime_grafana_secret}"
+  chown relythra:relythra "${runtime_grafana_secret}"
+  chmod 0440 "${runtime_grafana_secret}"
+  export RELYTHRA_GRAFANA_WEBHOOK_SECRET_REF="file:${runtime_grafana_secret}"
 fi
 
 if [ -d /var/log/demo ]; then

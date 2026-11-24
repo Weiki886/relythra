@@ -22,6 +22,12 @@ This slice does not trigger Prometheus, Loki, GitHub or Runtime collection after
 - `make demo-smoke` starts an isolated stack, provisions project/service fixtures, stops the demo inventory target, waits for a signed Grafana notification to persist, restores inventory, verifies the RESOLVED transition in the same Investigation and finishes existing telemetry/isolation checks.
 - Run `make check`, Gitleaks and `git diff --check`, then check required remote CI.
 
+## Linux Secret permissions regression
+
+The first remote Compose run failed during API startup because the mounted HMAC Secret retained mode 0600 under Linux. Reproducing a root-owned 0600 Secret inside an isolated container yielded the same resolution error. Extend the existing bootstrap staging used for database and management Secrets to copy the HMAC Secret into the private runtime directory, assign UID/GID 10001 and mode 0440, update its file reference, then drop privileges. The demo smoke also checks the API process UID and the staged Secret owner/mode.
+
+Validate the bootstrap using the cached image with the updated entrypoint mounted read-only, verify API liveness and staged file permissions under UID 10001, and run the complete required remote CI on the new commit.
+
 ## Rollback
 
 Revert the API verifier, Grafana provisioning files, smoke assertions and documentation. No migration or persistent production data changes are added.

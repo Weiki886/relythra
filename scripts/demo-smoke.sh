@@ -91,9 +91,10 @@ DEMO_ENABLE_FAULTS=false \
 stage="slow SQL recovery telemetry assertions"
 python3 scripts/demo-assert.py slow-sql-recovered
 stage="container identity and database isolation assertions"
-for service in inventory orders; do
+for service in api inventory orders; do
   test "$("${COMPOSE[@]}" exec -T "$service" awk '$1 == "Uid:" { print $2 }' /proc/1/status)" = "10001"
 done
+test "$("${COMPOSE[@]}" exec -T api stat -c '%a:%u:%g' /run/relythra-secrets/grafana_webhook_secret)" = "440:10001:10001"
 test "$("${COMPOSE[@]}" exec -T grafana awk '$1 == "Uid:" { print $2 }' /proc/1/status)" = "472"
 # SQL grants, not only default_transaction_read_only, must prevent writes.
 "${COMPOSE[@]}" exec -T demo-postgres psql -U demo_owner -d demo -v ON_ERROR_STOP=1 <<'SQL'
