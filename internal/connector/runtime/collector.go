@@ -570,7 +570,6 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 			}
 		}
 	}
-	linkMappedContainerPeers(containers)
 	// Retain configured identities with no returned series as unknown coverage,
 	// without claiming the mapped workload is present or has exited.
 	for _, mapping := range request.ContainerMappings {
@@ -593,6 +592,7 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 		result.Gaps = append(result.Gaps, "mapped_container_metrics_missing")
 		result.Partial = true
 	}
+	linkMappedContainerPeers(containers)
 	ordered := make([]Container, 0, len(containers))
 	for _, container := range containers {
 		container.OOMWindowObservations = summarizeOOMWindows(*container, request, result)

@@ -406,8 +406,16 @@ func TestQueryPreservesMappedContainersWithNoTelemetryAsUnknown(t *testing.T) {
 	}
 	if missing.HostID != "host-a" || missing.Service != request.Service || missing.MappingVersion != request.MappingVersion ||
 		missing.MappingStatus != "explicit_mapping" || missing.State != "unknown" || missing.ClockSkew ||
-		missing.InstanceID != "" || missing.StartTime != nil || len(missing.PeerContainerIDs) != 0 {
+		missing.InstanceID != "" || missing.StartTime != nil || len(missing.PeerContainerIDs) != len(result.Containers)-1 {
 		t.Fatalf("missing telemetry was promoted to an observed runtime state: %+v", missing)
+	}
+	for _, container := range result.Containers {
+		if container.ID == missing.ID {
+			continue
+		}
+		if !slices.Contains(missing.PeerContainerIDs, container.ID) || !slices.Contains(container.PeerContainerIDs, missing.ID) {
+			t.Errorf("mapped peer relationship is not symmetric for %q and %q: %+v / %+v", missing.ID, container.ID, missing.PeerContainerIDs, container.PeerContainerIDs)
+		}
 	}
 	for name, measurement := range map[string]Measurement{
 		"cpu": missing.CPU, "memory": missing.Memory, "oom": missing.OOMEvents, "start": missing.StartEvidence,

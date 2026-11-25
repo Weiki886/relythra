@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Weiki886/relythra/internal/connector/loki"
 	"github.com/Weiki886/relythra/internal/connector/prometheus"
 	runtimeconnector "github.com/Weiki886/relythra/internal/connector/runtime"
 	"github.com/Weiki886/relythra/internal/datasource"
@@ -33,6 +34,61 @@ func runtimeObservation() (runtimeconnector.Result, RuntimeEvidenceContext) {
 		Events:     []runtimeconnector.Event{{Timestamp: start.Add(2 * time.Minute), Classification: "unverified_log_match", SourceReference: "https://loki.example.test/loki/api/v1/query_range", Line: redact.UntrustedData{Trust: "untrusted_data", Source: "loki", Content: "restart requested", OriginalBytes: 17}}},
 		Gaps:       []string{"container_service_mapping_unavailable", "healthy_peer_evidence_unavailable", "exporter_scrape_freshness_unavailable", "container_lifecycle_events_unverified"}, Partial: true,
 	}, RuntimeEvidenceContext{InvestigationID: investigationID, ToolCallID: "55555555-5555-4555-8555-555555555555", CollectedAt: start.Add(6 * time.Minute)}
+}
+
+type mappedPeerMetricsFixture struct {
+	observedAt time.Time
+}
+
+func (fixture mappedPeerMetricsFixture) Query(_ context.Context, _ prometheus.Target, query datasource.NormalizedQuery) (prometheus.Result, error) {
+	series := []prometheus.Series{}
+	switch query.TemplateID {
+	case "prometheus.runtime.host.cpu.v1":
+		series = []prometheus.Series{{Labels: map[string]string{"host_id": "host-1"}, Samples: []prometheus.Sample{{Timestamp: fixture.observedAt, Value: 0.4}}}}
+	case "prometheus.runtime.host.memory_available.v1":
+		series = []prometheus.Series{{Labels: map[string]string{"host_id": "host-1"}, Samples: []prometheus.Sample{{Timestamp: fixture.observedAt, Value: 2048}}}}
+	case "prometheus.runtime.host.load.v1":
+		series = []prometheus.Series{{Labels: map[string]string{"host_id": "host-1"}, Samples: []prometheus.Sample{{Timestamp: fixture.observedAt, Value: 1}}}}
+	case "prometheus.runtime.container.cpu.v1":
+		series = []prometheus.Series{{Labels: map[string]string{"id": "cgroup-observed", "host_id": "host-1"}, Samples: []prometheus.Sample{{Timestamp: fixture.observedAt, Value: 0.1}}}}
+	case "prometheus.runtime.container.memory.v1":
+		series = []prometheus.Series{{Labels: map[string]string{"id": "cgroup-observed", "host_id": "host-1"}, Samples: []prometheus.Sample{{Timestamp: fixture.observedAt, Value: 1024}}}}
+	}
+	return prometheus.Result{TemplateID: query.TemplateID, SourceReference: "https://prometheus.example.test/query", Series: series}, nil
+}
+
+type mappedPeerLogsFixture struct{}
+
+func (mappedPeerLogsFixture) Query(_ context.Context, _ loki.Target, query datasource.NormalizedQuery) (loki.Result, error) {
+	return loki.Result{TemplateID: query.TemplateID, SourceReference: "https://loki.example.test/query", Entries: []loki.Entry{}, Empty: true}, nil
+}
+
+func TestFromRuntimeResultAcceptsMixedObservedAndMissingMappedContainers(t *testing.T) {
+	start := time.Date(2026, 11, 10, 1, 0, 0, 0, time.UTC)
+	collector, err := runtimeconnector.NewCollector(mappedPeerMetricsFixture{observedAt: start.Add(time.Minute)}, mappedPeerLogsFixture{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := runtimeconnector.Request{
+		Runtime: datasource.RuntimeDockerCompose, Service: "checkout", Environment: "demo", HostID: "host-1", MappingVersion: 3,
+		ContainerMappings: []datasource.RuntimeContainerMapping{{HostID: "host-1", CgroupID: "cgroup-observed"}, {HostID: "host-1", CgroupID: "cgroup-missing"}},
+		Start:             start, End: start.Add(5 * time.Minute), Step: time.Minute,
+	}
+	result, err := collector.Query(context.Background(), runtimeconnector.Target{}, request)
+	if err != nil {
+		t.Fatalf("runtime Query: %v", err)
+	}
+	if len(result.Containers) != 2 {
+		t.Fatalf("containers=%+v, want observed and mapped-missing identities", result.Containers)
+	}
+	filter, err := redact.NewFilter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := RuntimeEvidenceContext{InvestigationID: investigationID, ToolCallID: "55555555-5555-4555-8555-555555555555", CollectedAt: start.Add(6 * time.Minute)}
+	if records, err := FromRuntimeResult(context.Background(), result, meta, filter); err != nil || len(records) != 8 {
+		t.Fatalf("FromRuntimeResult returned %d records, error %v; mapped peers: %+v", len(records), err, result.Containers)
+	}
 }
 
 var expectedRuntimeTemplates = []string{
