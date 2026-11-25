@@ -129,6 +129,11 @@ func (repository *Postgres) RemapGrafanaAlert(
 			return GrafanaAlertResult{}, fmt.Errorf("update remapped Grafana investigation ownership: %w", err)
 		}
 		result.InvestigationID = investigationID
+		if updated.Status == "FIRING" {
+			if err := enqueueInvestigationCollectionJobTx(ctx, tx, investigationID); err != nil {
+				return GrafanaAlertResult{}, fmt.Errorf("enqueue remapped Grafana investigation collection: %w", err)
+			}
+		}
 		if _, _, err := persistGrafanaAlertEvidenceTx(ctx, tx, updated.ID, GrafanaAlertEvidenceContext{
 			InvestigationID: investigationID,
 			CollectedAt:     time.Now().UTC(),
@@ -403,6 +408,9 @@ func ingestOneGrafanaAlert(
 			return GrafanaAlertResult{}, fmt.Errorf("create or find Grafana investigation: %w", err)
 		}
 		result.InvestigationID = investigationID
+		if err := enqueueInvestigationCollectionJobTx(ctx, tx, investigationID); err != nil {
+			return GrafanaAlertResult{}, fmt.Errorf("enqueue Grafana investigation collection: %w", err)
+		}
 		rows, err := tx.QueryContext(ctx, `
 			SELECT id::text FROM deployment_events
 			WHERE project_id = $1 AND service_id = $2 AND environment = $3
@@ -445,6 +453,18 @@ func ingestOneGrafanaAlert(
 		result.DeploymentCount = len(deploymentIDs)
 	}
 	return result, nil
+}
+
+func enqueueInvestigationCollectionJobTx(ctx context.Context, tx *sql.Tx, investigationID string) error {
+	if !domain.IsID(investigationID) {
+		return ErrInvalidInput
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO investigation_collection_jobs (investigation_id)
+		VALUES ($1)
+		ON CONFLICT (investigation_id) DO NOTHING
+	`, investigationID)
+	return err
 }
 
 func validRequestID(value string) bool {

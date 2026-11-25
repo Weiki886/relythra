@@ -334,6 +334,9 @@ func TestPersistGrafanaAlertEvidenceSnapshotsAndOwnership(t *testing.T) {
 		t.Fatalf("writes=%d %v", count, err)
 	}
 	// A downgrade may not erase or relabel immutable Grafana history.
+	if err := goose.DownContext(ctx, db, "."); err != nil {
+		t.Fatalf("roll back empty collection-job migration before Grafana evidence guard: %v", err)
+	}
 	if err := goose.DownContext(ctx, db, "."); err == nil || !strings.Contains(err.Error(), "immutable GRAFANA") {
 		t.Fatalf("rollback guard=%v", err)
 	}
@@ -344,5 +347,96 @@ func TestPersistGrafanaAlertEvidenceSnapshotsAndOwnership(t *testing.T) {
 	}
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM evidence WHERE source_type='GRAFANA'`).Scan(&count); err != nil || count != 2 {
 		t.Fatalf("preserved=%d %v", count, err)
+	}
+}
+
+func TestGrafanaFiringEnqueuesCollectionJobOnceAndAfterMapping(t *testing.T) {
+	db := openStoreTestDB(t)
+	ctx := context.Background()
+	fixture := insertStoreFixture(t, ctx, db, "grafana-collection-job")
+	repository := NewPostgres(db)
+	filter := mustGrafanaEvidenceFilter(t)
+
+	mapped := fixtureAlertInput(fixture, "collection-job-firing")
+	mapped.ProjectSlug = "grafana-collection-job"
+	first, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{mapped}, "collection-job-firing-1", filter)
+	if err != nil {
+		t.Fatalf("ingest mapped firing alert: %v", err)
+	}
+	if len(first) != 1 || first[0].InvestigationID == "" {
+		t.Fatalf("mapped firing result = %+v, want investigation", first)
+	}
+	assertCollectionJobCount(t, ctx, db, first[0].InvestigationID, 1, "PENDING")
+
+	if _, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{mapped}, "collection-job-firing-2", filter); err != nil {
+		t.Fatalf("repeat mapped firing alert: %v", err)
+	}
+	assertCollectionJobCount(t, ctx, db, first[0].InvestigationID, 1, "PENDING")
+
+	resolved := fixtureAlertInput(fixture, "collection-job-resolved-first")
+	resolved.ProjectSlug = "grafana-collection-job"
+	resolved.Status = "RESOLVED"
+	endedAt := fixture.startedAt.Add(time.Minute)
+	resolved.EndsAt = &endedAt
+	resolvedResult, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{resolved}, "collection-job-resolved", filter)
+	if err != nil {
+		t.Fatalf("ingest resolved alert: %v", err)
+	}
+	if len(resolvedResult) != 1 || resolvedResult[0].InvestigationID != "" {
+		t.Fatalf("resolved result = %+v, want no investigation", resolvedResult)
+	}
+
+	unmapped := fixtureAlertInput(fixture, "collection-job-unmapped")
+	unmapped.ProjectSlug = "grafana-collection-job"
+	unmapped.ServiceSlug = "missing-service"
+	unmappedResult, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{unmapped}, "collection-job-unmapped", filter)
+	if err != nil {
+		t.Fatalf("ingest unmapped firing alert: %v", err)
+	}
+	if len(unmappedResult) != 1 || unmappedResult[0].InvestigationID != "" || unmappedResult[0].MatchState != "NEEDS_MAPPING" {
+		t.Fatalf("unmapped result = %+v, want no investigation until remap", unmappedResult)
+	}
+	remapped, err := repository.RemapGrafanaAlert(ctx, unmappedResult[0].Alert.ID, unmappedResult[0].Alert.EventVersion, fixture.serviceID, "prod", filter)
+	if err != nil {
+		t.Fatalf("remap unmapped firing alert: %v", err)
+	}
+	if remapped.InvestigationID == "" {
+		t.Fatalf("remapped result = %+v, want investigation", remapped)
+	}
+	assertCollectionJobCount(t, ctx, db, remapped.InvestigationID, 1, "PENDING")
+
+	validRollback := fixtureAlertInput(fixture, "collection-job-rollback")
+	validRollback.ProjectSlug = "grafana-collection-job"
+	invalidRollback := fixtureAlertInput(fixture, "collection-job-invalid")
+	invalidRollback.ProjectSlug = "missing-project"
+	if _, err := repository.IngestGrafanaAlerts(ctx, []GrafanaAlertInput{validRollback, invalidRollback}, "collection-job-rollback", filter); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("batch rollback error = %v, want ErrNotFound", err)
+	}
+	var rollbackCount int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM investigation_collection_jobs jobs
+		JOIN investigations investigations ON investigations.id = jobs.investigation_id
+		JOIN incidents incidents ON incidents.id = investigations.incident_id
+		JOIN alerts alerts ON alerts.id = incidents.alert_id
+		WHERE alerts.fingerprint = $1
+	`, validRollback.Fingerprint).Scan(&rollbackCount); err != nil {
+		t.Fatalf("count rolled-back collection jobs: %v", err)
+	}
+	if rollbackCount != 0 {
+		t.Fatalf("rolled-back collection jobs = %d, want 0", rollbackCount)
+	}
+}
+
+func assertCollectionJobCount(t *testing.T, ctx context.Context, db *sql.DB, investigationID string, want int, wantStatus string) {
+	t.Helper()
+	var count int
+	var status string
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*), COALESCE(max(status), '') FROM investigation_collection_jobs WHERE investigation_id = $1
+	`, investigationID).Scan(&count, &status); err != nil {
+		t.Fatalf("read collection jobs: %v", err)
+	}
+	if count != want || (want > 0 && status != wantStatus) {
+		t.Fatalf("collection jobs count/status = %d/%q, want %d/%q", count, status, want, wantStatus)
 	}
 }
