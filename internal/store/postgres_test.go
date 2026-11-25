@@ -499,6 +499,18 @@ func TestIngestGrafanaAlertDeduplicatesConcurrentFingerprints(t *testing.T) {
 	if alertCount != 1 || incidentCount != 1 || investigationCount != 1 || deliveryCount != writers {
 		t.Fatalf("concurrent row counts alert/incident/investigation/delivery = %d/%d/%d/%d", alertCount, incidentCount, investigationCount, deliveryCount)
 	}
+	var collectionJobCount int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM investigation_collection_jobs jobs
+		JOIN investigations investigations ON investigations.id = jobs.investigation_id
+		JOIN incidents incidents ON incidents.id = investigations.incident_id
+		WHERE incidents.alert_id = $1
+	`, stableID).Scan(&collectionJobCount); err != nil {
+		t.Fatalf("count concurrent collection jobs: %v", err)
+	}
+	if collectionJobCount != 1 {
+		t.Fatalf("concurrent collection jobs = %d, want 1", collectionJobCount)
+	}
 }
 
 func TestRemapGrafanaAlertUsesVersionAndCreatesInvestigation(t *testing.T) {

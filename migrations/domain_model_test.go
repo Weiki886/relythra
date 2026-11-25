@@ -68,8 +68,13 @@ func TestDomainSchemaMigratesAndRollsBack(t *testing.T) {
 	assertDeploymentIngestionSchema(t, ctx, db, schema)
 	assertGrafanaAlertIngestionSchema(t, ctx, db, schema)
 	assertEvidenceObservationSchema(t, ctx, db, schema)
+	assertInvestigationCollectionJobSchema(t, ctx, db, schema)
 
 	assertGrafanaEvidenceSource(t, ctx, db, true)
+	if err := goose.DownContext(ctx, db, "."); err != nil {
+		t.Fatalf("roll back Investigation collection jobs migration: %v", err)
+	}
+	assertInvestigationCollectionJobRolledBack(t, ctx, db, schema)
 	if err := goose.DownContext(ctx, db, "."); err != nil {
 		t.Fatalf("roll back Grafana Evidence source migration: %v", err)
 	}
@@ -132,6 +137,7 @@ func TestDomainSchemaMigratesAndRollsBack(t *testing.T) {
 		"deployment_event_updates",
 		"deployment_webhook_signatures",
 		"alert_deliveries",
+		"investigation_collection_jobs",
 		"hypothesis_evidence",
 		"audit_events",
 	} {
@@ -155,6 +161,7 @@ func TestDomainSchemaMigratesAndRollsBack(t *testing.T) {
 		"audit_events_reject_mutation",
 		"deployment_event_updates_reject_mutation",
 		"alert_deliveries_reject_mutation",
+		"investigation_collection_jobs_touch_updated_at",
 	} {
 		var count int
 		if err := db.QueryRowContext(ctx, `
@@ -178,6 +185,10 @@ func TestDomainSchemaMigratesAndRollsBack(t *testing.T) {
 	var count int
 
 	assertGrafanaEvidenceSource(t, ctx, db, true)
+	if err := goose.DownContext(ctx, db, "."); err != nil {
+		t.Fatalf("roll back Investigation collection jobs migration: %v", err)
+	}
+	assertInvestigationCollectionJobRolledBack(t, ctx, db, schema)
 	if err := goose.DownContext(ctx, db, "."); err != nil {
 		t.Fatalf("roll back Grafana Evidence source migration: %v", err)
 	}
@@ -743,5 +754,44 @@ func assertGrafanaEvidenceSource(t *testing.T, ctx context.Context, db *sql.DB, 
 	}
 	if strings.Contains(definition, "GRAFANA") != want {
 		t.Fatalf("GRAFANA allowed=%v want=%v: %s", !want, want, definition)
+	}
+}
+
+func assertInvestigationCollectionJobSchema(t *testing.T, ctx context.Context, db *sql.DB, schema string) {
+	t.Helper()
+	var count int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = 'investigation_collection_jobs'
+		  AND column_name IN ('id', 'investigation_id', 'status', 'attempt_count', 'available_at', 'locked_until', 'last_error_code')
+	`, schema).Scan(&count); err != nil {
+		t.Fatalf("check Investigation collection job columns: %v", err)
+	}
+	if count != 7 {
+		t.Fatalf("Investigation collection job columns = %d, want 7", count)
+	}
+	var uniqueCount int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM pg_constraint constraint_row
+		JOIN pg_class relation ON relation.oid = constraint_row.conrelid
+		JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+		WHERE namespace.nspname = $1 AND relation.relname = 'investigation_collection_jobs'
+		  AND constraint_row.contype = 'u'
+	`, schema).Scan(&uniqueCount); err != nil {
+		t.Fatalf("check Investigation collection job idempotency constraint: %v", err)
+	}
+	if uniqueCount != 1 {
+		t.Fatalf("Investigation collection job unique constraints = %d, want 1", uniqueCount)
+	}
+}
+
+func assertInvestigationCollectionJobRolledBack(t *testing.T, ctx context.Context, db *sql.DB, schema string) {
+	t.Helper()
+	var relation *string
+	if err := db.QueryRowContext(ctx, "SELECT to_regclass($1)::text", schema+".investigation_collection_jobs").Scan(&relation); err != nil {
+		t.Fatalf("check Investigation collection job rollback: %v", err)
+	}
+	if relation != nil {
+		t.Fatal("investigation_collection_jobs still exists after migration rollback")
 	}
 }
