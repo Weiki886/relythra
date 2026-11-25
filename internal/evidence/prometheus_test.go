@@ -73,6 +73,26 @@ func TestFromPrometheusResultNormalizesBoundedQueryEvidence(t *testing.T) {
 	}
 }
 
+func TestFromPrometheusResultPreservesSourceTimeZone(t *testing.T) {
+	filter, _ := redact.NewFilter()
+	result := validPrometheusResult()
+	zone := time.FixedZone("+08:00", 8*60*60)
+	result.Start = result.Start.In(zone)
+	result.End = result.End.In(zone)
+
+	record, err := FromPrometheusResult(context.Background(), result, validPrometheusEvidenceContext(), filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.SourceTimezone != "+08:00" || record.SourceTimeText != "2026-11-08T18:00:00+08:00/2026-11-08T18:05:00+08:00" {
+		t.Fatalf("source time metadata = %q / %q", record.SourceTimezone, record.SourceTimeText)
+	}
+	if record.ObservedStart.Location() != time.UTC || record.ObservedEnd.Location() != time.UTC ||
+		!record.ObservedStart.Equal(result.Start) || !record.ObservedEnd.Equal(result.End) {
+		t.Fatalf("normalized observation bounds = %s..%s", record.ObservedStart, record.ObservedEnd)
+	}
+}
+
 func TestFromPrometheusResultPreservesQueryQualityState(t *testing.T) {
 	filter, _ := redact.NewFilter()
 	base := validPrometheusResult()

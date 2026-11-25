@@ -80,6 +80,7 @@ func FromPrometheusResult(
 		age := int(metadata.CollectedAt.Sub(*result.LatestSampleAt) / time.Second)
 		freshnessSeconds = &age
 	}
+	sourceTimezone, sourceTimeText := sourceTimeMetadata(result.Start, result.End)
 	input := Input{
 		InvestigationID:   metadata.InvestigationID,
 		ToolCallID:        metadata.ToolCallID,
@@ -96,8 +97,8 @@ func FromPrometheusResult(
 		Completeness:      completeness,
 		FreshnessSeconds:  freshnessSeconds,
 		IndependenceGroup: fmt.Sprintf("prometheus:%s:v%d", result.TemplateID, result.TemplateVersion),
-		SourceTimezone:    "UTC",
-		SourceTimeText:    result.Start.UTC().Format(time.RFC3339Nano) + "/" + result.End.UTC().Format(time.RFC3339Nano),
+		SourceTimezone:    sourceTimezone,
+		SourceTimeText:    sourceTimeText,
 	}
 	return Normalize(ctx, input, filter)
 }

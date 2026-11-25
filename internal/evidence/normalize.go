@@ -93,6 +93,36 @@ type hashPayload struct {
 	SourceTimeText    string          `json:"source_time_text"`
 }
 
+func sourceTimeMetadata(start, end time.Time) (string, string) {
+	startTimezone := sourceTimezone(start)
+	endTimezone := sourceTimezone(end)
+	timezone := startTimezone
+	if startTimezone != endTimezone {
+		timezone = "mixed"
+	}
+	return timezone, start.Format(time.RFC3339Nano) + "/" + end.Format(time.RFC3339Nano)
+}
+
+func sourceTimezone(value time.Time) string {
+	if value.Location() == time.UTC {
+		return "UTC"
+	}
+	location := value.Location().String()
+	if strings.Contains(location, "/") {
+		return location
+	}
+	_, offset := value.Zone()
+	if offset == 0 {
+		return "UTC"
+	}
+	sign := "+"
+	if offset < 0 {
+		sign = "-"
+		offset = -offset
+	}
+	return fmt.Sprintf("%s%02d:%02d", sign, offset/3600, (offset%3600)/60)
+}
+
 func Normalize(ctx context.Context, input Input, filter *redact.Filter) (Record, error) {
 	if filter == nil {
 		return Record{}, redact.ErrUnsafeOutput
