@@ -361,6 +361,78 @@ func TestQueryDoesNotReportServiceMappingGapWhenAllContainersAreExplicitlyMapped
 	}
 }
 
+func TestQueryPreservesMappedContainersWithNoTelemetryAsUnknown(t *testing.T) {
+	observed := metricSeries("cgroup-observed", "host-a", "raw_cgroup_only", 1)
+	metrics := &fakeMetrics{series: map[string][]prometheus.Series{
+		"prometheus.runtime.container.cpu.v1":         {observed},
+		"prometheus.runtime.container.memory.v1":      {metricSeries("cgroup-observed", "host-a", "raw_cgroup_only", 1024)},
+		"prometheus.runtime.container.oom_events.v1":  {},
+		"prometheus.runtime.container.start_time.v1":  {metricSeries("cgroup-start-only", "host-a", "raw_cgroup_only", 1793772000)},
+		"prometheus.runtime.host.cpu.v1":              {hostSeries("host-a", 2.5)},
+		"prometheus.runtime.host.memory_available.v1": {hostSeries("host-a", 8192)},
+		"prometheus.runtime.host.load.v1":             {hostSeries("host-a", 0.5)},
+	}}
+	collector, err := NewCollector(metrics, &fakeLogs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := validRequest(nil)
+	request.MappingVersion = 7
+	request.ContainerMappings = []datasource.RuntimeContainerMapping{
+		{HostID: "host-a", CgroupID: "cgroup-observed"},
+		{HostID: "host-a", CgroupID: "cgroup-no-telemetry"},
+		{HostID: "host-a", CgroupID: "cgroup-start-only"},
+	}
+
+	result, err := collector.Query(context.Background(), Target{}, request)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(result.Containers) != 3 {
+		t.Fatalf("containers=%+v, want all mapped instances including the start-time-only observation", result.Containers)
+	}
+	var missing *Container
+	var startOnly *Container
+	for index := range result.Containers {
+		switch result.Containers[index].ID {
+		case opaqueIdentity("host-a\x00cgroup-no-telemetry"):
+			missing = &result.Containers[index]
+		case opaqueIdentity("host-a\x00cgroup-start-only"):
+			startOnly = &result.Containers[index]
+		}
+	}
+	if missing == nil {
+		t.Fatalf("mapped container with no series was omitted: %+v", result.Containers)
+	}
+	if missing.HostID != "host-a" || missing.Service != request.Service || missing.MappingVersion != request.MappingVersion ||
+		missing.MappingStatus != "explicit_mapping" || missing.State != "unknown" || missing.ClockSkew ||
+		missing.InstanceID != "" || missing.StartTime != nil || len(missing.PeerContainerIDs) != len(result.Containers)-1 {
+		t.Fatalf("missing telemetry was promoted to an observed runtime state: %+v", missing)
+	}
+	for _, container := range result.Containers {
+		if container.ID == missing.ID {
+			continue
+		}
+		if !slices.Contains(missing.PeerContainerIDs, container.ID) || !slices.Contains(container.PeerContainerIDs, missing.ID) {
+			t.Errorf("mapped peer relationship is not symmetric for %q and %q: %+v / %+v", missing.ID, container.ID, missing.PeerContainerIDs, container.PeerContainerIDs)
+		}
+	}
+	for name, measurement := range map[string]Measurement{
+		"cpu": missing.CPU, "memory": missing.Memory, "oom": missing.OOMEvents, "start": missing.StartEvidence,
+	} {
+		if !measurement.Empty || len(measurement.Samples) != 0 || measurement.SourceReference == "" {
+			t.Errorf("%s measurement=%+v, want explicit empty measurement", name, measurement)
+		}
+	}
+	if !result.Partial || !containsGap(result.Gaps, "mapped_container_metrics_missing") {
+		t.Fatalf("missing mapped-container gap not surfaced: %+v", result)
+	}
+	if startOnly == nil || startOnly.State != "unknown" || startOnly.StartTime == nil || startOnly.InstanceID == "" ||
+		len(startOnly.StartEvidence.Samples) != 1 || !startOnly.CPU.Empty || !startOnly.Memory.Empty {
+		t.Fatalf("start-time-only mapped observation was lost or promoted to a resource state: %+v", startOnly)
+	}
+}
+
 func TestQueryRejectsContainerMappingWithoutVersionBeforeSourceCalls(t *testing.T) {
 	metrics := &fakeMetrics{}
 	logs := &fakeLogs{}
@@ -621,13 +693,14 @@ func TestQueryCorrelatesLifecycleEventOnlyByExplicitCgroupMapping(t *testing.T) 
 	if len(result.Events) != 3 {
 		t.Fatalf("events = %+v", result.Events)
 	}
-	if result.Events[0].ContainerID != result.Containers[0].ID || result.Events[0].MappingVersion != 7 || result.Events[0].Classification != "unverified_log_match" {
+	if result.Events[0].ContainerID != opaqueIdentity("host-a\x00cgroup-a") || result.Events[0].MappingVersion != 7 || result.Events[0].Classification != "unverified_log_match" {
 		t.Fatalf("exact mapped event correlation = %+v", result.Events[0])
 	}
-	for _, event := range result.Events[1:] {
-		if event.ContainerID != "" || event.MappingVersion != 0 {
-			t.Fatalf("unmapped log labels were correlated: %+v", event)
-		}
+	if result.Events[1].ContainerID != opaqueIdentity("host-a\x00cgroup-b") || result.Events[1].MappingVersion != 7 {
+		t.Fatalf("configured mapping without resource series was not correlated by its exact cgroup label: %+v", result.Events[1])
+	}
+	if result.Events[2].ContainerID != "" || result.Events[2].MappingVersion != 0 {
+		t.Fatalf("container_id label without cgroup mapping was correlated: %+v", result.Events[2])
 	}
 	for _, event := range result.Events {
 		if event.ContainerID == "cgroup-a" || event.ContainerID == "cgroup-b" {
@@ -815,5 +888,8 @@ func TestQueryDisclosesExporterScrapeFreshnessIsUnknown(t *testing.T) {
 	}
 	if !result.Partial || !containsGap(result.Gaps, "exporter_scrape_freshness_unavailable") {
 		t.Fatalf("range evaluation timestamps imply scrape freshness: %+v", result)
+	}
+	if len(result.Containers) != 0 || !containsGap(result.Gaps, "container_resource_metrics_missing") {
+		t.Fatalf("unmapped empty query synthesized a container identity: %+v", result)
 	}
 }
