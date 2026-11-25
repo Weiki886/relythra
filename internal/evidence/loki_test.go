@@ -50,7 +50,7 @@ func TestFromLokiPreservesObservation(t *testing.T) {
 	if record.ObservedStart.Location() != time.UTC || record.ObservedEnd.Location() != time.UTC || record.CollectedAt.Location() != time.UTC || !record.ObservedStart.Equal(result.Start) || !record.ObservedEnd.Equal(result.End) || !record.CollectedAt.Equal(observation.CollectedAt) {
 		t.Fatalf("UTC bounds: %+v", record)
 	}
-	if record.SourceTimeText != "2026-11-09T01:00:00Z/2026-11-09T01:05:00Z" || record.SourceTimezone != "UTC" || record.QueryText != result.Query || record.RawReference != result.SourceReference || record.IndependenceGroup != "loki:loki.service.slow_queries.v1:v1" || record.Completeness != CompletenessComplete || record.FreshnessSeconds == nil || *record.FreshnessSeconds != 299 {
+	if record.SourceTimeText != "2026-11-09T09:00:00+08:00/2026-11-09T09:05:00+08:00" || record.SourceTimezone != "+08:00" || record.QueryText != result.Query || record.RawReference != result.SourceReference || record.IndependenceGroup != "loki:loki.service.slow_queries.v1:v1" || record.Completeness != CompletenessComplete || record.FreshnessSeconds == nil || *record.FreshnessSeconds != 299 {
 		t.Fatalf("metadata: %+v", record)
 	}
 	var parameters struct {

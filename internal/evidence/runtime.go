@@ -288,13 +288,14 @@ func FromRuntimeResult(ctx context.Context, result runtimeconnector.Result, meta
 		if err != nil {
 			return nil, ErrInvalidInput
 		}
+		sourceTimezone, sourceTimeText := sourceTimeMetadata(result.Start, result.End)
 		record, err := Normalize(ctx, Input{
 			InvestigationID: metadata.InvestigationID, ToolCallID: metadata.ToolCallID, CollectedAt: metadata.CollectedAt,
 			SourceType: SourceRuntime, EntityType: "HOST", EntityID: result.HostID,
 			ObservedStart: result.Start, ObservedEnd: result.End, RawReference: reference,
 			QueryParameters: parameters, ValueSummary: values, Completeness: completeness,
-			IndependenceGroup: prefix + template + ":v1", SourceTimezone: "UTC",
-			SourceTimeText: result.Start.UTC().Format(time.RFC3339Nano) + "/" + result.End.UTC().Format(time.RFC3339Nano),
+			IndependenceGroup: prefix + template + ":v1", SourceTimezone: sourceTimezone,
+			SourceTimeText: sourceTimeText,
 		}, filter)
 		if err != nil {
 			return nil, err

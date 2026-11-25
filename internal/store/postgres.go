@@ -1334,11 +1334,17 @@ func scanEvidence(row scanner) (Evidence, error) {
 	if err != nil {
 		return Evidence{}, err
 	}
+	evidence.ObservedStart = evidence.ObservedStart.UTC()
+	evidence.ObservedEnd = evidence.ObservedEnd.UTC()
+	evidence.CreatedAt = evidence.CreatedAt.UTC()
 	evidence.ToolCallID = nullStringPointer(toolCallID)
 	evidence.EntityID = nullStringPointer(entityID)
 	evidence.ValueSummary = json.RawMessage(valueSummary)
 	evidence.QueryParameters = json.RawMessage(queryParameters)
 	evidence.CollectedAt = nullTimePointer(collectedAt)
+	if evidence.CollectedAt != nil {
+		*evidence.CollectedAt = evidence.CollectedAt.UTC()
+	}
 	if freshnessSeconds.Valid {
 		value := int(freshnessSeconds.Int64)
 		evidence.FreshnessSeconds = &value

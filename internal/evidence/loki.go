@@ -106,6 +106,7 @@ func FromLokiResult(
 		age := int(metadata.CollectedAt.Sub(latest) / time.Second)
 		freshnessSeconds = &age
 	}
+	sourceTimezone, sourceTimeText := sourceTimeMetadata(result.Start, result.End)
 	return Normalize(ctx, Input{
 		InvestigationID: metadata.InvestigationID, ToolCallID: metadata.ToolCallID,
 		SourceType: SourceLoki, EntityType: metadata.EntityType, EntityID: metadata.EntityID,
@@ -114,7 +115,7 @@ func FromLokiResult(
 		QueryParameters: queryParameters, ValueSummary: valueSummary,
 		Completeness: completeness, FreshnessSeconds: freshnessSeconds,
 		IndependenceGroup: fmt.Sprintf("loki:%s:v%d", result.TemplateID, result.TemplateVersion),
-		SourceTimezone:    "UTC",
-		SourceTimeText:    result.Start.UTC().Format(time.RFC3339Nano) + "/" + result.End.UTC().Format(time.RFC3339Nano),
+		SourceTimezone:    sourceTimezone,
+		SourceTimeText:    sourceTimeText,
 	}, filter)
 }

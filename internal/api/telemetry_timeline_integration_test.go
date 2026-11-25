@@ -19,7 +19,8 @@ func TestPersistedTelemetryEvidenceAppearsInInvestigationTimeline(t *testing.T) 
 	db := openDiagnosisTestDB(t)
 	ctx := context.Background()
 	investigationID, serviceID := insertDiagnosisFixture(t, db)
-	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	zone := time.FixedZone("+08:00", 8*60*60)
+	start := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC).In(zone)
 	end := start.Add(5 * time.Minute)
 	collectedAt := end.Add(time.Minute)
 
@@ -77,6 +78,14 @@ func TestPersistedTelemetryEvidenceAppearsInInvestigationTimeline(t *testing.T) 
 	}
 	if items[1].ID != logEvidence.ID || items[1].SourceType != "LOKI" || !items[1].ObservedStart.Equal(start.Add(time.Minute)) {
 		t.Fatalf("Loki timeline item = %+v", items[1])
+	}
+	_, metricOffset := items[0].ObservedStart.Zone()
+	_, logOffset := items[1].ObservedStart.Zone()
+	if metricOffset != 0 || logOffset != 0 ||
+		items[0].SourceTimezone != "+08:00" || items[0].SourceTimeText != "2025-01-01T08:00:00+08:00/2025-01-01T08:05:00+08:00" ||
+		items[1].SourceTimezone != "+08:00" || items[1].SourceTimeText != "2025-01-01T08:01:00+08:00/2025-01-01T08:05:00+08:00" {
+		t.Fatalf("timeline did not preserve source timezone alongside UTC bounds: Prometheus=%q/%q Loki=%q/%q",
+			items[0].SourceTimezone, items[0].SourceTimeText, items[1].SourceTimezone, items[1].SourceTimeText)
 	}
 	for _, item := range items {
 		if item.EntityType != "SERVICE" || item.EntityID == nil || *item.EntityID != serviceID {
