@@ -527,16 +527,27 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 	for _, series := range startResults.Series {
 		id := series.Labels["id"]
 		hostID := series.Labels["host_id"]
-		if id == "" || hostID != request.HostID {
+		if id == "" || id == "/" || len(id) > maxIdentityBytes || hostID != request.HostID || len(series.Samples) == 0 {
 			continue
 		}
-		container := containers[id+"\x00"+hostID]
-		if container == nil || len(series.Samples) == 0 {
-			continue
+		key := id + "\x00" + hostID
+		container := containers[key]
+		if container == nil {
+			if _, mapped := explicitMappings[key]; !mapped {
+				continue
+			}
+			container = &Container{
+				ID: opaqueIdentity(hostID + "\x00" + id), HostID: hostID, Service: request.Service,
+				MappingStatus: "explicit_mapping", MappingVersion: request.MappingVersion,
+				CPU: emptyMeasurement(), Memory: emptyMeasurement(), OOMEvents: emptyMeasurement(),
+				StartEvidence: emptyMeasurement(), OOMWindowObservations: []OOMWindowObservation{}, PeerContainerIDs: []string{},
+			}
+			containers[key] = container
 		}
 		container.StartEvidence = makeMeasurement(series.Samples, startResults.SourceReference, startResults.Partial, request)
+		updateLatest(&container.LastObservedAt, series.Samples)
+		container.ClockSkew = container.ClockSkew || hasFutureSample(series.Samples, request.End)
 		if hasFutureSample(series.Samples, request.End) {
-			container.ClockSkew = true
 			continue
 		}
 		value := series.Samples[0].Value
@@ -560,6 +571,28 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 		}
 	}
 	linkMappedContainerPeers(containers)
+	// Retain configured identities with no returned series as unknown coverage,
+	// without claiming the mapped workload is present or has exited.
+	for _, mapping := range request.ContainerMappings {
+		if mapping.HostID != request.HostID {
+			continue
+		}
+		key := mapping.CgroupID + "\x00" + mapping.HostID
+		if _, observed := containers[key]; observed {
+			continue
+		}
+		containers[key] = &Container{
+			ID: opaqueIdentity(mapping.HostID + "\x00" + mapping.CgroupID), HostID: mapping.HostID,
+			Service: request.Service, MappingStatus: "explicit_mapping", MappingVersion: request.MappingVersion,
+			CPU:                   mappedMissingMeasurement(results, "prometheus.runtime.container.cpu.v1", request),
+			Memory:                mappedMissingMeasurement(results, "prometheus.runtime.container.memory.v1", request),
+			OOMEvents:             mappedMissingMeasurement(results, "prometheus.runtime.container.oom_events.v1", request),
+			StartEvidence:         mappedMissingMeasurement(results, "prometheus.runtime.container.start_time.v1", request),
+			OOMWindowObservations: []OOMWindowObservation{}, PeerContainerIDs: []string{}, State: "unknown",
+		}
+		result.Gaps = append(result.Gaps, "mapped_container_metrics_missing")
+		result.Partial = true
+	}
 	ordered := make([]Container, 0, len(containers))
 	for _, container := range containers {
 		container.OOMWindowObservations = summarizeOOMWindows(*container, request, result)
@@ -598,6 +631,14 @@ func collectContainers(request Request, results map[string]prometheus.Result, re
 	}
 	sort.Slice(ordered, func(left, right int) bool { return ordered[left].ID < ordered[right].ID })
 	return ordered
+}
+
+// mappedMissingMeasurement keeps an empty query result distinct from a zero-valued sample.
+func mappedMissingMeasurement(results map[string]prometheus.Result, templateID string, request Request) Measurement {
+	if result, exists := results[templateID]; exists {
+		return makeMeasurement(nil, result.SourceReference, result.Partial, request)
+	}
+	return emptyMeasurement()
 }
 
 func linkMappedContainerPeers(containers map[string]*Container) {
