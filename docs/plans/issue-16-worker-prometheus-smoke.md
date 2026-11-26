@@ -16,8 +16,9 @@ Extend the isolated demo smoke so a signed Grafana FIRING delivery has an Invent
 1. Add a pure timeline validation test and run it to confirm the missing behavior fails.
 2. Implement narrowly bounded timeline validation for `investigation_id`, `source_type`, `query_parameters.template_id`, and at least one `value_summary.series[].samples[]` item.
 3. Add the smoke mapping through `POST /api/v1/data-source-mappings` with project/service IDs queried from the isolated database, `environment=demo`, endpoint `http://observability-gateway:9090`, fixed template `prometheus.service.latency.v1`, and the existing file SecretRef. Never print the management or observability token.
-4. After observing the signed FIRING delivery, poll the public timeline endpoint with a bounded timeout and fail with the last missing-evidence reason if the Worker does not persist a populated Prometheus result.
-5. Update demo documentation to distinguish the newly verified Worker Prometheus evidence from the remaining unverified GitHub, Loki-to-Investigation, runtime, and diagnosis-candidate chain.
+4. Before stopping Inventory, send `/orders` requests across multiple Prometheus scrape intervals and wait for the fixed latency query to return a finite positive value; this prevents a lazy histogram from remaining flat and producing only NaN results.
+5. After observing the signed FIRING delivery, poll the public timeline endpoint with a bounded timeout and fail with the last missing-evidence reason if the Worker does not persist a populated Prometheus result.
+6. Update demo documentation to distinguish the newly verified Worker Prometheus evidence from the remaining unverified GitHub, Loki-to-Investigation, runtime, and diagnosis-candidate chain.
 
 ## Verification
 
@@ -33,3 +34,4 @@ This is a test-only change against the already isolated demo stack. The mapping 
 ## Rulings
 
 - Keep the Issue open: this slice proves the Worker-to-Prometheus-to-Investigation timeline path but does not prove the complete required v0 chain.
+- Accept PR #105 review feedback: Inventory creates its histogram series lazily, so the smoke must warm it across scrape intervals and require a finite positive latency query before stopping Inventory.

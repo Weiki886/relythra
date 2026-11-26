@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from demo_artifacts import MAX_CAPTURE_BYTES, capture_compose, collect, collect_http, compose_command, read_secrets, redact, remove_partial_secret, safe_compose_output, write_capture
-from demo_assertions import assert_prometheus_evidence_timeline, prometheus_mapping_payload
+from demo_assertions import assert_finite_latency_response, assert_prometheus_evidence_timeline, prometheus_mapping_payload
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -41,6 +41,20 @@ def prometheus_timeline(investigation_id="demo-investigation"):
 
 
 class DemoPrometheusEvidenceTests(unittest.TestCase):
+    def test_accepts_finite_positive_prometheus_latency(self):
+        response = {"status": "success", "data": {"result": [{"value": [1795651200, "0.125"]}]}}
+        assert_finite_latency_response(response)
+
+    def test_rejects_missing_nan_or_zero_latency(self):
+        responses = [
+            {"status": "success", "data": {"result": []}},
+            {"status": "success", "data": {"result": [{"value": [1795651200, "NaN"]}]}},
+            {"status": "success", "data": {"result": [{"value": [1795651200, "0"]}]}},
+        ]
+        for response in responses:
+            with self.subTest(response=response), self.assertRaisesRegex(AssertionError, "finite positive latency"):
+                assert_finite_latency_response(response)
+
     def test_mapping_is_scoped_to_demo_service_and_fixed_read_only_template(self):
         mapping = prometheus_mapping_payload("project-id", "service-id")
         self.assertEqual(mapping["project_id"], "project-id")

@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from demo_assertions import assert_prometheus_evidence_timeline, prometheus_mapping_payload
+from demo_assertions import assert_finite_latency_response, assert_prometheus_evidence_timeline, prometheus_mapping_payload
 
 
 def check_config(path):
@@ -167,6 +167,24 @@ def prometheus_evidence(investigation_id):
     print(f"Worker Prometheus latency Evidence verified for Investigation {investigation_id}")
 
 
+
+def prime_prometheus_latency():
+    query = 'histogram_quantile(0.95, sum by (le, route) (rate(demo_http_request_duration_seconds_bucket{service="inventory",env="demo"}[5m])))'
+    for index in range(3):
+        status, raw = http(28090, "/orders")
+        assert status == 200 and json.loads(raw).get("available") == 42, ("latency priming request", status, raw[:200])
+        if index < 2:
+            time.sleep(6)
+
+    def finite_latency():
+        status, raw = http(29090, "/api/v1/query?" + urllib.parse.urlencode({"query": query}), True)
+        assert status == 200, ("Prometheus latency query", status, raw[:200])
+        assert_finite_latency_response(json.loads(raw))
+
+    eventually(finite_latency, timeout=40)
+    print("Inventory latency histogram has a finite Prometheus result across scrape intervals")
+
+
 def grafana_delivery(investigation_id, expected_status):
     def delivered():
         status, raw = http(28080, f"/api/v1/investigations/{investigation_id}")
@@ -285,6 +303,8 @@ if __name__ == "__main__":
         configure_prometheus_mapping(sys.argv[2], sys.argv[3])
     elif mode == "prometheus-evidence":
         prometheus_evidence(sys.argv[2])
+    elif mode == "prime-prometheus-latency":
+        prime_prometheus_latency()
     elif mode == "grafana-delivery":
         grafana_delivery(sys.argv[2], sys.argv[3])
     elif mode == "slow-sql-fault":

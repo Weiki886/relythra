@@ -1,5 +1,6 @@
 """Pure assertions shared by the disposable demo smoke and its unit tests."""
 
+import math
 
 PROMETHEUS_LATENCY_TEMPLATE = "prometheus.service.latency.v1"
 
@@ -48,3 +49,19 @@ def assert_prometheus_evidence_timeline(timeline, investigation_id):
         ):
             return item
     raise AssertionError("Prometheus latency Evidence has no samples")
+
+
+def assert_finite_latency_response(response):
+    result = response.get("data", {}).get("result") if response.get("status") == "success" else None
+    if isinstance(result, list):
+        for series in result:
+            value = series.get("value") if isinstance(series, dict) else None
+            if not isinstance(value, list) or len(value) < 2:
+                continue
+            try:
+                latency = float(value[1])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(latency) and latency > 0:
+                return latency
+    raise AssertionError("Prometheus query has no finite positive latency")
