@@ -33,4 +33,8 @@ Issue #16 要求告警到达后自动收集告警窗口附近的证据。当前 
 
 ## 实施阶段
 
-本 ADR 首个切片只实现与 Investigation 同事务的任务持久化、幂等约束和 remap 入队；Worker claim/lease/retry、采集器执行与 Compose 故障 E2E 由后续 PR 实现与验证。Issue #16 在完整链路验收前保持开放。
+- 首个切片实现与 Investigation 同事务的任务持久化、幂等约束和 remap 入队。
+- 第二个切片实现 `FOR UPDATE SKIP LOCKED` 有界领取、UUID 租约 token、过期重领、受限退避重试和最大尝试次数终止；仓储契约本身不启动生产消费循环。
+- 后续切片仍需将 Worker 消费循环装配到固定模板只读采集器，写入已验证的 Evidence，并完成 Compose 慢 SQL 故障 E2E。不得在来源采集尚未实现时将任务标记成功。
+
+Issue #16 在完整链路验收前保持开放。
