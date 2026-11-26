@@ -111,6 +111,7 @@ func (processor *CollectionProcessor) Process(ctx context.Context, job store.Inv
 	}
 
 	prometheusMappings := 0
+	retryCode := ""
 	for _, mapping := range mappings {
 		switch mapping.SourceType {
 		case datasource.SourcePrometheus:
@@ -118,7 +119,10 @@ func (processor *CollectionProcessor) Process(ctx context.Context, job store.Inv
 			if err := processor.collectPrometheus(ctx, job, investigation, mapping, windowStart, windowEnd); err != nil {
 				var failure *collectionFailure
 				if errors.As(err, &failure) {
-					return processor.retry(ctx, job, failure.code)
+					if retryCode == "" {
+						retryCode = failure.code
+					}
+					continue
 				}
 				return processor.retry(ctx, job, "evidence_persist_failed")
 			}
@@ -136,6 +140,9 @@ func (processor *CollectionProcessor) Process(ctx context.Context, job store.Inv
 		if err := processor.persistMissingPrometheusGap(ctx, job, investigation, windowStart, windowEnd); err != nil {
 			return processor.retry(ctx, job, "gap_persist_failed")
 		}
+	}
+	if retryCode != "" {
+		return processor.retry(ctx, job, retryCode)
 	}
 	completed, err := processor.repository.CompleteInvestigationCollectionJob(ctx, job.ID, job.LeaseToken)
 	if err != nil {
@@ -170,6 +177,7 @@ func (processor *CollectionProcessor) collectPrometheus(
 	if err != nil {
 		return &collectionFailure{code: "prometheus_secret_reference_invalid"}
 	}
+	retryCode := ""
 	for index, template := range templates {
 		if template.Version != mapping.Templates[index].Version {
 			if err := processor.persistGap(ctx, job, investigation, string(datasource.SourcePrometheus), template.ID, template.Version, evidence.CollectionFailureRequestRejected, start, end); err != nil {
@@ -183,7 +191,13 @@ func (processor *CollectionProcessor) collectPrometheus(
 			Step: datasource.DefaultQueryStep.String(), MaxSeries: datasource.DefaultQueryMaxSeries, MaxPoints: datasource.DefaultQueryMaxPoints,
 		})
 		if len(issues) > 0 {
-			return &collectionFailure{code: "prometheus_query_invalid"}
+			if err := processor.persistGap(ctx, job, investigation, string(datasource.SourcePrometheus), template.ID, template.Version, evidence.CollectionFailureRequestRejected, start, end); err != nil {
+				return &collectionFailure{code: "gap_persist_failed"}
+			}
+			if retryCode == "" {
+				retryCode = "prometheus_query_invalid"
+			}
+			continue
 		}
 		var resolvedSecret *secrets.Secret
 		queryFilter := processor.filter
@@ -193,7 +207,10 @@ func (processor *CollectionProcessor) collectPrometheus(
 				if gapErr := processor.persistGap(ctx, job, investigation, string(datasource.SourcePrometheus), template.ID, template.Version, evidence.CollectionFailurePermissionDenied, start, end); gapErr != nil {
 					return &collectionFailure{code: "gap_persist_failed"}
 				}
-				return &collectionFailure{code: "prometheus_secret_unavailable"}
+				if retryCode == "" {
+					retryCode = "prometheus_secret_unavailable"
+				}
+				continue
 			}
 			resolvedSecret = &secret
 			queryFilter, err = processor.filter.WithAdditionalSecrets(secret.Reveal())
@@ -210,17 +227,29 @@ func (processor *CollectionProcessor) collectPrometheus(
 			if gapErr := processor.persistGap(ctx, job, investigation, string(datasource.SourcePrometheus), template.ID, template.Version, reason, start, end); gapErr != nil {
 				return &collectionFailure{code: "gap_persist_failed"}
 			}
-			return &collectionFailure{code: code}
+			if retryCode == "" {
+				retryCode = code
+			}
+			continue
 		}
 		if result.TemplateID != template.ID || result.TemplateVersion != template.Version || result.QueryType != datasource.QueryTypeRange ||
 			!result.End.After(result.Start) || result.End.Sub(result.Start) > datasource.MaxQueryWindow {
-			return &collectionFailure{code: "prometheus_result_invalid"}
+			if err := processor.persistGap(ctx, job, investigation, string(datasource.SourcePrometheus), template.ID, template.Version, evidence.CollectionFailureInvalidResponse, start, end); err != nil {
+				return &collectionFailure{code: "gap_persist_failed"}
+			}
+			if retryCode == "" {
+				retryCode = "prometheus_result_invalid"
+			}
+			continue
 		}
 		if _, _, err := processor.repository.PersistPrometheusEvidence(ctx, result, evidence.PrometheusEvidenceContext{
 			InvestigationID: job.InvestigationID, EntityType: "SERVICE", EntityID: investigation.Service.ID, CollectedAt: processor.now().UTC(),
 		}, queryFilter); err != nil {
 			return &collectionFailure{code: "evidence_persist_failed"}
 		}
+	}
+	if retryCode != "" {
+		return &collectionFailure{code: retryCode}
 	}
 	return nil
 }

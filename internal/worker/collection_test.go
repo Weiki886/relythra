@@ -90,9 +90,10 @@ func (collectionSecretResolverFake) Resolve(context.Context, secrets.Reference) 
 }
 
 type collectionPrometheusFake struct {
-	result prometheusconnector.Result
-	err    error
-	calls  []struct {
+	result         prometheusconnector.Result
+	err            error
+	failTemplateID string
+	calls          []struct {
 		target prometheusconnector.Target
 		query  datasource.NormalizedQuery
 	}
@@ -103,7 +104,20 @@ func (connector *collectionPrometheusFake) Query(_ context.Context, target prome
 		target prometheusconnector.Target
 		query  datasource.NormalizedQuery
 	}{target: target, query: query})
-	return connector.result, connector.err
+	if query.TemplateID == connector.failTemplateID {
+		return prometheusconnector.Result{}, &prometheusconnector.QueryError{Category: prometheusconnector.ErrorTimeout}
+	}
+	if connector.err != nil {
+		return prometheusconnector.Result{}, connector.err
+	}
+	result := connector.result
+	result.TemplateID = query.TemplateID
+	result.TemplateVersion = query.Version
+	result.QueryType = query.QueryType
+	result.Start = query.Start
+	result.End = query.End
+	result.Step = query.Step
+	return result, nil
 }
 
 func TestCollectionWorkerPersistsPrometheusEvidenceBeforeCompletingLease(t *testing.T) {
@@ -154,6 +168,38 @@ func TestCollectionWorkerRedactsResolvedDatasourceSecretFromEvidence(t *testing.
 	}
 	if len(repository.persistedPrometheus) != 1 || strings.Contains(string(repository.persistedPrometheus[0].ValueSummary), canary) {
 		t.Fatalf("Evidence summary did not redact datasource credential: %s", repository.persistedPrometheus[0].ValueSummary)
+	}
+}
+
+func TestCollectionWorkerContinuesIndependentTemplatesAndMappingsAfterQueryFailure(t *testing.T) {
+	ctx, prometheusMapping := validCollectionContextAndMapping()
+	prometheusMapping.Templates = append(prometheusMapping.Templates, datasource.Template{
+		ID: "prometheus.service.request_rate.v1", Version: 1, Source: datasource.SourcePrometheus,
+	})
+	lokiMapping := store.DataSourceMapping{
+		ID: "70000000-0000-4000-8000-000000000001", ProjectID: collectionProjectID,
+		ServiceID: collectionServiceID, Environment: "prod", SourceType: datasource.SourceLoki,
+		Templates: []datasource.Template{{ID: "loki.service.errors.v1", Version: 1, Source: datasource.SourceLoki}},
+	}
+	repository := &collectionRepositoryFake{context: ctx, mappings: []store.DataSourceMapping{prometheusMapping, lokiMapping}}
+	connector := &collectionPrometheusFake{result: validCollectionPrometheusResult(), failTemplateID: "prometheus.service.latency.v1"}
+	filter, _ := redact.NewFilter()
+	processor, err := worker.NewCollectionProcessor(repository, connector, collectionSecretResolverFake{}, filter, collectionOptions())
+	if err != nil {
+		t.Fatalf("NewCollectionProcessor: %v", err)
+	}
+
+	if err := processor.Process(context.Background(), validCollectionJob()); err == nil {
+		t.Fatal("Process() error = nil, want retry after one source timeout")
+	}
+	if len(connector.calls) != 2 || connector.calls[1].query.TemplateID != "prometheus.service.request_rate.v1" {
+		t.Fatalf("Prometheus calls=%+v, want both templates despite first timeout", connector.calls)
+	}
+	if len(repository.persistedPrometheus) != 1 || len(repository.persistedGaps) != 2 {
+		t.Fatalf("persisted Prometheus=%d gaps=%d, want healthy metric plus timeout and Loki gaps", len(repository.persistedPrometheus), len(repository.persistedGaps))
+	}
+	if repository.completeCalls != 0 || repository.retryCalls != 1 || repository.retryCode != "prometheus_timeout" {
+		t.Fatalf("completion=%d retry=%d code=%q, want one retry and no completion", repository.completeCalls, repository.retryCalls, repository.retryCode)
 	}
 }
 
