@@ -97,6 +97,7 @@ func run() error {
 	}()
 
 	var runErr error
+	collectionStopped := false
 	select {
 	case <-ctx.Done():
 	case err := <-errorChannel:
@@ -105,6 +106,7 @@ func run() error {
 		}
 		stop()
 	case err := <-collectionErrors:
+		collectionStopped = true
 		if err != nil {
 			runErr = errors.New("worker collection loop stopped")
 		}
@@ -114,11 +116,13 @@ func run() error {
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	shutdownErr := server.Shutdown(shutdownContext)
-	select {
-	case <-collectionErrors:
-	case <-shutdownContext.Done():
-		if shutdownErr == nil {
-			shutdownErr = shutdownContext.Err()
+	if !collectionStopped {
+		select {
+		case <-collectionErrors:
+		case <-shutdownContext.Done():
+			if shutdownErr == nil {
+				shutdownErr = shutdownContext.Err()
+			}
 		}
 	}
 	if runErr != nil {
