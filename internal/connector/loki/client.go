@@ -95,6 +95,7 @@ type SecretResolver interface {
 type Target struct {
 	Endpoint        string
 	SecretReference *secrets.Reference
+	ResolvedSecret  *secrets.Secret
 }
 
 type Entry struct {
@@ -209,12 +210,22 @@ func (connector *Connector) Query(ctx context.Context, target Target, query data
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("User-Agent", "Relythra/1.0")
+	queryConnector := *connector
 	if target.SecretReference != nil {
-		secret, err := connector.resolver.Resolve(ctx, *target.SecretReference)
-		if err != nil {
-			return Result{}, queryError(ErrorSecretUnavailable, err)
+		var secret secrets.Secret
+		if target.ResolvedSecret != nil {
+			secret = *target.ResolvedSecret
+		} else {
+			secret, err = connector.resolver.Resolve(ctx, *target.SecretReference)
+			if err != nil {
+				return Result{}, queryError(ErrorSecretUnavailable, err)
+			}
 		}
 		request.Header.Set("Authorization", "Bearer "+secret.Reveal())
+		queryConnector.filter, err = connector.filter.WithAdditionalSecrets(secret.Reveal())
+		if err != nil {
+			return Result{}, queryError(ErrorInvalidResponse, err)
+		}
 	}
 	response, err := connector.client.Do(request)
 	if err != nil {
@@ -256,7 +267,7 @@ func (connector *Connector) Query(ctx context.Context, target Target, query data
 	if cursor != nil && cursor.ResponseDigest != responseHash {
 		return Result{}, queryError(ErrorCursorExpired, ErrCursorExpired)
 	}
-	entries, partial, timeSkew, err := connector.normalizeEntries(ctx, parsed.Data.Result, query)
+	entries, partial, timeSkew, err := queryConnector.normalizeEntries(ctx, parsed.Data.Result, query)
 	if err != nil {
 		return Result{}, queryError(ErrorInvalidResponse, err)
 	}
@@ -280,7 +291,7 @@ func (connector *Connector) Query(ctx context.Context, target Target, query data
 	if end < len(entries) {
 		nextCursor = encodeCursor(pageCursor{Fingerprint: fingerprint, ResponseDigest: responseHash, Offset: end})
 	}
-	warnings, err := connector.cleanWarnings(ctx, parsed.Warnings)
+	warnings, err := queryConnector.cleanWarnings(ctx, parsed.Warnings)
 	if err != nil {
 		return Result{}, queryError(ErrorInvalidResponse, err)
 	}

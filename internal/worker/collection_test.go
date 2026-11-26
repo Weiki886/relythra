@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	lokiconnector "github.com/Weiki886/relythra/internal/connector/loki"
 	prometheusconnector "github.com/Weiki886/relythra/internal/connector/prometheus"
 	"github.com/Weiki886/relythra/internal/datasource"
 	"github.com/Weiki886/relythra/internal/domain"
@@ -31,6 +32,7 @@ type collectionRepositoryFake struct {
 	context             store.InvestigationContext
 	mappings            []store.DataSourceMapping
 	persistedPrometheus []evidence.Record
+	persistedLoki       []evidence.Record
 	persistedGaps       []evidence.Record
 	completeCalls       int
 	retryCalls          int
@@ -63,6 +65,18 @@ func (repository *collectionRepositoryFake) PersistPrometheusEvidence(_ context.
 	return store.Evidence{ID: "evidence"}, true, nil
 }
 
+func (repository *collectionRepositoryFake) PersistLokiEvidence(ctx context.Context, result lokiconnector.Result, metadata evidence.LokiEvidenceContext, filter *redact.Filter) (store.Evidence, bool, error) {
+	if repository.persistErr != nil {
+		return store.Evidence{}, false, repository.persistErr
+	}
+	record, err := evidence.FromLokiResult(ctx, result, metadata, filter)
+	if err != nil {
+		return store.Evidence{}, false, err
+	}
+	repository.persistedLoki = append(repository.persistedLoki, record)
+	return store.Evidence{ID: "loki-evidence"}, true, nil
+}
+
 func (repository *collectionRepositoryFake) PersistEvidence(_ context.Context, record evidence.Record) (store.Evidence, bool, error) {
 	if repository.persistErr != nil {
 		return store.Evidence{}, false, repository.persistErr
@@ -73,7 +87,7 @@ func (repository *collectionRepositoryFake) PersistEvidence(_ context.Context, r
 
 func (repository *collectionRepositoryFake) CompleteInvestigationCollectionJob(context.Context, string, string) (bool, error) {
 	repository.completeCalls++
-	repository.completedBeforeSave = len(repository.persistedPrometheus)+len(repository.persistedGaps) == 0
+	repository.completedBeforeSave = len(repository.persistedPrometheus)+len(repository.persistedLoki)+len(repository.persistedGaps) == 0
 	return true, nil
 }
 

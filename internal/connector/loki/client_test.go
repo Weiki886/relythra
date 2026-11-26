@@ -375,3 +375,34 @@ func validQuery(templateID string) datasource.NormalizedQuery {
 		Limit: 20, MaxSeries: 100,
 	}
 }
+
+func TestQueryUsesResolvedCredentialWithoutReadingReferenceAgain(t *testing.T) {
+	const canary = "resolved-loki-credential-canary"
+	reference, err := secrets.ParseReference("env:LOKI_QUERY_TOKEN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, err := secrets.New(canary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+canary {
+			t.Error("wrong credential snapshot")
+		}
+		_, _ = io.WriteString(w, strings.ReplaceAll(lokiResponse, "database unavailable", "raw echo "+canary))
+	}))
+	defer server.Close()
+	calls := 0
+	connector := newTestConnector(t, server, func(context.Context, secrets.Reference) (secrets.Secret, error) {
+		calls++
+		return secrets.New("rotated-value")
+	}, newTestFilter(t))
+	result, err := connector.Query(context.Background(), Target{Endpoint: server.URL, SecretReference: &reference, ResolvedSecret: &secret}, validQuery("loki.service.errors.v1"))
+	if err != nil || calls != 0 {
+		t.Fatalf("query err=%v resolver calls=%d, want supplied snapshot", err, calls)
+	}
+	if len(result.Entries) == 0 || strings.Contains(result.Entries[0].Line.Content, canary) {
+		t.Fatal("resolved credential echoed in connector output")
+	}
+}
