@@ -68,7 +68,7 @@ node_exporter 只读挂载 `/proc` 与 `/sys`，采集 CPU、内存、负载与�
 
 环境若无法提供非根 cgroup 指标，smoke 会失败，需检查 cgroup 权限、rootless 限制和 Docker Desktop 设置，不能用根 cgroup冒充业务容器。
 
-诊断进程只加入 control/diagnosis 网络，Loki 原始写入只在 observation-backend；读网关仅允许明确 GET 路径，写请求与未登记路径返回 403。只读 Token 与控制面管理 Token 分开；部署发送 Token 与通知通道只在 `.env.example` 留独立 SecretRef 占位，当前不消费。
+诊断进程只加入 control/diagnosis 网络，Loki 原始写入只在 observation-backend；读网关允许明确 GET 路径，以及 Loki `/loki/api/v1/query_range` 的 POST 表单查询，POST 请求体上限为 16 KiB。其余方法与路径按白名单拒绝，写入路径返回 403。只读 Token 与控制面管理 Token 分开；部署发送 Token 与通知通道只在 `.env.example` 留独立 SecretRef 占位，当前不消费。
 
 ## 发布、故障与恢复边界
 

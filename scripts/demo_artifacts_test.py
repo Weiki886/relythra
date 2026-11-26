@@ -193,6 +193,21 @@ class DemoLokiEvidenceTests(unittest.TestCase):
         spec.loader.exec_module(smoke)
         return smoke
 
+    def test_loki_post_probe_uses_form_query_and_requires_nonempty_success(self):
+        smoke = self.load_smoke()
+        result = {"status": "success", "data": {"resultType": "streams", "result": [{"stream": {"service": "inventory"}, "values": [["1", "request"]]}]}}
+        with patch.object(smoke, "http", return_value=(200, json.dumps(result).encode())) as call:
+            smoke.loki_post_query_probe()
+        args, kwargs = call.call_args
+        self.assertEqual(args, (23100, "/loki/api/v1/query_range", True))
+        self.assertEqual(kwargs["method"], "POST")
+        params = smoke.urllib.parse.parse_qs(kwargs["data"].decode())
+        self.assertIn('service="inventory",env="demo"', params["query"][0])
+        self.assertEqual(params["limit"], ["10"])
+        for status, response in ((403, b"denied"), (200, b'{"status":"success","data":{"result":[]}}')):
+            with patch.object(smoke, "http", return_value=(status, response)), self.assertRaises(AssertionError):
+                smoke.loki_post_query_probe()
+
     def test_mapping_is_created_through_authenticated_management_api(self):
         smoke = self.load_smoke()
         mapping = loki_mapping_payload("project-id", "inventory-id")

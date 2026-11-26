@@ -33,7 +33,7 @@ def check_config(path):
     print("Compose boundaries: health, limits, loopback, mounts and socket isolation verified")
 
 
-def http(port, path, authorized=False, method="GET", admin=False):
+def http(port, path, authorized=False, method="GET", admin=False, data=None):
     headers = {}
     if authorized:
         with open(os.environ["DEMO_OBSERVABILITY_TOKEN_FILE"], encoding="utf-8") as secret:
@@ -42,7 +42,9 @@ def http(port, path, authorized=False, method="GET", admin=False):
         with open(os.environ["DEMO_GRAFANA_PASSWORD_FILE"], encoding="utf-8") as secret:
             credentials = "admin:" + secret.read().strip()
         headers["Authorization"] = "Basic " + base64.b64encode(credentials.encode()).decode()
-    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers, method=method)
+    if data is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=12) as response:
             return response.status, response.read(2 * 1024 * 1024)
@@ -79,6 +81,10 @@ def healthy():
     for port, path in [(29090, "/api/v1/admin/tsdb/delete_series"), (29090, "/-/reload"), (23100, "/loki/api/v1/push")]:
         assert http(port, path, True, "POST")[0] == 403, ("write allowed", path)
         assert http(port, path, True)[0] == 403, ("unregistered path allowed", path)
+    for path in ("/loki/api/v1/query", "/loki/api/v1/labels", "/ready"):
+        assert http(23100, path, True, "POST")[0] == 403, ("unregistered POST allowed", path)
+    assert http(23100, "/loki/api/v1/query_range", method="POST")[0] == 401, "Loki POST requires token"
+    assert http(23100, "/loki/api/v1/query_range", True, "DELETE")[0] == 403, "Loki DELETE allowed"
     assert http(28090, "/internal/test/slow-query")[0] == 404, "faults must default off"
 
     def samples():
@@ -112,6 +118,7 @@ def healthy():
                 assert json.loads(line)["msg"] == "request completed"
         assert seen == {"orders", "inventory"}, seen
     eventually(logs)
+    eventually(loki_post_query_probe)
     def grafana_provisioned():
         status, raw = http(23001, "/api/dashboards/uid/relythra-demo")
         assert status == 200 and len(json.loads(raw)["dashboard"]["panels"]) == 6, "Grafana dashboard"
@@ -123,6 +130,17 @@ def healthy():
     eventually(grafana_provisioned)
     assert http(23001, "/api/dashboards/db", method="POST")[0] in (401, 403), "Viewer can write dashboards"
     print("Real telemetry verified: six healthy scrape targets, business/node/cgroup/worker samples, labeled JSON logs and Grafana dashboard")
+
+
+def loki_post_query_probe():
+    data = urllib.parse.urlencode({
+        "query": '{service="inventory",env="demo"} |~ "(?i)(slow query|query_id|duration_ms)"',
+        "limit": 10,
+    }).encode()
+    status, raw = http(23100, "/loki/api/v1/query_range", True, method="POST", data=data)
+    assert status == 200, ("Loki POST query", status)
+    response = json.loads(raw)
+    assert response.get("status") == "success" and response.get("data", {}).get("result"), "Loki POST query has no logs"
 
 
 def configure_mapping(mapping, source_name):
@@ -165,8 +183,6 @@ def prometheus_evidence(investigation_id):
 
     eventually(collected, timeout=180)
     print(f"Worker Prometheus latency Evidence verified for Investigation {investigation_id}")
-
-
 
 
 def loki_evidence(investigation_id, service_id):

@@ -19,4 +19,8 @@
 - 定向 Python 回归测试先红后绿，完整执行 `make demo-artifact-check`。
 - 执行 `make check`、`git diff --check`、gitleaks，并在 Kiri 执行 `make demo-smoke`，确认专用资源清理。
 - 独立代码评审后提交 PR，核对最终 HEAD 的 Backend、Frontend 和 Compose smoke。
-- 风险为 standard，类型为 type:test，范围为 area:qa、area:infra。改动限于隔离演示编排、断言和说明，使用既有只读采集与映射接口。回滚应用提交即可恢复原冒烟流程，无迁移。
+- 风险为 high，类型为 type:test、type:fix，范围为 area:qa、area:infra、area:security。改动限于隔离演示编排、断言和说明，使用既有只读采集与映射接口。回滚应用提交即可恢复原冒烟流程，无迁移。
+
+## CI 发现与方案修订
+
+首轮远端演示在 Worker Loki 采集时产生 `loki_permission_denied`。失败产物确认连接器使用 POST 表单查询，演示网关只接受 GET，返回 403。复用连接器的既有请求契约，为精确 `/loki/api/v1/query_range` 路径开放带 Token 的 POST，限制请求体 16 KiB，其余方法和路径保持白名单约束。新增 ADR 0011、非空 POST 查询探针及未认证/其他 POST/DELETE 拒绝验证。因涉及观测网关安全边界，本轮风险调整为 high，并增加 type:fix、area:security 标签。回滚整份 PR 可恢复原网关策略与 smoke。
