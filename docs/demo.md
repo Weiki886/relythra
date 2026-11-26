@@ -22,6 +22,8 @@ done
 
 签名 Webhook 使用独立的 `grafana_webhook_secret` 文件，分别挂载给 API 与 Grafana。API 使用 `file:/run/secrets/grafana_webhook_secret`，Grafana bootstrap 导出变量供 Contact Point provisioning 使用。`DEMO_GRAFANA_WEBHOOK_SECRET_FILE` 必须指向该文件。Grafana 的本地来源链接使用 `DEMO_GRAFANA_PORT` 对应的回环端口。
 
+`observability_token` 以宿主机权限文件挂载给 API/Worker。入口脚本在容器内复制到仅 `relythra` 用户和组可读的 `/run/relythra-secrets/observability_token`，不修改宿主机文件权限。数据源映射若使用该只读 Token，SecretRef 应填写 `file:/run/relythra-secrets/observability_token`；不要引用 `/run/secrets/observability_token`，因为容器会以非 root 用户运行服务。
+
 旧 `.env` 需从 `.env.example` 补充 `DEMO_*_FILE`。Secret 路径相对于 `deploy/compose/`；不要提交 `.env`、`secrets/` 或含 Token 的截图/命令历史。只读 Token 限制为至少 32 个字母、数字、下划线或连字符。
 
 | 入口 | 默认地址 | 权限/用途 |

@@ -7,13 +7,22 @@ source_management_secret=/run/secrets/management_token
 runtime_management_secret=/run/relythra-secrets/management_token
 source_grafana_secret=/run/secrets/grafana_webhook_secret
 runtime_grafana_secret=/run/relythra-secrets/grafana_webhook_secret
+source_observability_secret=/run/secrets/observability_token
+runtime_observability_secret=/run/relythra-secrets/observability_token
 
 if [ "${RELYTHRA_DATABASE_PASSWORD_REF:-}" = "file:${source_database_secret}" ] ||
    [ "${RELYTHRA_ADMIN_TOKEN_REF:-}" = "file:${source_management_secret}" ] ||
-   [ "${RELYTHRA_GRAFANA_WEBHOOK_SECRET_REF:-}" = "file:${source_grafana_secret}" ]; then
+   [ "${RELYTHRA_GRAFANA_WEBHOOK_SECRET_REF:-}" = "file:${source_grafana_secret}" ] ||
+   [ -f "${source_observability_secret}" ]; then
   mkdir -p /run/relythra-secrets
   chown root:relythra /run/relythra-secrets
   chmod 0710 /run/relythra-secrets
+fi
+
+if [ -f "${source_observability_secret}" ]; then
+  cp "${source_observability_secret}" "${runtime_observability_secret}"
+  chown relythra:relythra "${runtime_observability_secret}"
+  chmod 0440 "${runtime_observability_secret}"
 fi
 
 if [ "${RELYTHRA_DATABASE_PASSWORD_REF:-}" = "file:${source_database_secret}" ]; then
