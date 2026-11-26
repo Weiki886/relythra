@@ -50,6 +50,13 @@ stage="render and verify Compose configuration"
 python3 scripts/demo-assert.py config "$temp_dir/compose.json"
 stage="build and start demo services"
 "${COMPOSE[@]}" up --build --wait --wait-timeout 240
+stage="verify observability token is available to the Worker"
+"${COMPOSE[@]}" exec -T worker sh -c '
+  cmp /run/secrets/observability_token /run/relythra-secrets/observability_token
+  test "$(stat -c %a /run/relythra-secrets/observability_token)" = 440
+  test "$(stat -c %u:%g /run/relythra-secrets/observability_token)" = 10001:10001
+  su-exec relythra test -r /run/relythra-secrets/observability_token
+'
 stage="seed isolated Grafana webhook project and service"
 "${COMPOSE[@]}" exec -T postgres psql -U relythra -d relythra -v ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO projects (slug, name) VALUES ('relythra-demo', 'Relythra isolated demo')

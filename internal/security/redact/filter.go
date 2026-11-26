@@ -126,6 +126,18 @@ func NewFilter(knownSecrets ...string) (*Filter, error) {
 	return &Filter{knownSecrets: secrets}, nil
 }
 
+// WithAdditionalSecrets returns an immutable filter that also knows credentials
+// scoped to one outbound query. The original filter remains unchanged.
+func (filter *Filter) WithAdditionalSecrets(knownSecrets ...string) (*Filter, error) {
+	if filter == nil || filter.forceFailure {
+		return nil, ErrUnsafeOutput
+	}
+	combined := make([]string, 0, len(filter.knownSecrets)+len(knownSecrets))
+	combined = append(combined, filter.knownSecrets...)
+	combined = append(combined, knownSecrets...)
+	return NewFilter(combined...)
+}
+
 // Text redacts known secrets and credential-shaped substrings. It returns an
 // error with no output when any registered secret remains.
 func (filter *Filter) Text(ctx context.Context, input string) (string, error) {

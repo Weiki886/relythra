@@ -34,7 +34,19 @@ legacy_dir="${TEST_TMP}/relythra-dev-$(id -u)"
 mkdir -p "${legacy_dir}/logs"
 printf 'preserve me\n' >"${legacy_dir}/logs/previous.log"
 
+if output="$(env -u RELYTHRA_DATASOURCE_ALLOWED_HOSTS TMPDIR="${TEST_TMP}" \
+  RELYTHRA_DATABASE_URL='postgres://test@127.0.0.1:5432/relythra?sslmode=disable' \
+  "${ROOT_DIR}/scripts/dev.sh" --check 2>&1)"; then
+  printf 'check mode unexpectedly accepted a missing datasource allowlist\n' >&2
+  exit 1
+fi
+case "${output}" in
+  *'set RELYTHRA_DATASOURCE_ALLOWED_HOSTS'*) ;;
+  *) printf 'missing datasource allowlist was not reported clearly:\n%s\n' "${output}" >&2; exit 1 ;;
+esac
+
 if output="$(TMPDIR="${TEST_TMP}" RELYTHRA_DATABASE_URL='postgres://test@127.0.0.1:5432/relythra?sslmode=disable' \
+  RELYTHRA_DATASOURCE_ALLOWED_HOSTS='prometheus.example.test' \
   "${ROOT_DIR}/scripts/dev.sh" --check 2>&1)"; then
   case "${output}" in
     *'http://127.0.0.1:5173'*) ;;
@@ -51,6 +63,7 @@ if [ "$(find "${TEST_TMP}" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:sp
 fi
 
 if output="$(TMPDIR="${TEST_TMP}" RELYTHRA_DATABASE_URL='postgres://test@127.0.0.1:5432/relythra?sslmode=disable' \
+  RELYTHRA_DATASOURCE_ALLOWED_HOSTS='prometheus.example.test' \
   "${ROOT_DIR}/scripts/dev.sh" 2>&1)"; then
   printf 'startup unexpectedly succeeded with a failing Go build\n' >&2
   exit 1
@@ -73,6 +86,7 @@ fi
 
 if output="$(TMPDIR="${TEST_TMP}" MOCK_LSOF_BUSY_PORT=8080 \
   RELYTHRA_DATABASE_URL='postgres://test@127.0.0.1:5432/relythra?sslmode=disable' \
+  RELYTHRA_DATASOURCE_ALLOWED_HOSTS='prometheus.example.test' \
   "${ROOT_DIR}/scripts/dev.sh" 2>&1)"; then
   printf 'startup unexpectedly succeeded with port 8080 occupied\n' >&2
   exit 1

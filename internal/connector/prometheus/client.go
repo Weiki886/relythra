@@ -86,6 +86,7 @@ type SecretResolver interface {
 type Target struct {
 	Endpoint        string
 	SecretReference *secrets.Reference
+	ResolvedSecret  *secrets.Secret
 }
 
 type Sample struct {
@@ -204,22 +205,18 @@ func (connector *Connector) Query(ctx context.Context, target Target, query data
 		values.Set("end", strconv.FormatFloat(float64(query.End.UnixNano())/float64(time.Second), 'f', 3, 64))
 		values.Set("step", query.Step.String())
 	}
-	method := http.MethodPost
-	var bodyReader io.Reader = strings.NewReader(values.Encode())
-	// The demo gateway permits only GET on fixed read endpoints (ADR 0005).
-	if strings.HasPrefix(query.TemplateID, "prometheus.runtime.") {
-		method = http.MethodGet
-		requestURL += "?" + values.Encode()
-		bodyReader = nil
-	}
-	request, err := http.NewRequestWithContext(ctx, method, requestURL, bodyReader)
+	// Every registered query is read-only and bounded, and the demo gateway
+	// permits only GET on fixed read endpoints (ADR 0005).
+	requestURL += "?" + values.Encode()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return Result{}, queryError(ErrorInvalidQuery, err)
 	}
 	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("User-Agent", "Relythra/1.0")
-	if target.SecretReference != nil {
+	if target.ResolvedSecret != nil {
+		request.Header.Set("Authorization", "Bearer "+target.ResolvedSecret.Reveal())
+	} else if target.SecretReference != nil {
 		secret, err := connector.resolver.Resolve(ctx, *target.SecretReference)
 		if err != nil {
 			return Result{}, queryError(ErrorSecretUnavailable, err)

@@ -2,6 +2,7 @@ package prometheus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,27 +25,23 @@ func TestQueryUsesFixedTemplateAndBoundedReadonlyRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost || request.URL.Path != "/api/v1/query_range" {
+		if request.Method != http.MethodGet || request.URL.Path != "/api/v1/query_range" {
 			t.Errorf("request = %s %s", request.Method, request.URL.Path)
+			w.WriteHeader(http.StatusForbidden)
+			return
 		}
 		if request.Header.Get("Authorization") != "Bearer "+canary {
 			t.Error("missing Bearer credential")
 		}
-		if request.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
-			t.Errorf("content type = %q", request.Header.Get("Content-Type"))
-		}
-		if err := request.ParseForm(); err != nil {
-			t.Errorf("parse form: %v", err)
-		}
-		query := request.Form.Get("query")
+		query := request.URL.Query().Get("query")
 		if !strings.Contains(query, `demo_http_request_duration_seconds_bucket{service="checkout-api",env="prod"}`) {
 			t.Errorf("query is not the registered fixed template: %s", query)
 		}
-		if strings.Contains(query, canary) || request.URL.RawQuery != "" {
-			t.Error("credential or query leaked into URL")
+		if strings.Contains(request.URL.String(), canary) || request.Body != http.NoBody {
+			t.Error("credential leaked into URL or unexpected request body")
 		}
-		if request.Form.Get("step") != "30s" {
-			t.Errorf("step = %q", request.Form.Get("step"))
+		if request.URL.Query().Get("step") != "30s" {
+			t.Errorf("step = %q", request.URL.Query().Get("step"))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, prometheusResponse)
@@ -184,14 +181,12 @@ func TestRegisteredTemplatesBuildExpectedPromQLAndUnits(t *testing.T) {
 func TestInstantQueryUsesFixedTemplateAndParsesVectorResponse(t *testing.T) {
 	const instant = `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"service":"checkout-api","env":"prod","route":"/orders"},"value":[1793772300,"12.5"]}]}}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost || request.URL.Path != "/api/v1/query" {
+		if request.Method != http.MethodGet || request.URL.Path != "/api/v1/query" {
 			t.Errorf("request = %s %s", request.Method, request.URL.Path)
 		}
-		if err := request.ParseForm(); err != nil {
-			t.Errorf("parse form: %v", err)
-		}
-		if request.Form.Get("time") != "1793772300.000" || request.Form.Has("start") || request.Form.Has("end") || request.Form.Has("step") {
-			t.Errorf("instant parameters = %#v", request.Form)
+		parameters := request.URL.Query()
+		if parameters.Get("time") != "1793772300.000" || parameters.Has("start") || parameters.Has("end") || parameters.Has("step") {
+			t.Errorf("instant parameters = %#v", parameters)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, instant)
@@ -409,5 +404,34 @@ func TestRuntimeQueryUsesGetThroughReadonlyGateway(t *testing.T) {
 	_, err := connector.Query(context.Background(), Target{Endpoint: server.URL}, validQuery("prometheus.runtime.container.memory.v1"))
 	if err != nil {
 		t.Fatalf("runtime readonly query: %v", err)
+	}
+}
+
+func TestQueryUsesAlreadyResolvedSecretWithoutResolvingReferenceAgain(t *testing.T) {
+	const canary = "prometheus-scoped-secret-canary"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+canary {
+			t.Errorf("authorization header = %q", request.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, prometheusResponse)
+	}))
+	defer server.Close()
+
+	connector := newTestConnector(t, server, func(context.Context, secrets.Reference) (secrets.Secret, error) {
+		return secrets.Secret{}, errors.New("resolver must not be called for scoped secret")
+	})
+	secret, err := secrets.New(canary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := secrets.ParseReference("env:PROMETHEUS_TEST_TOKEN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connector.Query(context.Background(), Target{
+		Endpoint: server.URL, SecretReference: &reference, ResolvedSecret: &secret,
+	}, validQuery("prometheus.service.latency.v1")); err != nil {
+		t.Fatalf("Query: %v", err)
 	}
 }

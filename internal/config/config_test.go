@@ -247,7 +247,13 @@ func TestLoadAPIRejectsIncompleteDatabaseSecretConfiguration(t *testing.T) {
 func TestLoadWorkerUsesDefaults(t *testing.T) {
 	t.Parallel()
 
-	cfg, err := config.LoadWorker(environment(nil))
+	cfg, err := config.LoadWorker(environment(map[string]string{
+		"RELYTHRA_DATABASE_URL":             "postgres://localhost/relythra",
+		"RELYTHRA_DATASOURCE_ALLOWED_HOSTS": "prometheus",
+		"RELYTHRA_DATASOURCE_ALLOWED_PORTS": "9090",
+		"RELYTHRA_DATASOURCE_ALLOW_HTTP":    "true",
+		"RELYTHRA_DATASOURCE_ALLOW_PRIVATE": "true",
+	}))
 	if err != nil {
 		t.Fatalf("LoadWorker() error = %v", err)
 	}
@@ -257,12 +263,41 @@ func TestLoadWorkerUsesDefaults(t *testing.T) {
 	if cfg.HeartbeatInterval != 5*time.Second {
 		t.Errorf("HeartbeatInterval = %v, want 5s", cfg.HeartbeatInterval)
 	}
+	if cfg.PollInterval != time.Second {
+		t.Errorf("PollInterval = %v, want 1s", cfg.PollInterval)
+	}
+	if cfg.DatabaseURL.Reveal() != "postgres://localhost/relythra" || len(cfg.DataSourcePolicy.AllowedHosts) != 1 || cfg.DataSourcePolicy.AllowedHosts[0] != "prometheus" {
+		t.Fatal("worker database or outbound policy was not loaded")
+	}
+}
+
+func TestLoadWorkerRequiresDatabaseAndOutboundPolicy(t *testing.T) {
+	t.Parallel()
+
+	for name, values := range map[string]map[string]string{
+		"database": {
+			"RELYTHRA_DATASOURCE_ALLOWED_HOSTS": "prometheus",
+			"RELYTHRA_DATASOURCE_ALLOWED_PORTS": "9090",
+		},
+		"outbound policy": {
+			"RELYTHRA_DATABASE_URL": "postgres://localhost/relythra",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := config.LoadWorker(environment(values)); err == nil {
+				t.Fatalf("LoadWorker(%s missing) error = nil", name)
+			}
+		})
+	}
 }
 
 func TestLoadWorkerRejectsNonPositiveHeartbeatInterval(t *testing.T) {
 	t.Parallel()
 
 	_, err := config.LoadWorker(environment(map[string]string{
+		"RELYTHRA_DATABASE_URL":              "postgres://localhost/relythra",
+		"RELYTHRA_DATASOURCE_ALLOWED_HOSTS":  "prometheus",
+		"RELYTHRA_DATASOURCE_ALLOWED_PORTS":  "9090",
 		"RELYTHRA_WORKER_HEARTBEAT_INTERVAL": "0s",
 	}))
 	if err == nil {

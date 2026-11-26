@@ -215,3 +215,22 @@ func TestTextFailsClosedWhenKnownSecretCannotBeRemoved(t *testing.T) {
 		t.Fatalf("unsafe output = %q, want empty", output)
 	}
 }
+
+func TestWithAdditionalSecretsExtendsFilterWithoutMutatingOriginal(t *testing.T) {
+	base, err := NewFilter("database-secret-canary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queryFilter, err := base.WithAdditionalSecrets("datasource-secret-canary")
+	if err != nil {
+		t.Fatalf("WithAdditionalSecrets: %v", err)
+	}
+	redacted, err := queryFilter.Text(context.Background(), "database-secret-canary datasource-secret-canary")
+	if err != nil || strings.Contains(redacted, "database-secret-canary") || strings.Contains(redacted, "datasource-secret-canary") {
+		t.Fatalf("query filter did not redact both secrets: value=%q err=%v", redacted, err)
+	}
+	unchanged, err := base.Text(context.Background(), "datasource-secret-canary")
+	if err != nil || unchanged != "datasource-secret-canary" {
+		t.Fatalf("base filter was mutated: value=%q err=%v", unchanged, err)
+	}
+}
