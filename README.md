@@ -20,10 +20,14 @@ Relythra 是一个面向发布后异常排查的只读诊断系统：关联发�
 本地已启动 PostgreSQL 时，可以从仓库根目录一次启动 API、Worker 和前端开发服务器：
 
 ```bash
-./scripts/dev.sh
+RELYTHRA_DATASOURCE_ALLOWED_HOSTS=metrics.example.com \
+RELYTHRA_DATASOURCE_ALLOWED_PORTS=9090 \
+  ./scripts/dev.sh
 ```
 
-脚本会检查本机依赖，按需创建 `relythra` 数据库，执行数据库迁移，安装缺失的前端依赖，并等待三个服务通过健康检查。Worker 共用数据库连接配置，并要求配置 `RELYTHRA_DATASOURCE_ALLOWED_HOSTS` 与 `RELYTHRA_DATASOURCE_ALLOWED_PORTS`；本地脚本默认为主机 `localhost,127.0.0.1` 和端口 `9090`，可通过环境变量覆盖。Worker 查询仍受 allowlist、固定模板和 SecretRef 限制。服务地址如下：
+脚本会检查本机依赖，按需创建 `relythra` 数据库，执行数据库迁移，安装缺失的前端依赖，并等待三个服务通过健康检查。`RELYTHRA_DATASOURCE_ALLOWED_HOSTS` 必须显式设置为目标 Prometheus 主机，端口默认为 `9090`。出站策略拒绝 loopback，因此 `localhost`、`127.0.0.1` 和 `::1` 不能用于数据源；请使用符合策略且可从本机访问的非 loopback Prometheus 地址。Worker 查询仍受 allowlist、固定模板和 SecretRef 限制。服务地址如下：
+
+上面的 `metrics.example.com` 是文档示例，运行时请替换为实际可访问、且符合出站策略的 Prometheus 主机。
 
 - Web：<http://127.0.0.1:5173>
 - API readiness：<http://127.0.0.1:8080/health/ready>
@@ -55,8 +59,12 @@ RELYTHRA_DATABASE_URL_REF='file:/run/secrets/relythra-database-url' \
 只检查环境、准备本地数据库并查看脚本将使用的地址，不启动服务：
 
 ```bash
-./scripts/dev.sh --check
+RELYTHRA_DATASOURCE_ALLOWED_HOSTS=metrics.example.com \
+RELYTHRA_DATASOURCE_ALLOWED_PORTS=9090 \
+  ./scripts/dev.sh --check
 ```
+
+`--check` 同样要求显式提供数据源 allowlist，以确保检查的配置与实际启动策略一致。
 
 管理 API 默认关闭。需要在本地启用时，同时提供管理 Token 和数据源 allowlist，例如：
 

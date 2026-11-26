@@ -20,6 +20,9 @@ const (
 	collectionRetryBase = 5 * time.Second
 	collectionLookback  = 5 * time.Minute
 	collectionLookahead = 5 * time.Minute
+	collectionQueryStep = 2 * time.Minute
+	collectionMaxSeries = 2
+	collectionMaxPoints = int(datasource.MaxQueryWindow/collectionQueryStep) + 1
 )
 
 var (
@@ -188,7 +191,7 @@ func (processor *CollectionProcessor) collectPrometheus(
 		query, issues := datasource.ValidateQuery(template, datasource.QueryParameters{
 			Service: investigation.Service.Slug, Environment: *investigation.Environment,
 			QueryType: datasource.QueryTypeRange, Start: start.Format(time.RFC3339Nano), End: end.Format(time.RFC3339Nano),
-			Step: datasource.DefaultQueryStep.String(), MaxSeries: datasource.DefaultQueryMaxSeries, MaxPoints: datasource.DefaultQueryMaxPoints,
+			Step: collectionQueryStep.String(), MaxSeries: collectionMaxSeries, MaxPoints: collectionMaxPoints,
 		})
 		if len(issues) > 0 {
 			if err := processor.persistGap(ctx, job, investigation, string(datasource.SourcePrometheus), template.ID, template.Version, evidence.CollectionFailureRequestRejected, start, end); err != nil {

@@ -201,9 +201,11 @@ PR 合并后，维护者必须分别回读 PR 的 `merged` 状态、最终合并
 本地启动 API、Worker 和 Web（宿主机 PostgreSQL 已启动）：
 
 ```bash
-./scripts/dev.sh --check
-./scripts/dev.sh
+RELYTHRA_DATASOURCE_ALLOWED_HOSTS=metrics.example.com RELYTHRA_DATASOURCE_ALLOWED_PORTS=9090 ./scripts/dev.sh --check
+RELYTHRA_DATASOURCE_ALLOWED_HOSTS=metrics.example.com RELYTHRA_DATASOURCE_ALLOWED_PORTS=9090 ./scripts/dev.sh
 ```
+
+本地开发脚本要求显式配置符合出站策略的数据源主机；loopback 地址不被允许，检查模式和启动模式一致。
 
 常用验证命令：
 

@@ -32,7 +32,6 @@ fi
 
 export RELYTHRA_API_ADDR="127.0.0.1:8080"
 export RELYTHRA_WORKER_ADDR="127.0.0.1:8081"
-export RELYTHRA_DATASOURCE_ALLOWED_HOSTS="${RELYTHRA_DATASOURCE_ALLOWED_HOSTS:-localhost,127.0.0.1}"
 export RELYTHRA_DATASOURCE_ALLOWED_PORTS="${RELYTHRA_DATASOURCE_ALLOWED_PORTS:-9090}"
 export RELYTHRA_DATASOURCE_ALLOW_HTTP="${RELYTHRA_DATASOURCE_ALLOW_HTTP:-true}"
 export RELYTHRA_DATASOURCE_ALLOW_PRIVATE="${RELYTHRA_DATASOURCE_ALLOW_PRIVATE:-true}"
@@ -64,6 +63,11 @@ Environment:
                          Connection fields used with a password SecretRef.
   PGHOST, PGPORT, PGUSER, PGSSLMODE
                          Defaults for the connection fields above.
+  RELYTHRA_DATASOURCE_ALLOWED_HOSTS
+                         Required comma-separated Prometheus host allowlist.
+                         Loopback hosts are rejected by outbound policy.
+  RELYTHRA_DATASOURCE_ALLOWED_PORTS
+                         Allowed Prometheus ports (defaults to 9090).
 
 SecretRefs accept env:NAME or file:/absolute/path.
 
@@ -159,6 +163,10 @@ database_psql() {
 }
 
 preflight() {
+  if [[ ! "${RELYTHRA_DATASOURCE_ALLOWED_HOSTS:-}" =~ [^[:space:],] ]]; then
+    fail "set RELYTHRA_DATASOURCE_ALLOWED_HOSTS to the Prometheus host allowed by the outbound policy (loopback is not allowed)"
+  fi
+
   require_command go
   require_command node
   require_command npm

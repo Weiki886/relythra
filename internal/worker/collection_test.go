@@ -117,7 +117,61 @@ func (connector *collectionPrometheusFake) Query(_ context.Context, target prome
 	result.Start = query.Start
 	result.End = query.End
 	result.Step = query.Step
+	if len(result.Series) > query.MaxSeries {
+		result.Series = result.Series[:query.MaxSeries]
+		result.Partial = true
+	}
+	for index := range result.Series {
+		if len(result.Series[index].Samples) > query.MaxPoints {
+			result.Series[index].Samples = result.Series[index].Samples[:query.MaxPoints]
+			result.Partial = true
+		}
+	}
 	return result, nil
+}
+
+func TestCollectionWorkerKeepsSixHourPrometheusEvidenceWithinPayloadLimit(t *testing.T) {
+	ctx, mapping := validCollectionContextAndMapping()
+	collected := time.Date(2026, 11, 26, 6, 0, 0, 0, time.UTC)
+	ctx.Alert.StartsAt = collected.Add(-6 * time.Hour)
+	ctx.Alert.Status = "FIRING"
+	result := validCollectionPrometheusResult()
+	result.Series = make([]prometheusconnector.Series, 2)
+	for seriesIndex := range result.Series {
+		series := prometheusconnector.Series{Labels: map[string]string{"route": "/checkout", "series": string(rune('a' + seriesIndex))}}
+		for sampleIndex := 0; sampleIndex < 721; sampleIndex++ {
+			series.Samples = append(series.Samples, prometheusconnector.Sample{
+				Timestamp: collected.Add(-6*time.Hour + time.Duration(sampleIndex)*30*time.Second),
+				Value:     0.25,
+			})
+		}
+		result.Series[seriesIndex] = series
+	}
+	repository := &collectionRepositoryFake{context: ctx, mappings: []store.DataSourceMapping{mapping}}
+	connector := &collectionPrometheusFake{result: result}
+	filter, _ := redact.NewFilter()
+	processor, err := worker.NewCollectionProcessor(repository, connector, collectionSecretResolverFake{}, filter, worker.CollectionOptions{
+		Now: func() time.Time { return collected },
+	})
+	if err != nil {
+		t.Fatalf("NewCollectionProcessor: %v", err)
+	}
+	if err := processor.Process(context.Background(), validCollectionJob()); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(connector.calls) != 1 {
+		t.Fatalf("connector calls = %d, want 1", len(connector.calls))
+	}
+	query := connector.calls[0].query
+	if query.Step != 2*time.Minute || query.MaxSeries != 2 || query.MaxPoints != 181 {
+		t.Fatalf("query budget = step %s, series %d, points %d; want 2m, 2, 181", query.Step, query.MaxSeries, query.MaxPoints)
+	}
+	if len(repository.persistedPrometheus) != 1 {
+		t.Fatalf("persisted evidence = %d, want 1", len(repository.persistedPrometheus))
+	}
+	if got := len(repository.persistedPrometheus[0].ValueSummary); got > 64*1024 {
+		t.Fatalf("Evidence value summary is %d bytes, exceeds 64 KiB", got)
+	}
 }
 
 func TestCollectionWorkerPersistsPrometheusEvidenceBeforeCompletingLease(t *testing.T) {
