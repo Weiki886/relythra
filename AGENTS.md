@@ -9,7 +9,7 @@ Relythra 面向发布后异常排查，关联发布、代码变更、指标、�
 - 系统以只读诊断为主。不得自动执行回滚、重启、扩容、配置修改或其他外部写操作。
 - Agent 输出是根因假设，不是未经证据支持的绝对结论。无法证明时必须显式返回证据不足或 `inconclusive`。
 - 证据必须能回到原始来源核验；区分事实、推断、反证和未知项。
-- 当前仓库处于 M2 v0 证据链阶段：已有 Go/React/PostgreSQL/Compose 骨架、数据源映射管理、固定查询计划、固定路径连接测试、PostgreSQL 采集任务与租约 Worker；Worker 仅对精确映射的 Prometheus 固定模板执行只读采集，其他已配置的 Loki/GitHub/Runtime 来源目前写入结构化缺口。LogQL/GitHub/Runtime 真实采集、Agent、慢 SQL 完整 Compose E2E、完整工作台和通知仍未完成。文档和 PR 不得把规划能力写成已交付能力。
+- 当前仓库处于 M2 v0 证据链阶段：已有 Go/React/PostgreSQL/Compose 骨架、数据源映射管理、固定查询计划、固定路径连接测试、PostgreSQL 采集任务与租约 Worker；Worker 对精确映射的 Prometheus 与 Loki 固定模板执行只读采集，其他已配置的 GitHub/Runtime 来源目前写入结构化缺口。GitHub/Runtime 自动采集、Agent、慢 SQL 完整 Compose E2E、完整工作台和通知仍未完成。文档和 PR 不得把规划能力写成已交付能力。
 - 仓库是公开仓库。Issue、PR、Commit、测试夹具、日志、截图和 AI Prompt 都按公开数据处理。
 
 产品范围和阶段目标以 Issue #1 的 Proposal、Milestone 和对应 Issue 为准；已接受的技术边界记录在 `docs/adr/`。
@@ -53,7 +53,7 @@ Relythra 面向发布后异常排查，关联发布、代码变更、指标、�
 
 - API 的 liveness 只表示进程存活，不访问数据库；readiness 才检查 PostgreSQL 等必要依赖。
 - API 与 Worker 是独立生命周期，各自支持信号触发的优雅关闭。
-- Worker 暴露的 Prometheus 指标必须保持可解析、稳定命名，并能被冒烟或监控验证。Worker 使用独立 PostgreSQL 连接和消费循环；只能通过固定模板、出站 allowlist 与 SecretRef 执行只读 Prometheus 查询。每个任务的 Evidence 或结构化缺口持久化成功后才能完成；外部失败使用稳定错误码、租约重试，不记录租约 token、SecretRef 或任意远端错误正文。
+- Worker 暴露的 Prometheus 指标必须保持可解析、稳定命名，并能被冒烟或监控验证。Worker 使用独立 PostgreSQL 连接和消费循环；只能通过固定模板、出站 allowlist 与 SecretRef 执行只读 Prometheus 与 Loki 查询。Loki 每个模板最多一页、20 条日志和两小时时间窗，原始与脱敏 JSON 均受 32 KiB 预算约束；裁剪、分页与时间偏差必须保留部分采集标记。每个任务的 Evidence 或结构化缺口持久化成功后才能完成；外部失败使用稳定错误码、租约重试，不记录租约 token、SecretRef 或任意远端错误正文。
 - PostgreSQL 迁移由独立命令执行。Compose 按数据库健康、迁移成功、API 健康的顺序启动。
 - 面向浏览器的错误响应不得泄露连接串、内部地址、堆栈或凭据；详细错误写入脱敏后的服务端日志。
 - 前端通过严格类型、ESLint、Vitest 和生产构建验证；不得用 `any`、禁用 Hook 规则或关闭类型检查来绕过问题。
@@ -63,7 +63,7 @@ Relythra 面向发布后异常排查，关联发布、代码变更、指标、�
 连接 GitHub、Grafana、Prometheus、Loki、容器和机器状态时，必须遵守以下规则：
 
 - 所有连接器默认只读，使用最小权限凭据；禁止通过连接器触发回滚、部署、重启、扩容或配置写入。
-- 当前只实现固定路径、固定响应上限的连接测试；真实业务查询必须复用同一出站策略、模板注册表和 Evidence 边界，未实现前不得由 API 接受任意查询文本。
+- 连接测试使用固定路径和响应上限；已接入的 Prometheus、Loki 业务查询复用同一出站策略、模板注册表和 Evidence 边界，API 不得接受任意查询文本。
 - 外部请求必须有超时、重试上限、结果大小/分页上限和明确的失败降级，不进行无界查询。
 - 数据源地址必须经过配置与白名单校验，防止 SSRF；不得允许用户直接提交任意 URL 或任意 PromQL/LogQL 执行入口。
 - Webhook 必须校验来源、大小、格式和重复投递；错误信息保持稳定且不泄露内部实现。

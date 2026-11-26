@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	lokiconnector "github.com/Weiki886/relythra/internal/connector/loki"
 	prometheusconnector "github.com/Weiki886/relythra/internal/connector/prometheus"
 	"github.com/Weiki886/relythra/internal/datasource"
 	"github.com/Weiki886/relythra/internal/evidence"
@@ -36,6 +37,7 @@ type collectionRepository interface {
 	GetInvestigationContext(context.Context, string) (store.InvestigationContext, error)
 	ListDataSourceMappings(context.Context, string, string, string) ([]store.DataSourceMapping, error)
 	PersistPrometheusEvidence(context.Context, prometheusconnector.Result, evidence.PrometheusEvidenceContext, *redact.Filter) (store.Evidence, bool, error)
+	PersistLokiEvidence(context.Context, lokiconnector.Result, evidence.LokiEvidenceContext, *redact.Filter) (store.Evidence, bool, error)
 	PersistEvidence(context.Context, evidence.Record) (store.Evidence, bool, error)
 	CompleteInvestigationCollectionJob(context.Context, string, string) (bool, error)
 	RetryInvestigationCollectionJob(context.Context, string, string, string, time.Duration) (bool, error)
@@ -45,18 +47,24 @@ type prometheusQueryer interface {
 	Query(context.Context, prometheusconnector.Target, datasource.NormalizedQuery) (prometheusconnector.Result, error)
 }
 
+type lokiQueryer interface {
+	Query(context.Context, lokiconnector.Target, datasource.NormalizedQuery) (lokiconnector.Result, error)
+}
+
 type CollectionOptions struct {
-	Now        func() time.Time
-	RetryDelay func(attempt int) time.Duration
+	LokiConnector lokiQueryer
+	Now           func() time.Time
+	RetryDelay    func(attempt int) time.Duration
 }
 
 type CollectionProcessor struct {
-	repository collectionRepository
-	connector  prometheusQueryer
-	resolver   prometheusconnector.SecretResolver
-	filter     *redact.Filter
-	now        func() time.Time
-	retryDelay func(int) time.Duration
+	repository    collectionRepository
+	connector     prometheusQueryer
+	lokiConnector lokiQueryer
+	resolver      prometheusconnector.SecretResolver
+	filter        *redact.Filter
+	now           func() time.Time
+	retryDelay    func(int) time.Duration
 }
 
 func NewCollectionProcessor(
@@ -79,12 +87,13 @@ func NewCollectionProcessor(
 		}
 	}
 	return &CollectionProcessor{
-		repository: repository,
-		connector:  connector,
-		resolver:   resolver,
-		filter:     filter,
-		now:        options.Now,
-		retryDelay: options.RetryDelay,
+		repository:    repository,
+		connector:     connector,
+		lokiConnector: options.LokiConnector,
+		resolver:      resolver,
+		filter:        filter,
+		now:           options.Now,
+		retryDelay:    options.RetryDelay,
 	}, nil
 }
 
@@ -116,20 +125,18 @@ func (processor *CollectionProcessor) Process(ctx context.Context, job store.Inv
 	prometheusMappings := 0
 	retryCode := ""
 	for _, mapping := range mappings {
+		var collectErr error
 		switch mapping.SourceType {
 		case datasource.SourcePrometheus:
 			prometheusMappings++
-			if err := processor.collectPrometheus(ctx, job, investigation, mapping, windowStart, windowEnd); err != nil {
-				var failure *collectionFailure
-				if errors.As(err, &failure) {
-					if retryCode == "" {
-						retryCode = failure.code
-					}
-					continue
-				}
-				return processor.retry(ctx, job, "evidence_persist_failed")
+			collectErr = processor.collectPrometheus(ctx, job, investigation, mapping, windowStart, windowEnd)
+		case datasource.SourceLoki:
+			if processor.lokiConnector != nil {
+				collectErr = processor.collectLoki(ctx, job, investigation, mapping, windowStart, windowEnd)
+			} else if err := processor.persistUnsupportedGaps(ctx, job, investigation, mapping, windowStart, windowEnd); err != nil {
+				return processor.retry(ctx, job, "gap_persist_failed")
 			}
-		case datasource.SourceLoki, datasource.SourceGitHub, datasource.SourceRuntime:
+		case datasource.SourceGitHub, datasource.SourceRuntime:
 			if err := processor.persistUnsupportedGaps(ctx, job, investigation, mapping, windowStart, windowEnd); err != nil {
 				return processor.retry(ctx, job, "gap_persist_failed")
 			}
@@ -137,6 +144,18 @@ func (processor *CollectionProcessor) Process(ctx context.Context, job store.Inv
 			// Grafana mappings describe alert metadata; alert context is already persisted.
 		default:
 			return processor.retry(ctx, job, "mapping_source_unsupported")
+		}
+		if collectErr != nil {
+			var failure *collectionFailure
+			if !errors.As(collectErr, &failure) {
+				return processor.retry(ctx, job, "evidence_persist_failed")
+			}
+			if failure.code == "evidence_persist_failed" || failure.code == "gap_persist_failed" {
+				return processor.retry(ctx, job, failure.code)
+			}
+			if retryCode == "" {
+				retryCode = failure.code
+			}
 		}
 	}
 	if prometheusMappings == 0 {
