@@ -16,7 +16,7 @@ Issue #16 要求告警到达后自动收集告警窗口附近的证据。当前 
 - 将新任务写入与 Investigation 创建处于同一数据库事务。事务失败时 Investigation 和任务一起回滚，避免任务指向不存在的调查或出现成功接收但没有任务的状态。
 - `NEEDS_MAPPING` 告警不创建 Investigation 或采集任务。若告警仍为 `FIRING`，管理员通过版本受控 remap 首次创建 Investigation 时，在同一事务内补建任务。`RESOLVED` 不创建新 Investigation 或任务。
 - 每个任务只通过外键关联 Investigation，不复制 Alert 正文、注释、日志、指标结果、查询文本、SecretRef、凭据、源码 Diff 或故障注入元数据。采集器在执行时通过 Investigation 读取已持久化且脱敏的领域上下文，并使用已注册的固定查询计划。
-- 后续 Worker 使用 PostgreSQL 队列领取任务，支持并发安全 claim、有限批量、有限租约和有限重试；回收过期 lease 后可安全重试。到达重试上限时以稳定错误码标记任务失败并保留调查，不能删除证据或触发外部写操作。
+- Worker 使用 PostgreSQL 队列领取任务，支持并发安全 claim、单任务消费、有限租约和有限重试；回收过期 lease 后可安全重试。到达重试上限时以稳定错误码标记任务失败并保留调查，不能删除证据或触发外部写操作。
 - Worker 消费任务不等同于启动 LLM Agent。采集器仅执行允许的只读连接器调用；任意 PromQL/LogQL 文本、部署、回滚、重启、扩缩容、配置修改及通知仍不在本 ADR 授权范围内。
 - 任务状态只能在创建事务后由 Worker 更新。终态任务不得被 webhook 重投复活；需要新的调查尝试时，按 ADR 0002 创建新的 Investigation attempt 和独立任务。
 
@@ -33,8 +33,9 @@ Issue #16 要求告警到达后自动收集告警窗口附近的证据。当前 
 
 ## 实施阶段
 
-- 首个切片实现与 Investigation 同事务的任务持久化、幂等约束和 remap 入队。
-- 第二个切片实现 `FOR UPDATE SKIP LOCKED` 有界领取、UUID 租约 token、过期重领、受限退避重试和最大尝试次数终止；仓储契约本身不启动生产消费循环。
-- 后续切片仍需将 Worker 消费循环装配到固定模板只读采集器，写入已验证的 Evidence，并完成 Compose 慢 SQL 故障 E2E。不得在来源采集尚未实现时将任务标记成功。
+- 已实现：与 Investigation 同事务的任务持久化、幂等约束和 remap 入队。
+- 已实现：`FOR UPDATE SKIP LOCKED` 单任务领取、UUID 租约 token、过期重领、受限退避重试和最大尝试次数终止。
+- 当前切片：Worker 使用固定 Prometheus 模板采集并持久化 Evidence；其他已配置的 Loki/GitHub/Runtime 来源和未配置 Prometheus 映射写入结构化缺口。任务只在结果或缺口成功持久化后完成。
+- 后续仍需实现 Loki/GitHub/Runtime 采集，并完成 Compose 慢 SQL 故障 E2E。完整验收前不得关闭 Issue #16。
 
 Issue #16 在完整链路验收前保持开放。

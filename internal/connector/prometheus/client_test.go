@@ -2,6 +2,7 @@ package prometheus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -409,5 +410,34 @@ func TestRuntimeQueryUsesGetThroughReadonlyGateway(t *testing.T) {
 	_, err := connector.Query(context.Background(), Target{Endpoint: server.URL}, validQuery("prometheus.runtime.container.memory.v1"))
 	if err != nil {
 		t.Fatalf("runtime readonly query: %v", err)
+	}
+}
+
+func TestQueryUsesAlreadyResolvedSecretWithoutResolvingReferenceAgain(t *testing.T) {
+	const canary = "prometheus-scoped-secret-canary"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+canary {
+			t.Errorf("authorization header = %q", request.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, prometheusResponse)
+	}))
+	defer server.Close()
+
+	connector := newTestConnector(t, server, func(context.Context, secrets.Reference) (secrets.Secret, error) {
+		return secrets.Secret{}, errors.New("resolver must not be called for scoped secret")
+	})
+	secret, err := secrets.New(canary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := secrets.ParseReference("env:PROMETHEUS_TEST_TOKEN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connector.Query(context.Background(), Target{
+		Endpoint: server.URL, SecretReference: &reference, ResolvedSecret: &secret,
+	}, validQuery("prometheus.service.latency.v1")); err != nil {
+		t.Fatalf("Query: %v", err)
 	}
 }

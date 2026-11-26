@@ -55,6 +55,24 @@ func TestFromCollectionFailureCreatesStructuredMissingEvidence(t *testing.T) {
 	}
 }
 
+func TestFromCollectionFailureAcceptsMissingMappingReason(t *testing.T) {
+	filter, _ := redact.NewFilter()
+	input := validCollectionGap()
+	input.ReasonCode = CollectionFailureMissingMapping
+	if _, err := FromCollectionFailure(context.Background(), input, filter); err != nil {
+		t.Fatalf("FromCollectionFailure(missing mapping): %v", err)
+	}
+}
+
+func TestFromCollectionFailureAcceptsUnimplementedCollectorReason(t *testing.T) {
+	filter, _ := redact.NewFilter()
+	input := validCollectionGap()
+	input.ReasonCode = CollectionFailureUnsupported
+	if _, err := FromCollectionFailure(context.Background(), input, filter); err != nil {
+		t.Fatalf("FromCollectionFailure(unimplemented collector): %v", err)
+	}
+}
+
 func TestFromCollectionFailureAcceptsRegisteredTemplatesBySource(t *testing.T) {
 	filter, _ := redact.NewFilter()
 	for _, testCase := range []struct {

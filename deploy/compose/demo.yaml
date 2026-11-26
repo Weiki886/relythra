@@ -39,7 +39,17 @@ services:
       - grafana_webhook_secret
   worker:
     <<: *limits
+    environment:
+      RELYTHRA_DATASOURCE_ALLOWED_HOSTS: observability-gateway,grafana
+      RELYTHRA_DATASOURCE_ALLOWED_PORTS: 9090,3100,3000
+      RELYTHRA_DATASOURCE_ALLOW_HTTP: "true"
+      RELYTHRA_DATASOURCE_ALLOW_PRIVATE: "true"
+    secrets:
+      - postgres_password
+      - observability_token
     networks: [control, diagnosis, telemetry]
+    depends_on:
+      observability-gateway: {condition: service_healthy}
   web:
     <<: *limits
     networks: [control]

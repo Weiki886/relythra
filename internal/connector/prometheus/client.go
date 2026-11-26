@@ -86,6 +86,7 @@ type SecretResolver interface {
 type Target struct {
 	Endpoint        string
 	SecretReference *secrets.Reference
+	ResolvedSecret  *secrets.Secret
 }
 
 type Sample struct {
@@ -219,7 +220,9 @@ func (connector *Connector) Query(ctx context.Context, target Target, query data
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("User-Agent", "Relythra/1.0")
-	if target.SecretReference != nil {
+	if target.ResolvedSecret != nil {
+		request.Header.Set("Authorization", "Bearer "+target.ResolvedSecret.Reveal())
+	} else if target.SecretReference != nil {
 		secret, err := connector.resolver.Resolve(ctx, *target.SecretReference)
 		if err != nil {
 			return Result{}, queryError(ErrorSecretUnavailable, err)

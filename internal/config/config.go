@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	defaultAPIAddress        = ":8080"
-	defaultWorkerAddress     = ":8081"
-	defaultShutdownTimeout   = 10 * time.Second
-	defaultHeartbeatInterval = 5 * time.Second
+	defaultAPIAddress         = ":8080"
+	defaultWorkerAddress      = ":8081"
+	defaultShutdownTimeout    = 10 * time.Second
+	defaultHeartbeatInterval  = 5 * time.Second
+	defaultWorkerPollInterval = time.Second
 )
 
 type API struct {
@@ -39,6 +40,9 @@ var deploymentSourcePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 type Worker struct {
 	Address           string
 	HeartbeatInterval time.Duration
+	PollInterval      time.Duration
+	DatabaseURL       secrets.Secret
+	DataSourcePolicy  outbound.PolicyConfig
 }
 
 func LoadAPI(getenv func(string) string) (API, error) {
@@ -302,7 +306,25 @@ func allowedSSLMode(value string) bool {
 }
 
 func LoadWorker(getenv func(string) string) (Worker, error) {
+	if getenv == nil {
+		return Worker{}, fmt.Errorf("environment lookup is required")
+	}
+	databaseURL, err := loadDatabaseURL(getenv)
+	if err != nil {
+		return Worker{}, err
+	}
+	dataSourcePolicy, err := loadDataSourcePolicy(getenv)
+	if err != nil {
+		return Worker{}, err
+	}
+	if len(dataSourcePolicy.AllowedHosts) == 0 || len(dataSourcePolicy.AllowedPorts) == 0 {
+		return Worker{}, fmt.Errorf("RELYTHRA_DATASOURCE_ALLOWED_HOSTS and RELYTHRA_DATASOURCE_ALLOWED_PORTS are required for worker collection")
+	}
 	heartbeatInterval, err := positiveDuration(getenv, "RELYTHRA_WORKER_HEARTBEAT_INTERVAL", defaultHeartbeatInterval)
+	if err != nil {
+		return Worker{}, err
+	}
+	pollInterval, err := positiveDuration(getenv, "RELYTHRA_WORKER_POLL_INTERVAL", defaultWorkerPollInterval)
 	if err != nil {
 		return Worker{}, err
 	}
@@ -310,6 +332,9 @@ func LoadWorker(getenv func(string) string) (Worker, error) {
 	return Worker{
 		Address:           valueOrDefault(getenv("RELYTHRA_WORKER_ADDR"), defaultWorkerAddress),
 		HeartbeatInterval: heartbeatInterval,
+		PollInterval:      pollInterval,
+		DatabaseURL:       databaseURL,
+		DataSourcePolicy:  dataSourcePolicy,
 	}, nil
 }
 

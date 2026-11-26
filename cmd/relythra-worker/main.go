@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,8 +13,14 @@ import (
 	"time"
 
 	"github.com/Weiki886/relythra/internal/config"
+	prometheusconnector "github.com/Weiki886/relythra/internal/connector/prometheus"
 	securitylogging "github.com/Weiki886/relythra/internal/security/logging"
+	"github.com/Weiki886/relythra/internal/security/outbound"
+	"github.com/Weiki886/relythra/internal/security/redact"
+	"github.com/Weiki886/relythra/internal/security/secrets"
+	"github.com/Weiki886/relythra/internal/store"
 	"github.com/Weiki886/relythra/internal/worker"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 func main() {
@@ -34,12 +41,49 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	filter, err := redact.NewFilter(cfg.DatabaseURL.Reveal())
+	if err != nil {
+		return err
+	}
+	logger, err := securitylogging.NewDefaultLogger(os.Stderr, cfg.DatabaseURL.Reveal())
+	if err != nil {
+		return err
+	}
+	slog.SetDefault(logger)
+
+	db, err := sql.Open("pgx", cfg.DatabaseURL.Reveal())
+	if err != nil {
+		return errors.New("open worker database failed")
+	}
+	defer db.Close()
+	startupContext, cancelStartup := context.WithTimeout(context.Background(), 5*time.Second)
+	err = db.PingContext(startupContext)
+	cancelStartup()
+	if err != nil {
+		return errors.New("worker database is unavailable")
+	}
+
+	policy, err := outbound.NewPolicy(cfg.DataSourcePolicy)
+	if err != nil {
+		return errors.New("worker outbound policy is invalid")
+	}
+	resolver := secrets.NewResolver(nil, nil)
+	connector, err := prometheusconnector.NewConnector(policy, resolver)
+	if err != nil {
+		return errors.New("initialize worker Prometheus connector failed")
+	}
+	processor, err := worker.NewCollectionProcessor(store.NewPostgres(db), connector, resolver, filter, worker.CollectionOptions{})
+	if err != nil {
+		return err
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	heartbeat := worker.NewHeartbeat(cfg.HeartbeatInterval)
 	go heartbeat.Start(ctx)
+	collectionErrors := make(chan error, 1)
+	go func() { collectionErrors <- processor.Run(ctx, cfg.PollInterval) }()
 
 	server := &http.Server{
 		Addr:              cfg.Address,
@@ -52,16 +96,33 @@ func run() error {
 		errorChannel <- server.ListenAndServe()
 	}()
 
+	var runErr error
 	select {
 	case <-ctx.Done():
 	case err := <-errorChannel:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+		if !errors.Is(err, http.ErrServerClosed) {
+			runErr = err
 		}
-		return err
+		stop()
+	case err := <-collectionErrors:
+		if err != nil {
+			runErr = errors.New("worker collection loop stopped")
+		}
+		stop()
 	}
 
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return server.Shutdown(shutdownContext)
+	shutdownErr := server.Shutdown(shutdownContext)
+	select {
+	case <-collectionErrors:
+	case <-shutdownContext.Done():
+		if shutdownErr == nil {
+			shutdownErr = shutdownContext.Err()
+		}
+	}
+	if runErr != nil {
+		return runErr
+	}
+	return shutdownErr
 }

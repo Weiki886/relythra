@@ -2,7 +2,7 @@
 
 Relythra 是一个面向发布后异常排查的只读诊断系统：关联发布与代码变更、指标、日志和运行状态，组织可追溯的根因假设与处理建议。
 
-当前仓库已完成 Issue #2 的工程骨架、Issue #3 的领域持久化契约、Issue #5 的安全数据边界、Issue #4 的数据源映射管理、Issue #7 的诊断评测案例契约、Issue #8 的部署事件接入，以及 Issue #9 的 Grafana 告警接入：Go API 与 Worker、React 健康状态页、PostgreSQL 领域与不可变审计迁移、受签名保护的部署与告警 Webhook、告警去重/Incident/Investigation 创建、人工告警重映射、部署候选查询、只读追溯 API、SecretRef、脱敏、Prompt allowlist、固定查询模板、受限连接测试、Docker Compose 和 CI。真实 Prometheus/LogQL 业务查询、Agent、完整工作台与通知能力尚未实现；本项目不是生产部署方案。
+当前仓库已完成 Issue #2 的工程骨架、Issue #3 的领域持久化契约、Issue #5 的安全数据边界、Issue #4 的数据源映射管理、Issue #7 的诊断评测案例契约、Issue #8 的部署事件接入，以及 Issue #9 的 Grafana 告警接入：Go API 与 Worker、React 健康状态页、PostgreSQL 领域与不可变审计迁移、受签名保护的部署与告警 Webhook、告警去重/Incident/Investigation 创建、人工告警重映射、部署候选查询、只读追溯 API、SecretRef、脱敏、Prompt allowlist、固定查询模板、受限连接测试、Docker Compose 和 CI。Worker 已开始消费 PostgreSQL 持久化采集任务，并仅对精确映射的 Prometheus 固定模板执行有界只读查询；其他已配置来源以结构化缺口进入 Evidence 时间线。LogQL/GitHub/Runtime 真实采集、完整慢 SQL Compose E2E、Agent、完整工作台与通知能力尚未完成；本项目不是生产部署方案。
 
 ## 工具链
 
@@ -23,7 +23,7 @@ Relythra 是一个面向发布后异常排查的只读诊断系统：关联发�
 ./scripts/dev.sh
 ```
 
-脚本会检查本机依赖，按需创建 `relythra` 数据库，执行数据库迁移，安装缺失的前端依赖，并等待三个服务通过健康检查。服务地址如下：
+脚本会检查本机依赖，按需创建 `relythra` 数据库，执行数据库迁移，安装缺失的前端依赖，并等待三个服务通过健康检查。Worker 共用数据库连接配置，并要求配置 `RELYTHRA_DATASOURCE_ALLOWED_HOSTS` 与 `RELYTHRA_DATASOURCE_ALLOWED_PORTS`；本地脚本默认为主机 `localhost,127.0.0.1` 和端口 `9090`，可通过环境变量覆盖。Worker 查询仍受 allowlist、固定模板和 SecretRef 限制。服务地址如下：
 
 - Web：<http://127.0.0.1:5173>
 - API readiness：<http://127.0.0.1:8080/health/ready>
@@ -95,7 +95,7 @@ cp .env.example .env
 docker compose --file deploy/compose/compose.yaml up --build
 ```
 
-`.env.example` 只保存 PostgreSQL 密码文件、管理 Token 文件和演示数据源策略，不包含凭据值。Compose 把两个 Secret 只读挂载给需要的进程；API 入口再以 UID 10001 可读的权限复制到运行时目录。Compose 会等待 PostgreSQL 健康、执行迁移，再启动 API、Worker 和 Web。首次启动需要拉取镜像并安装依赖，耗时会随网络变化。
+`.env.example` 只保存 PostgreSQL 密码文件、管理 Token 文件和演示数据源策略，不包含凭据值。Compose 把两个 Secret 只读挂载给需要的进程；API 入口再以 UID 10001 可读的权限复制到运行时目录。Compose 会等待 PostgreSQL 健康、执行迁移，再启动 API、Worker 和 Web。API 与 Worker 使用同一数据源 allowlist；Worker 需要只读 PostgreSQL 凭据与 Prometheus 所需的 Secret 挂载。首次启动需要拉取镜像并安装依赖，耗时会随网络变化。
 
 - Web：<http://localhost:3000>
 - API liveness：<http://localhost:8080/health/live>
@@ -288,4 +288,4 @@ RELYTHRA_POSTGRES_PASSWORD_FILE=/absolute/path/to/local-password \
 
 凭据轮换时先撤销旧值，再替换 Secret 文件或环境变量并重启使用它的进程；仅替换文件但保留旧凭据有效不构成完成处置。安全问题请按 [SECURITY.md](SECURITY.md) 的私密流程报告。
 
-诊断系统不自动回滚、重启或扩容。当前已实现单管理员 Token、部署与 Grafana Webhook 签名/重放防护、数据源 allowlist、DNS/IP 锁定、零重定向和固定路径连接测试；尚未实现多租户 RBAC、真实 Prometheus/LogQL 业务查询、Kubernetes 诊断、通知、模型调用和公网访问控制。生产数据库角色隔离、通用数据保留期和外部审计留存仍需后续设计。健康检查只反映进程与数据库连通性，不代表业务诊断已经可用。
+诊断系统不自动回滚、重启或扩容。当前已实现单管理员 Token、部署与 Grafana Webhook 签名/重放防护、数据源 allowlist、DNS/IP 锁定、零重定向、固定路径连接测试、以及 Worker 对已映射 Prometheus 固定模板的真实只读查询和 Evidence 持久化；尚未实现多租户 RBAC、LogQL/GitHub/Runtime 真实采集、Kubernetes 诊断、通知、模型调用和公网访问控制。生产数据库角色隔离、通用数据保留期和外部审计留存仍需后续设计。健康检查只反映进程与数据库连通性，不代表业务诊断已经可用。

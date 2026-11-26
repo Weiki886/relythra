@@ -22,6 +22,8 @@ const (
 	CollectionFailureInvalidResponse  CollectionFailureCode = "invalid_response"
 	CollectionFailureRequestRejected  CollectionFailureCode = "request_rejected"
 	CollectionFailureUnknown          CollectionFailureCode = "unknown"
+	CollectionFailureMissingMapping   CollectionFailureCode = "missing_mapping"
+	CollectionFailureUnsupported      CollectionFailureCode = "collector_not_implemented"
 )
 
 type CollectionGapInput struct {
@@ -51,7 +53,7 @@ type collectionGapSummary struct {
 }
 
 // FromCollectionFailure records a safe, structured gap for one failed source
-// query. It deliberately accepts a reason code instead of an error string.
+// query or an unavailable collector. It deliberately accepts a reason code instead of an error string.
 func FromCollectionFailure(
 	ctx context.Context,
 	input CollectionGapInput,
@@ -123,7 +125,7 @@ func validCollectionTemplate(source, templateID string) bool {
 func validCollectionFailureCode(code CollectionFailureCode) bool {
 	switch code {
 	case CollectionFailureTimeout, CollectionFailureRateLimited, CollectionFailurePermissionDenied,
-		CollectionFailureUnavailable, CollectionFailureInvalidResponse, CollectionFailureRequestRejected,
+		CollectionFailureUnavailable, CollectionFailureInvalidResponse, CollectionFailureRequestRejected, CollectionFailureMissingMapping, CollectionFailureUnsupported,
 		CollectionFailureUnknown:
 		return true
 	default:
