@@ -1,4 +1,5 @@
 import base64
+import importlib.util
 import json
 import os
 import subprocess
@@ -41,19 +42,93 @@ def prometheus_timeline(investigation_id="demo-investigation"):
 
 
 class DemoPrometheusEvidenceTests(unittest.TestCase):
-    def test_accepts_finite_positive_prometheus_latency(self):
-        response = {"status": "success", "data": {"result": [{"value": [1795651200, "0.125"]}]}}
-        assert_finite_latency_response(response)
+    def test_accepts_finite_positive_prometheus_range_latency(self):
+        response = {"status": "success", "data": {"resultType": "matrix", "result": [
+            {"values": [[1795651080, "NaN"], [1795651200, "0.125"]]},
+        ]}}
+        self.assertEqual(assert_finite_latency_response(response), 0.125)
 
-    def test_rejects_missing_nan_or_zero_latency(self):
+    def test_rejects_missing_nan_or_zero_range_latency_and_instant_results(self):
         responses = [
-            {"status": "success", "data": {"result": []}},
-            {"status": "success", "data": {"result": [{"value": [1795651200, "NaN"]}]}},
-            {"status": "success", "data": {"result": [{"value": [1795651200, "0"]}]}},
+            {"status": "success", "data": {"resultType": "matrix", "result": []}},
+            {"status": "success", "data": {"resultType": "matrix", "result": [{"values": []}]}},
+            {"status": "success", "data": {"resultType": "vector", "result": [{"value": [1795651200, "0.125"]}]}},
         ]
+        for value in ("NaN", "+Inf", "-Inf", "0", "-1", "invalid", None):
+            responses.append({"status": "success", "data": {"resultType": "matrix", "result": [
+                {"values": [[1795651200, value]]},
+            ]}})
         for response in responses:
             with self.subTest(response=response), self.assertRaisesRegex(AssertionError, "finite positive latency"):
                 assert_finite_latency_response(response)
+
+    def run_latency_priming(self, range_ready):
+        spec = importlib.util.spec_from_file_location("demo_smoke_assert", ROOT / "scripts/demo-assert.py")
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        clock = [1000.0]
+        requests = []
+        range_queries = []
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        def http(port, path, authorized=False):
+            if port == 28090:
+                self.assertEqual(path, "/orders")
+                requests.append(clock[0])
+                return 200, b'{"available": 42}'
+            self.assertEqual(port, 29090)
+            self.assertTrue(authorized)
+            url = smoke.urllib.parse.urlparse(path)
+            params = smoke.urllib.parse.parse_qs(url.query)
+            if url.path == "/api/v1/query":
+                # The old instant check passes as soon as traffic spans two scrapes.
+                return 200, json.dumps({"status": "success", "data": {"resultType": "vector", "result": [
+                    {"value": [clock[0], "0.125"]},
+                ]}}).encode()
+            self.assertEqual(url.path, "/api/v1/query_range")
+            start, end, step = (float(params[key][0]) for key in ("start", "end", "step"))
+            self.assertEqual(end, clock[0])
+            self.assertEqual(end - start, 300)
+            self.assertEqual(step, 120)
+            self.assertIn('service="inventory",env="demo"', params["query"][0])
+            self.assertIn("[5m]", params["query"][0])
+            range_queries.append(clock[0])
+            # Finite histograms begin after two 5s scrapes. Worker evaluations
+            # at end-300, end-180 and end-60 initially all precede that data.
+            values = [[start + index * step, "0.125" if range_ready and start + index * step >= 1010 else "NaN"]
+                      for index in range(3)]
+            return 200, json.dumps({"status": "success", "data": {"resultType": "matrix", "result": [
+                {"values": values},
+            ]}}).encode()
+
+        with patch.object(smoke, "http", side_effect=http), \
+             patch.object(smoke.time, "time", side_effect=lambda: clock[0]), \
+             patch.object(smoke.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(smoke.time, "sleep", side_effect=sleep), \
+             patch("builtins.print"):
+            if range_ready:
+                smoke.prime_prometheus_latency()
+            else:
+                with self.assertRaisesRegex(AssertionError, "Timed out"):
+                    smoke.prime_prometheus_latency()
+        return clock[0], requests, range_queries
+
+    def test_priming_keeps_traffic_until_worker_range_grid_has_finite_data(self):
+        finished, requests, queries = self.run_latency_priming(range_ready=True)
+        self.assertGreaterEqual(finished, 1070)
+        self.assertGreater(len(requests), 3)
+        self.assertGreater(len(queries), 1)
+        self.assertLessEqual(max(b - a for a, b in zip(requests, requests[1:])), 6)
+        self.assertEqual(requests[-1], queries[-1])
+
+    def test_priming_times_out_when_worker_range_grid_stays_empty(self):
+        finished, requests, queries = self.run_latency_priming(range_ready=False)
+        self.assertGreaterEqual(finished, 1180)
+        self.assertLessEqual(finished, 1186)
+        self.assertGreater(len(requests), 3)
+        self.assertGreater(len(queries), 1)
 
     def test_mapping_is_scoped_to_demo_service_and_fixed_read_only_template(self):
         mapping = prometheus_mapping_payload("project-id", "service-id")

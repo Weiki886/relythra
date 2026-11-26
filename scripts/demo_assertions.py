@@ -52,16 +52,20 @@ def assert_prometheus_evidence_timeline(timeline, investigation_id):
 
 
 def assert_finite_latency_response(response):
-    result = response.get("data", {}).get("result") if response.get("status") == "success" else None
+    data = response.get("data", {}) if response.get("status") == "success" else {}
+    result = data.get("result") if data.get("resultType") == "matrix" else None
     if isinstance(result, list):
         for series in result:
-            value = series.get("value") if isinstance(series, dict) else None
-            if not isinstance(value, list) or len(value) < 2:
+            values = series.get("values") if isinstance(series, dict) else None
+            if not isinstance(values, list):
                 continue
-            try:
-                latency = float(value[1])
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(latency) and latency > 0:
-                return latency
-    raise AssertionError("Prometheus query has no finite positive latency")
+            for sample in values:
+                if not isinstance(sample, list) or len(sample) < 2:
+                    continue
+                try:
+                    latency = float(sample[1])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(latency) and latency > 0:
+                    return latency
+    raise AssertionError("Prometheus range query has no finite positive latency")

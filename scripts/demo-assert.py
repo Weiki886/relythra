@@ -50,7 +50,7 @@ def http(port, path, authorized=False, method="GET", admin=False):
         return error.code, error.read(4096)
 
 
-def eventually(assertion, timeout=100):
+def eventually(assertion, timeout=100, interval=2):
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
@@ -59,7 +59,7 @@ def eventually(assertion, timeout=100):
             return
         except (AssertionError, urllib.error.URLError, TimeoutError, ConnectionError) as error:
             last = error
-            time.sleep(2)
+            time.sleep(interval)
     raise AssertionError(f"Timed out waiting for observable condition: {last}")
 
 
@@ -170,19 +170,20 @@ def prometheus_evidence(investigation_id):
 
 def prime_prometheus_latency():
     query = 'histogram_quantile(0.95, sum by (le, route) (rate(demo_http_request_duration_seconds_bucket{service="inventory",env="demo"}[5m])))'
-    for index in range(3):
-        status, raw = http(28090, "/orders")
-        assert status == 200 and json.loads(raw).get("available") == 42, ("latency priming request", status, raw[:200])
-        if index < 2:
-            time.sleep(6)
 
     def finite_latency():
-        status, raw = http(29090, "/api/v1/query?" + urllib.parse.urlencode({"query": query}), True)
-        assert status == 200, ("Prometheus latency query", status, raw[:200])
+        status, raw = http(28090, "/orders")
+        assert status == 200 and json.loads(raw).get("available") == 42, ("latency priming request", status, raw[:200])
+        # Match collectionWindow and collectionQueryStep in internal/worker/collection.go.
+        # On a fresh stack the latest evaluation is one minute before this end.
+        end = time.time()
+        params = {"query": query, "start": end - 300, "end": end, "step": 120}
+        status, raw = http(29090, "/api/v1/query_range?" + urllib.parse.urlencode(params), True)
+        assert status == 200, ("Prometheus latency range query", status, raw[:200])
         assert_finite_latency_response(json.loads(raw))
 
-    eventually(finite_latency, timeout=40)
-    print("Inventory latency histogram has a finite Prometheus result across scrape intervals")
+    eventually(finite_latency, timeout=180, interval=6)
+    print("Inventory latency histogram has a finite Prometheus sample on the Worker range-query grid")
 
 
 def grafana_delivery(investigation_id, expected_status):

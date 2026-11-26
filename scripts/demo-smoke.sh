@@ -75,7 +75,7 @@ test -n "$project_id" && test -n "$service_id"
 python3 scripts/demo-assert.py configure-prometheus-mapping "$project_id" "$service_id"
 stage="baseline telemetry assertions"
 python3 scripts/demo-assert.py healthy
-stage="prime finite Inventory latency series across Prometheus scrapes"
+stage="prime Inventory latency on the Worker range-query grid"
 python3 scripts/demo-assert.py prime-prometheus-latency
 stage="Grafana HMAC webhook delivery assertions"
 webhook_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

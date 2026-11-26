@@ -2,6 +2,8 @@
 
 这是 Issue #6 的本地可信环境：orders → inventory → 独立 demo PostgreSQL；Prometheus 采集业务/Worker/node/cgroup 指标；Alloy 采集业务 JSON 日志到 Loki；Grafana 提供 Viewer 面板、目标不可用告警和签名 Webhook Contact Point。`make demo-smoke` 在隔离项目中通过管理 API 为 Inventory 配置固定 Prometheus latency 模板，停止并恢复 inventory 触发 FIRING/RESOLVED 通知，再验证 HMAC 验签、同一 Investigation 的 Grafana Evidence 与读取链接，以及 Worker 持久化的非空 Prometheus latency Evidence 与读取链接。该 smoke 仍未验证 Loki、GitHub、DeploymentEvent、运行时 Evidence 与诊断候选共同形成完整慢 SQL 证据链。
 
+停止 Inventory 前，smoke 每 6 秒通过 `/orders` 产生真实请求，并查询固定 latency 模板。预热检查采用与 Worker 一致的五分钟回看窗口和两分钟步长，等待范围查询出现有限且大于 0 的样本后再触发故障，最多等待 180 秒。这样可以覆盖告警前的采样点。
+
 ## 启动
 
 基础 API/Worker/Web 的无 Docker 入口仍是 `./scripts/dev.sh`。下面的完整演示需要 Docker Compose v2、约 4 GiB 可用内存与 Linux cgroup。Docker Desktop 指标代表其 Linux VM，不能代表 macOS/Windows 物理宿主机。
