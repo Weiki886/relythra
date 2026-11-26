@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from demo_assertions import assert_finite_latency_response, assert_prometheus_evidence_timeline, prometheus_mapping_payload
+from demo_assertions import assert_finite_latency_response, assert_loki_evidence_timeline, assert_prometheus_evidence_timeline, loki_mapping_payload, prometheus_mapping_payload
 
 
 def check_config(path):
@@ -125,10 +125,10 @@ def healthy():
     print("Real telemetry verified: six healthy scrape targets, business/node/cgroup/worker samples, labeled JSON logs and Grafana dashboard")
 
 
-def configure_prometheus_mapping(project_id, service_id):
+def configure_mapping(mapping, source_name):
     with open(os.environ["RELYTHRA_MANAGEMENT_TOKEN_FILE"], encoding="utf-8") as secret:
         token = secret.read().strip()
-    payload = json.dumps(prometheus_mapping_payload(project_id, service_id)).encode("utf-8")
+    payload = json.dumps(mapping).encode("utf-8")
     request = urllib.request.Request(
         "http://127.0.0.1:28080/api/v1/data-source-mappings",
         data=payload,
@@ -139,12 +139,12 @@ def configure_prometheus_mapping(project_id, service_id):
         with urllib.request.urlopen(request, timeout=12) as response:
             status, raw = response.status, response.read(64 * 1024)
     except urllib.error.HTTPError as error:
-        raise AssertionError(f"Prometheus mapping API returned HTTP {error.code}") from None
-    assert status == 201, ("Prometheus mapping create", status)
+        raise AssertionError(f"{source_name} mapping API returned HTTP {error.code}") from None
+    assert status == 201, (f"{source_name} mapping create", status)
     assert token.encode() not in raw, "mapping response exposed the management token"
     response = json.loads(raw)
-    assert response.get("data", {}).get("secret_status") == "configured", "Prometheus SecretRef was not resolved"
-    print("Isolated Inventory Prometheus mapping created through the authenticated management API")
+    assert response.get("data", {}).get("secret_status") == "configured", f"{source_name} SecretRef was not resolved"
+    print(f"Isolated Inventory {source_name} mapping created through the authenticated management API")
 
 
 def prometheus_evidence(investigation_id):
@@ -166,6 +166,32 @@ def prometheus_evidence(investigation_id):
     eventually(collected, timeout=180)
     print(f"Worker Prometheus latency Evidence verified for Investigation {investigation_id}")
 
+
+
+
+def loki_evidence(investigation_id, service_id):
+    path = f"/api/v1/investigations/{investigation_id}/timeline?" + urllib.parse.urlencode({
+        "source_type": "LOKI",
+        "limit": 100,
+    })
+
+    def collected():
+        status, raw = http(28080, path)
+        assert status == 200, ("Loki timeline read", status)
+        timeline = json.loads(raw).get("data")
+        assert isinstance(timeline, dict), "Loki timeline response has no data"
+        item = assert_loki_evidence_timeline(timeline, investigation_id, service_id)
+        assert item.get("id"), "Loki Evidence has no ID"
+        source = urllib.parse.urlparse(item.get("raw_reference", ""))
+        assert source.hostname == "observability-gateway" and source.port == 3100 and source.path == "/loki/api/v1/query_range", "Loki original query reference"
+        status, raw = http(28080, f"/api/v1/evidence/{item['id']}")
+        evidence = json.loads(raw).get("data") if status == 200 else None
+        assert isinstance(evidence, dict) and evidence.get("id") == item["id"], "Loki Evidence deep link"
+        assert evidence.get("investigation_id") == investigation_id, "Loki deep link investigation ownership"
+        assert_loki_evidence_timeline({"investigation_id": investigation_id, "items": [evidence]}, investigation_id, service_id)
+
+    eventually(collected, timeout=180)
+    print(f"Worker Loki request log Evidence verified for Investigation {investigation_id}")
 
 
 def prime_prometheus_latency():
@@ -301,7 +327,11 @@ if __name__ == "__main__":
     elif mode == "recovered":
         eventually(recovered)
     elif mode == "configure-prometheus-mapping":
-        configure_prometheus_mapping(sys.argv[2], sys.argv[3])
+        configure_mapping(prometheus_mapping_payload(sys.argv[2], sys.argv[3]), "Prometheus")
+    elif mode == "configure-loki-mapping":
+        configure_mapping(loki_mapping_payload(sys.argv[2], sys.argv[3]), "Loki")
+    elif mode == "loki-evidence":
+        loki_evidence(sys.argv[2], sys.argv[3])
     elif mode == "prometheus-evidence":
         prometheus_evidence(sys.argv[2])
     elif mode == "prime-prometheus-latency":

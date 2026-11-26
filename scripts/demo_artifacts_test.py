@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from demo_artifacts import MAX_CAPTURE_BYTES, capture_compose, collect, collect_http, compose_command, read_secrets, redact, remove_partial_secret, safe_compose_output, write_capture
-from demo_assertions import assert_finite_latency_response, assert_prometheus_evidence_timeline, prometheus_mapping_payload
+from demo_assertions import assert_finite_latency_response, assert_loki_evidence_timeline, assert_prometheus_evidence_timeline, loki_mapping_payload, prometheus_mapping_payload
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -161,6 +161,143 @@ class DemoPrometheusEvidenceTests(unittest.TestCase):
                 timeline = prometheus_timeline()
                 timeline["items"][0]["value_summary"]["series"] = series
                 assert_prometheus_evidence_timeline(timeline, "demo-investigation")
+
+
+def loki_timeline():
+    return {
+        "investigation_id": "demo-investigation",
+        "items": [{
+            "id": "loki-evidence",
+            "source_type": "LOKI",
+            "entity_type": "SERVICE",
+            "entity_id": "inventory-id",
+            "completeness": "PARTIAL",
+            "query_parameters": {"template_id": "loki.service.slow_queries.v1"},
+            "value_summary": {"entries": [{
+                "timestamp": "2026-11-26T00:00:00Z",
+                "labels": {"project": "relythra-demo", "service": "inventory", "env": "demo"},
+                "line": {
+                    "trust": "untrusted_data",
+                    "source": "loki",
+                    "content": json.dumps({"msg": "request completed", "route": "/stock", "duration_ms": 12.5}),
+                },
+            }]},
+        }],
+    }
+
+
+class DemoLokiEvidenceTests(unittest.TestCase):
+    def load_smoke(self):
+        spec = importlib.util.spec_from_file_location("demo_loki_smoke_assert", ROOT / "scripts/demo-assert.py")
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        return smoke
+
+    def test_mapping_is_created_through_authenticated_management_api(self):
+        smoke = self.load_smoke()
+        mapping = loki_mapping_payload("project-id", "inventory-id")
+        response = FakeResponse(b'{"data":{"secret_status":"configured"}}')
+        response.status = 201
+        with tempfile.TemporaryDirectory() as directory:
+            secret_path = Path(directory) / "management_token"
+            secret_path.write_text("demo-management-canary")
+            with patch.dict(os.environ, {"RELYTHRA_MANAGEMENT_TOKEN_FILE": str(secret_path)}), \
+                 patch.object(smoke.urllib.request, "urlopen", return_value=response) as call, \
+                 patch("builtins.print"):
+                smoke.configure_mapping(mapping, "Loki")
+            request = call.call_args.args[0]
+            self.assertEqual(request.full_url, "http://127.0.0.1:28080/api/v1/data-source-mappings")
+            self.assertEqual(request.get_method(), "POST")
+            self.assertEqual(request.get_header("Authorization"), "Bearer demo-management-canary")
+            self.assertEqual(json.loads(request.data), mapping)
+            self.assertNotIn("demo-management-canary", request.data.decode())
+
+    def test_loki_mode_reads_filtered_timeline_and_matching_evidence_link(self):
+        self.run_loki_mode("demo-investigation")
+
+    def test_loki_mode_rejects_deep_link_from_another_investigation(self):
+        with self.assertRaisesRegex(AssertionError, "investigation ownership"):
+            self.run_loki_mode("another-investigation")
+
+    def run_loki_mode(self, deep_investigation):
+        smoke = self.load_smoke()
+        timeline = loki_timeline()
+        item = timeline["items"][0]
+        item["raw_reference"] = "http://observability-gateway:3100/loki/api/v1/query_range?query=demo"
+        evidence = dict(item, investigation_id=deep_investigation)
+        paths = []
+
+        def http(port, path):
+            self.assertEqual(port, 28080)
+            paths.append(path)
+            if path.startswith("/api/v1/investigations/"):
+                params = smoke.urllib.parse.parse_qs(smoke.urllib.parse.urlparse(path).query)
+                self.assertEqual(params, {"source_type": ["LOKI"], "limit": ["100"]})
+                return 200, json.dumps({"data": timeline}).encode()
+            self.assertEqual(path, "/api/v1/evidence/loki-evidence")
+            return 200, json.dumps({"data": evidence}).encode()
+
+        with patch.object(smoke, "http", side_effect=http), \
+             patch.object(smoke, "eventually", side_effect=lambda check, timeout: check()), \
+             patch("builtins.print"):
+            smoke.loki_evidence("demo-investigation", "inventory-id")
+        self.assertEqual(len(paths), 2)
+
+    def test_mapping_uses_demo_scope_gateway_and_registered_template(self):
+        self.assertEqual(loki_mapping_payload("project-id", "service-id"), {
+            "project_id": "project-id", "service_id": "service-id", "environment": "demo",
+            "source_type": "LOKI", "public_settings": {"endpoint": "http://observability-gateway:3100"},
+            "template_ids": ["loki.service.slow_queries.v1"],
+            "secret_ref": "file:/run/relythra-secrets/observability_token",
+        })
+
+    def test_accepts_real_inventory_request_evidence_including_partial(self):
+        for completeness in ("COMPLETE", "PARTIAL"):
+            timeline = loki_timeline()
+            timeline["items"][0]["completeness"] = completeness
+            item = assert_loki_evidence_timeline(timeline, "demo-investigation", "inventory-id")
+            self.assertEqual(item["id"], "loki-evidence")
+
+    def test_rejects_wrong_investigation_service_template_or_source(self):
+        for field, value in (("entity_id", "orders-id"), ("entity_type", "HOST"),
+                             ("source_type", "PROMETHEUS"), ("completeness", "MISSING")):
+            with self.subTest(field=field):
+                timeline = loki_timeline()
+                timeline["items"][0][field] = value
+                with self.assertRaises(AssertionError):
+                    assert_loki_evidence_timeline(timeline, "demo-investigation", "inventory-id")
+        timeline = loki_timeline()
+        with self.assertRaises(AssertionError):
+            assert_loki_evidence_timeline(timeline, "another-investigation", "inventory-id")
+        timeline["items"][0]["query_parameters"]["template_id"] = "loki.service.errors.v1"
+        with self.assertRaises(AssertionError):
+            assert_loki_evidence_timeline(timeline, "demo-investigation", "inventory-id")
+
+    def test_rejects_empty_entries_and_invalid_labels_or_trust(self):
+        for field, value in (("labels", {"service": "orders", "env": "demo"}),
+                             ("labels", {"service": "inventory", "env": "prod"}),
+                             ("line", {"trust": "trusted", "source": "loki", "content": "request completed"}),
+                             ("line", {"trust": "untrusted_data", "source": "github", "content": "request completed"})):
+            with self.subTest(field=field, value=value):
+                timeline = loki_timeline()
+                timeline["items"][0]["value_summary"]["entries"][0][field] = value
+                with self.assertRaises(AssertionError):
+                    assert_loki_evidence_timeline(timeline, "demo-investigation", "inventory-id")
+        for entries in (None, [], [None]):
+            timeline = loki_timeline()
+            timeline["items"][0]["value_summary"]["entries"] = entries
+            with self.subTest(entries=entries), self.assertRaises(AssertionError):
+                assert_loki_evidence_timeline(timeline, "demo-investigation", "inventory-id")
+
+    def test_requires_stock_request_with_finite_nonnegative_duration(self):
+        bad_logs = [None, "request completed", "[]", json.dumps({"route": "/health/ready", "duration_ms": 1})]
+        for duration in (None, True, "12", -1, float("nan"), float("inf")):
+            bad_logs.append(json.dumps({"msg": "request completed", "route": "/stock", "duration_ms": duration}))
+        for content in bad_logs:
+            timeline = loki_timeline()
+            timeline["items"][0]["value_summary"]["entries"][0]["line"]["content"] = content
+            with self.subTest(content=content), self.assertRaises(AssertionError):
+                assert_loki_evidence_timeline(timeline, "demo-investigation", "inventory-id")
 
 
 class DemoArtifactTests(unittest.TestCase):

@@ -1,8 +1,10 @@
 """Pure assertions shared by the disposable demo smoke and its unit tests."""
 
+import json
 import math
 
 PROMETHEUS_LATENCY_TEMPLATE = "prometheus.service.latency.v1"
+LOKI_REQUEST_TEMPLATE = "loki.service.slow_queries.v1"
 
 
 def prometheus_mapping_payload(project_id, service_id):
@@ -69,3 +71,54 @@ def assert_finite_latency_response(response):
                 if math.isfinite(latency) and latency > 0:
                     return latency
     raise AssertionError("Prometheus range query has no finite positive latency")
+
+
+def loki_mapping_payload(project_id, service_id):
+    return {
+        "project_id": project_id,
+        "service_id": service_id,
+        "environment": "demo",
+        "source_type": "LOKI",
+        "public_settings": {"endpoint": "http://observability-gateway:3100"},
+        "template_ids": [LOKI_REQUEST_TEMPLATE],
+        "secret_ref": "file:/run/relythra-secrets/observability_token",
+    }
+
+
+def assert_loki_evidence_timeline(timeline, investigation_id, service_id):
+    assert timeline.get("investigation_id") == investigation_id, "Loki investigation ownership"
+    items = timeline.get("items")
+    assert isinstance(items, list), "Loki timeline items are missing"
+    evidence_items = [
+        item for item in items
+        if isinstance(item, dict)
+        and item.get("source_type") == "LOKI"
+        and isinstance(item.get("query_parameters"), dict)
+        and item["query_parameters"].get("template_id") == LOKI_REQUEST_TEMPLATE
+    ]
+    assert evidence_items, "Loki request template Evidence is missing"
+    for item in evidence_items:
+        assert item.get("entity_type") == "SERVICE" and item.get("entity_id") == service_id, "Loki service ownership"
+        assert item.get("completeness") in ("COMPLETE", "PARTIAL"), "Loki Evidence is missing"
+        summary = item.get("value_summary")
+        entries = summary.get("entries") if isinstance(summary, dict) else None
+        assert isinstance(entries, list) and entries, "Loki Evidence has no entries"
+        for entry in entries:
+            assert isinstance(entry, dict) and entry.get("timestamp"), "Loki entry has no timestamp"
+            labels = entry.get("labels")
+            assert isinstance(labels, dict) and all(
+                labels.get(key) == value
+                for key, value in {"project": "relythra-demo", "service": "inventory", "env": "demo"}.items()
+            ), "Loki entry labels do not match the demo service"
+            line = entry.get("line")
+            assert isinstance(line, dict) and line.get("trust") == "untrusted_data" and line.get("source") == "loki", "Loki trust metadata"
+            try:
+                log = json.loads(line.get("content"))
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(log, dict) or log.get("msg") != "request completed" or log.get("route") != "/stock":
+                continue
+            duration = log.get("duration_ms")
+            if isinstance(duration, (int, float)) and not isinstance(duration, bool) and math.isfinite(duration) and duration >= 0:
+                return item
+    raise AssertionError("Loki Evidence has no Inventory stock request log with finite duration")

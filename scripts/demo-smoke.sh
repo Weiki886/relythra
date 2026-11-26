@@ -73,6 +73,8 @@ project_id="$("${COMPOSE[@]}" exec -T postgres psql -U relythra -d relythra -Atc
 service_id="$("${COMPOSE[@]}" exec -T postgres psql -U relythra -d relythra -Atc "SELECT s.id FROM services s JOIN projects p ON p.id=s.project_id WHERE p.slug='relythra-demo' AND s.slug='inventory'")"
 test -n "$project_id" && test -n "$service_id"
 python3 scripts/demo-assert.py configure-prometheus-mapping "$project_id" "$service_id"
+stage="create isolated Inventory Loki mapping"
+python3 scripts/demo-assert.py configure-loki-mapping "$project_id" "$service_id"
 stage="baseline telemetry assertions"
 python3 scripts/demo-assert.py healthy
 stage="prime Inventory latency on the Worker range-query grid"
@@ -90,6 +92,8 @@ test -n "$investigation_id" || { printf 'Grafana alert did not reach Relythra vi
 python3 scripts/demo-assert.py grafana-delivery "$investigation_id" FIRING
 stage="Worker Prometheus Evidence timeline assertion"
 python3 scripts/demo-assert.py prometheus-evidence "$investigation_id"
+stage="Worker Loki Evidence timeline assertion"
+python3 scripts/demo-assert.py loki-evidence "$investigation_id" "$service_id"
 "${COMPOSE[@]}" start --wait inventory
 stage="Grafana resolved webhook and evidence assertions"
 python3 scripts/demo-assert.py grafana-delivery "$investigation_id" RESOLVED
