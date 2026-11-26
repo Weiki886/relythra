@@ -1,4 +1,5 @@
 import base64
+import importlib.util
 import json
 import os
 import subprocess
@@ -8,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from demo_artifacts import MAX_CAPTURE_BYTES, capture_compose, collect, collect_http, compose_command, read_secrets, redact, remove_partial_secret, safe_compose_output, write_capture
+from demo_assertions import assert_finite_latency_response, assert_prometheus_evidence_timeline, prometheus_mapping_payload
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -26,6 +28,139 @@ class FakeResponse:
 
     def read(self, _limit):
         return self.body[:_limit]
+
+
+def prometheus_timeline(investigation_id="demo-investigation"):
+    return {
+        "investigation_id": investigation_id,
+        "items": [{
+            "source_type": "PROMETHEUS",
+            "query_parameters": {"template_id": "prometheus.service.latency.v1"},
+            "value_summary": {"series": [{"samples": [{"timestamp": "2026-11-26T00:00:00Z", "value": 0.42}]}]},
+        }],
+    }
+
+
+class DemoPrometheusEvidenceTests(unittest.TestCase):
+    def test_accepts_finite_positive_prometheus_range_latency(self):
+        response = {"status": "success", "data": {"resultType": "matrix", "result": [
+            {"values": [[1795651080, "NaN"], [1795651200, "0.125"]]},
+        ]}}
+        self.assertEqual(assert_finite_latency_response(response), 0.125)
+
+    def test_rejects_missing_nan_or_zero_range_latency_and_instant_results(self):
+        responses = [
+            {"status": "success", "data": {"resultType": "matrix", "result": []}},
+            {"status": "success", "data": {"resultType": "matrix", "result": [{"values": []}]}},
+            {"status": "success", "data": {"resultType": "vector", "result": [{"value": [1795651200, "0.125"]}]}},
+        ]
+        for value in ("NaN", "+Inf", "-Inf", "0", "-1", "invalid", None):
+            responses.append({"status": "success", "data": {"resultType": "matrix", "result": [
+                {"values": [[1795651200, value]]},
+            ]}})
+        for response in responses:
+            with self.subTest(response=response), self.assertRaisesRegex(AssertionError, "finite positive latency"):
+                assert_finite_latency_response(response)
+
+    def run_latency_priming(self, range_ready):
+        spec = importlib.util.spec_from_file_location("demo_smoke_assert", ROOT / "scripts/demo-assert.py")
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        clock = [1000.0]
+        requests = []
+        range_queries = []
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        def http(port, path, authorized=False):
+            if port == 28090:
+                self.assertEqual(path, "/orders")
+                requests.append(clock[0])
+                return 200, b'{"available": 42}'
+            self.assertEqual(port, 29090)
+            self.assertTrue(authorized)
+            url = smoke.urllib.parse.urlparse(path)
+            params = smoke.urllib.parse.parse_qs(url.query)
+            if url.path == "/api/v1/query":
+                # The old instant check passes as soon as traffic spans two scrapes.
+                return 200, json.dumps({"status": "success", "data": {"resultType": "vector", "result": [
+                    {"value": [clock[0], "0.125"]},
+                ]}}).encode()
+            self.assertEqual(url.path, "/api/v1/query_range")
+            start, end, step = (float(params[key][0]) for key in ("start", "end", "step"))
+            self.assertEqual(end, clock[0])
+            self.assertEqual(end - start, 300)
+            self.assertEqual(step, 120)
+            self.assertIn('service="inventory",env="demo"', params["query"][0])
+            self.assertIn("[5m]", params["query"][0])
+            range_queries.append(clock[0])
+            # Finite histograms begin after two 5s scrapes. Worker evaluations
+            # at end-300, end-180 and end-60 initially all precede that data.
+            values = [[start + index * step, "0.125" if range_ready and start + index * step >= 1010 else "NaN"]
+                      for index in range(3)]
+            return 200, json.dumps({"status": "success", "data": {"resultType": "matrix", "result": [
+                {"values": values},
+            ]}}).encode()
+
+        with patch.object(smoke, "http", side_effect=http), \
+             patch.object(smoke.time, "time", side_effect=lambda: clock[0]), \
+             patch.object(smoke.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(smoke.time, "sleep", side_effect=sleep), \
+             patch("builtins.print"):
+            if range_ready:
+                smoke.prime_prometheus_latency()
+            else:
+                with self.assertRaisesRegex(AssertionError, "Timed out"):
+                    smoke.prime_prometheus_latency()
+        return clock[0], requests, range_queries
+
+    def test_priming_keeps_traffic_until_worker_range_grid_has_finite_data(self):
+        finished, requests, queries = self.run_latency_priming(range_ready=True)
+        self.assertGreaterEqual(finished, 1070)
+        self.assertGreater(len(requests), 3)
+        self.assertGreater(len(queries), 1)
+        self.assertLessEqual(max(b - a for a, b in zip(requests, requests[1:])), 6)
+        self.assertEqual(requests[-1], queries[-1])
+
+    def test_priming_times_out_when_worker_range_grid_stays_empty(self):
+        finished, requests, queries = self.run_latency_priming(range_ready=False)
+        self.assertGreaterEqual(finished, 1180)
+        self.assertLessEqual(finished, 1186)
+        self.assertGreater(len(requests), 3)
+        self.assertGreater(len(queries), 1)
+
+    def test_mapping_is_scoped_to_demo_service_and_fixed_read_only_template(self):
+        mapping = prometheus_mapping_payload("project-id", "service-id")
+        self.assertEqual(mapping["project_id"], "project-id")
+        self.assertEqual(mapping["service_id"], "service-id")
+        self.assertEqual(mapping["environment"], "demo")
+        self.assertEqual(mapping["source_type"], "PROMETHEUS")
+        self.assertEqual(mapping["public_settings"]["endpoint"], "http://observability-gateway:9090")
+        self.assertEqual(mapping["template_ids"], ["prometheus.service.latency.v1"])
+        self.assertEqual(mapping["secret_ref"], "file:/run/relythra-secrets/observability_token")
+
+    def test_accepts_populated_latency_evidence_for_requested_investigation(self):
+        evidence = assert_prometheus_evidence_timeline(prometheus_timeline(), "demo-investigation")
+        self.assertEqual(evidence["source_type"], "PROMETHEUS")
+        self.assertEqual(evidence["query_parameters"]["template_id"], "prometheus.service.latency.v1")
+
+    def test_rejects_evidence_from_another_investigation(self):
+        with self.assertRaisesRegex(AssertionError, "investigation_id"):
+            assert_prometheus_evidence_timeline(prometheus_timeline("other-investigation"), "demo-investigation")
+
+    def test_rejects_missing_latency_template(self):
+        timeline = prometheus_timeline()
+        timeline["items"][0]["query_parameters"]["template_id"] = "prometheus.other.v1"
+        with self.assertRaisesRegex(AssertionError, "latency template"):
+            assert_prometheus_evidence_timeline(timeline, "demo-investigation")
+
+    def test_rejects_empty_or_malformed_samples(self):
+        for series in ([], [{"samples": []}], [{"samples": [{"timestamp": "", "value": "unknown"}]}]):
+            with self.subTest(series=series), self.assertRaisesRegex(AssertionError, "samples"):
+                timeline = prometheus_timeline()
+                timeline["items"][0]["value_summary"]["series"] = series
+                assert_prometheus_evidence_timeline(timeline, "demo-investigation")
 
 
 class DemoArtifactTests(unittest.TestCase):

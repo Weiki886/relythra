@@ -68,8 +68,15 @@ INSERT INTO services (project_id, slug, name)
 SELECT id, 'orders', 'Orders demo service' FROM projects WHERE slug = 'relythra-demo'
 ON CONFLICT (project_id, slug) DO NOTHING;
 SQL
+stage="create isolated Inventory Prometheus mapping"
+project_id="$("${COMPOSE[@]}" exec -T postgres psql -U relythra -d relythra -Atc "SELECT id FROM projects WHERE slug='relythra-demo'")"
+service_id="$("${COMPOSE[@]}" exec -T postgres psql -U relythra -d relythra -Atc "SELECT s.id FROM services s JOIN projects p ON p.id=s.project_id WHERE p.slug='relythra-demo' AND s.slug='inventory'")"
+test -n "$project_id" && test -n "$service_id"
+python3 scripts/demo-assert.py configure-prometheus-mapping "$project_id" "$service_id"
 stage="baseline telemetry assertions"
 python3 scripts/demo-assert.py healthy
+stage="prime Inventory latency on the Worker range-query grid"
+python3 scripts/demo-assert.py prime-prometheus-latency
 stage="Grafana HMAC webhook delivery assertions"
 webhook_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 "${COMPOSE[@]}" stop inventory
@@ -81,6 +88,8 @@ for attempt in $(seq 1 60); do
 done
 test -n "$investigation_id" || { printf 'Grafana alert did not reach Relythra via signed webhook.\n' >&2; exit 1; }
 python3 scripts/demo-assert.py grafana-delivery "$investigation_id" FIRING
+stage="Worker Prometheus Evidence timeline assertion"
+python3 scripts/demo-assert.py prometheus-evidence "$investigation_id"
 "${COMPOSE[@]}" start --wait inventory
 stage="Grafana resolved webhook and evidence assertions"
 python3 scripts/demo-assert.py grafana-delivery "$investigation_id" RESOLVED
