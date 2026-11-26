@@ -1,6 +1,6 @@
 # Compose 业务与观测演示
 
-这是 Issue #6 的本地可信环境：orders → inventory → 独立 demo PostgreSQL；Prometheus 采集业务/Worker/node/cgroup 指标；Alloy 采集业务 JSON 日志到 Loki；Grafana 提供 Viewer 面板、目标不可用告警和签名 Webhook Contact Point；`make demo-smoke` 会在隔离项目中停止并恢复 inventory，验证经过 HMAC 验签的 FIRING/RESOLVED 通知、同一 Investigation 的 Grafana Evidence 和读取链接。此演示尚未自动触发指标、日志、GitHub 或运行时采集，也不代表完整慢 SQL 诊断链已经实现。
+这是 Issue #6 的本地可信环境：orders → inventory → 独立 demo PostgreSQL；Prometheus 采集业务/Worker/node/cgroup 指标；Alloy 采集业务 JSON 日志到 Loki；Grafana 提供 Viewer 面板、目标不可用告警和签名 Webhook Contact Point。`make demo-smoke` 在隔离项目中通过管理 API 为 Inventory 配置固定 Prometheus latency 模板，停止并恢复 inventory 触发 FIRING/RESOLVED 通知，再验证 HMAC 验签、同一 Investigation 的 Grafana Evidence 与读取链接，以及 Worker 持久化的非空 Prometheus latency Evidence 与读取链接。该 smoke 仍未验证 Loki、GitHub、DeploymentEvent、运行时 Evidence 与诊断候选共同形成完整慢 SQL 证据链。
 
 ## 启动
 

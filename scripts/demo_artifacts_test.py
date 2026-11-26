@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from demo_artifacts import MAX_CAPTURE_BYTES, capture_compose, collect, collect_http, compose_command, read_secrets, redact, remove_partial_secret, safe_compose_output, write_capture
+from demo_assertions import assert_prometheus_evidence_timeline, prometheus_mapping_payload
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -26,6 +27,51 @@ class FakeResponse:
 
     def read(self, _limit):
         return self.body[:_limit]
+
+
+def prometheus_timeline(investigation_id="demo-investigation"):
+    return {
+        "investigation_id": investigation_id,
+        "items": [{
+            "source_type": "PROMETHEUS",
+            "query_parameters": {"template_id": "prometheus.service.latency.v1"},
+            "value_summary": {"series": [{"samples": [{"timestamp": "2026-11-26T00:00:00Z", "value": 0.42}]}]},
+        }],
+    }
+
+
+class DemoPrometheusEvidenceTests(unittest.TestCase):
+    def test_mapping_is_scoped_to_demo_service_and_fixed_read_only_template(self):
+        mapping = prometheus_mapping_payload("project-id", "service-id")
+        self.assertEqual(mapping["project_id"], "project-id")
+        self.assertEqual(mapping["service_id"], "service-id")
+        self.assertEqual(mapping["environment"], "demo")
+        self.assertEqual(mapping["source_type"], "PROMETHEUS")
+        self.assertEqual(mapping["public_settings"]["endpoint"], "http://observability-gateway:9090")
+        self.assertEqual(mapping["template_ids"], ["prometheus.service.latency.v1"])
+        self.assertEqual(mapping["secret_ref"], "file:/run/relythra-secrets/observability_token")
+
+    def test_accepts_populated_latency_evidence_for_requested_investigation(self):
+        evidence = assert_prometheus_evidence_timeline(prometheus_timeline(), "demo-investigation")
+        self.assertEqual(evidence["source_type"], "PROMETHEUS")
+        self.assertEqual(evidence["query_parameters"]["template_id"], "prometheus.service.latency.v1")
+
+    def test_rejects_evidence_from_another_investigation(self):
+        with self.assertRaisesRegex(AssertionError, "investigation_id"):
+            assert_prometheus_evidence_timeline(prometheus_timeline("other-investigation"), "demo-investigation")
+
+    def test_rejects_missing_latency_template(self):
+        timeline = prometheus_timeline()
+        timeline["items"][0]["query_parameters"]["template_id"] = "prometheus.other.v1"
+        with self.assertRaisesRegex(AssertionError, "latency template"):
+            assert_prometheus_evidence_timeline(timeline, "demo-investigation")
+
+    def test_rejects_empty_or_malformed_samples(self):
+        for series in ([], [{"samples": []}], [{"samples": [{"timestamp": "", "value": "unknown"}]}]):
+            with self.subTest(series=series), self.assertRaisesRegex(AssertionError, "samples"):
+                timeline = prometheus_timeline()
+                timeline["items"][0]["value_summary"]["series"] = series
+                assert_prometheus_evidence_timeline(timeline, "demo-investigation")
 
 
 class DemoArtifactTests(unittest.TestCase):
