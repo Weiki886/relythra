@@ -69,8 +69,13 @@ func TestDomainSchemaMigratesAndRollsBack(t *testing.T) {
 	assertGrafanaAlertIngestionSchema(t, ctx, db, schema)
 	assertEvidenceObservationSchema(t, ctx, db, schema)
 	assertInvestigationCollectionJobSchema(t, ctx, db, schema)
+	assertCollectionJobLeaseSchema(t, ctx, db, schema)
 
 	assertGrafanaEvidenceSource(t, ctx, db, true)
+	if err := goose.DownContext(ctx, db, "."); err != nil {
+		t.Fatalf("roll back collection job leases migration: %v", err)
+	}
+	assertCollectionJobLeaseRolledBack(t, ctx, db, schema)
 	if err := goose.DownContext(ctx, db, "."); err != nil {
 		t.Fatalf("roll back Investigation collection jobs migration: %v", err)
 	}
@@ -185,6 +190,10 @@ func TestDomainSchemaMigratesAndRollsBack(t *testing.T) {
 	var count int
 
 	assertGrafanaEvidenceSource(t, ctx, db, true)
+	if err := goose.DownContext(ctx, db, "."); err != nil {
+		t.Fatalf("roll back collection job leases migration: %v", err)
+	}
+	assertCollectionJobLeaseRolledBack(t, ctx, db, schema)
 	if err := goose.DownContext(ctx, db, "."); err != nil {
 		t.Fatalf("roll back Investigation collection jobs migration: %v", err)
 	}
@@ -793,5 +802,45 @@ func assertInvestigationCollectionJobRolledBack(t *testing.T, ctx context.Contex
 	}
 	if relation != nil {
 		t.Fatal("investigation_collection_jobs still exists after migration rollback")
+	}
+}
+
+func assertCollectionJobLeaseSchema(t *testing.T, ctx context.Context, db *sql.DB, schema string) {
+	t.Helper()
+	var count int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema=$1 AND table_name='investigation_collection_jobs' AND column_name='lease_token'
+	`, schema).Scan(&count); err != nil {
+		t.Fatalf("check collection job lease token column: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("collection job lease token columns=%d, want 1", count)
+	}
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM pg_constraint constraint_row
+		JOIN pg_class relation ON relation.oid=constraint_row.conrelid
+	JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+		WHERE namespace.nspname=$1 AND relation.relname='investigation_collection_jobs'
+		  AND constraint_row.conname='investigation_collection_jobs_lease_token_check'
+	`, schema).Scan(&count); err != nil {
+		t.Fatalf("check collection job lease token constraint: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("collection job lease token constraints=%d, want 1", count)
+	}
+}
+
+func assertCollectionJobLeaseRolledBack(t *testing.T, ctx context.Context, db *sql.DB, schema string) {
+	t.Helper()
+	var count int
+	if err := db.QueryRowContext(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema=$1 AND table_name='investigation_collection_jobs' AND column_name='lease_token'
+	`, schema).Scan(&count); err != nil {
+		t.Fatalf("check collection job lease rollback: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("collection job lease token columns after rollback=%d, want 0", count)
 	}
 }

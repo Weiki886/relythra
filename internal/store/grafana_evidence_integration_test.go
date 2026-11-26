@@ -335,6 +335,9 @@ func TestPersistGrafanaAlertEvidenceSnapshotsAndOwnership(t *testing.T) {
 	}
 	// A downgrade may not erase or relabel immutable Grafana history.
 	if err := goose.DownContext(ctx, db, "."); err != nil {
+		t.Fatalf("roll back collection-job lease migration before Grafana evidence guard: %v", err)
+	}
+	if err := goose.DownContext(ctx, db, "."); err != nil {
 		t.Fatalf("roll back empty collection-job migration before Grafana evidence guard: %v", err)
 	}
 	if err := goose.DownContext(ctx, db, "."); err == nil || !strings.Contains(err.Error(), "immutable GRAFANA") {
