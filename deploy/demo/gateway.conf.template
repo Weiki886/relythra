@@ -11,6 +11,11 @@ map $uri $loki_path_allowed {
   default 0;
   ~^/(loki/api/v1/(query|query_range|labels|series|status/buildinfo|label/[a-zA-Z_][a-zA-Z0-9_]*/values)|ready)$ 1;
 }
+map "$request_method:$uri" $loki_method_allowed {
+  default 0;
+  ~^GET: 1;
+  "POST:/loki/api/v1/query_range" 1;
+}
 server {
   listen 9090;
   access_log off;
@@ -28,11 +33,12 @@ server {
 }
 server {
   listen 3100;
+  client_max_body_size 16k;
   access_log off;
   server_tokens off;
   location / {
     if ($read_allowed = 0) { return 401; }
-    if ($request_method != GET) { return 403; }
+    if ($loki_method_allowed = 0) { return 403; }
     if ($loki_path_allowed = 0) { return 403; }
     proxy_pass http://loki-store:3100;
     proxy_set_header Authorization '';

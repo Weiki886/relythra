@@ -1,6 +1,6 @@
 # Compose 业务与观测演示
 
-这是 Issue #6 的本地可信环境：orders → inventory → 独立 demo PostgreSQL；Prometheus 采集业务/Worker/node/cgroup 指标；Alloy 采集业务 JSON 日志到 Loki；Grafana 提供 Viewer 面板、目标不可用告警和签名 Webhook Contact Point。`make demo-smoke` 在隔离项目中通过管理 API 为 Inventory 配置固定 Prometheus latency 模板，停止并恢复 inventory 触发 FIRING/RESOLVED 通知，再验证 HMAC 验签、同一 Investigation 的 Grafana Evidence 与读取链接，以及 Worker 持久化的非空 Prometheus latency Evidence 与读取链接。该 smoke 仍未验证 Loki、GitHub、DeploymentEvent、运行时 Evidence 与诊断候选共同形成完整慢 SQL 证据链。
+这是 Issue #6 的本地可信环境：orders → inventory → 独立 demo PostgreSQL；Prometheus 采集业务/Worker/node/cgroup 指标；Alloy 采集业务 JSON 日志到 Loki；Grafana 提供 Viewer 面板、目标不可用告警和签名 Webhook Contact Point。`make demo-smoke` 在隔离项目中通过管理 API 为 Inventory 配置固定 Prometheus latency 和 Loki slow_queries 模板，停止并恢复 inventory 触发 FIRING/RESOLVED 通知，再验证 HMAC 验签、同一 Investigation 的 Grafana Evidence，以及 Worker 自动持久化的非空 Prometheus latency 和 Loki 请求日志 Evidence，并回读对应 Evidence 链接。Loki 检查要求日志归属 Inventory/demo、保留不可信数据标记，并包含真实 `/stock` 请求及有限的非负 `duration_ms`，同时校验原始 Loki 查询引用。该 smoke 的完整慢 SQL 证据链仍需补齐 DeploymentEvent、GitHub、运行时 Evidence 与诊断候选。
 
 停止 Inventory 前，smoke 每 6 秒通过 `/orders` 产生真实请求，并查询固定 latency 模板。预热检查采用与 Worker 一致的五分钟回看窗口和两分钟步长，等待范围查询出现有限且大于 0 的样本后再触发故障，最多等待 180 秒。这样可以覆盖告警前的采样点。
 
@@ -68,7 +68,7 @@ node_exporter 只读挂载 `/proc` 与 `/sys`，采集 CPU、内存、负载与�
 
 环境若无法提供非根 cgroup 指标，smoke 会失败，需检查 cgroup 权限、rootless 限制和 Docker Desktop 设置，不能用根 cgroup冒充业务容器。
 
-诊断进程只加入 control/diagnosis 网络，Loki 原始写入只在 observation-backend；读网关仅允许明确 GET 路径，写请求与未登记路径返回 403。只读 Token 与控制面管理 Token 分开；部署发送 Token 与通知通道只在 `.env.example` 留独立 SecretRef 占位，当前不消费。
+诊断进程只加入 control/diagnosis 网络，Loki 原始写入只在 observation-backend；读网关允许明确 GET 路径，以及 Loki `/loki/api/v1/query_range` 的 POST 表单查询，POST 请求体上限为 16 KiB。其余方法与路径按白名单拒绝，写入路径返回 403。只读 Token 与控制面管理 Token 分开；部署发送 Token 与通知通道只在 `.env.example` 留独立 SecretRef 占位，当前不消费。
 
 ## 发布、故障与恢复边界
 
@@ -116,6 +116,6 @@ smoke 失败时，脚本会在系统临时目录（`$TMPDIR`，未设置时为 `
 
 可通过环境变量 `RELYTHRA_DEMO_ARTIFACT_DIR` 指定诊断包的父目录。成功运行不会创建诊断包。CI 中演示验收失败会上传诊断包并保留 3 天。失败诊断包可能包含演示日志和遥测数据，脱敏仅覆盖已知凭据和常见字段，应按诊断材料保管，分享前检查内容，不要提交到公开仓库或附加未脱敏的业务数据。
 
-检查项包括真实 Grafana 告警经 HMAC Webhook 写入控制面、真实业务请求、慢 SQL 故障与恢复期间的 Prometheus/Loki 信号、6 个 targets、业务/宿主机/非根 cgroup/Worker 样本、两种服务日志与标签、Viewer 面板、只读拒写、数据库权限、演示数据库中断/恢复、重启保留数据。Webhook 检查覆盖 FIRING/RESOLVED delivery、同一 Investigation 的 Grafana Evidence 与公开读取链接。其他数据源的自动采集和诊断候选仍由后续任务验证。任何组件没就绪都会失败并报告具体服务/缺失样本。首次下载镜像超时可在网络恢复后重新执行；不把重跑当作解决 flaky。
+检查项包括真实 Grafana 告警经 HMAC Webhook 写入控制面、真实业务请求、慢 SQL 故障与恢复期间的 Prometheus/Loki 信号、6 个 targets、业务/宿主机/非根 cgroup/Worker 样本、两种服务日志与标签、Viewer 面板、只读拒写、数据库权限、演示数据库中断/恢复、重启保留数据。Webhook 检查覆盖 FIRING/RESOLVED delivery、同一 Investigation 的 Grafana Evidence 与公开读取链接。同一调查还必须包含 Worker 自动采集的 Prometheus latency 与 Loki 业务日志 Evidence，时间线和 Evidence ID 读取均需通过。GitHub、Runtime 自动采集与诊断候选仍由后续任务验证。任何组件没就绪都会失败并报告具体服务/缺失样本。首次下载镜像超时可在网络恢复后重新执行；不把重跑当作解决 flaky。
 
 `demo.sh up` 失败后不会清空数据；用 `status` 定位不健康组件，再用相同项目名和两个 compose 文件执行 `logs <service>`。不要输出 Secret、网关渲染文件或完整环境变量。Grafana 初始密码仅在空卷生效，修改 Secret 文件后应通过受控账号管理更新已有密码。
