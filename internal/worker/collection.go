@@ -31,7 +31,7 @@ const (
 	collectionMaxPoints             = int(datasource.MaxQueryWindow/collectionQueryStep) + 1
 	collectionRuntimeLines          = 20
 	collectionRuntimeBytes          = 32 * 1024
-	collectionGitHubCandidates      = 4 // Four candidates × seven 10s-bounded requests stays below the 10m lease.
+	collectionGitHubCandidates      = 4 // Four candidates × eleven 10s-bounded requests stays below the 10m lease.
 	collectionGitHubMaxFiles        = 4
 	collectionGitHubDiffBytes       = 8 << 10
 	collectionGitHubPatchBytes      = 2 << 10
