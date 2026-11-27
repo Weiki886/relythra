@@ -158,7 +158,52 @@ def assert_runtime_evidence_timeline(timeline, investigation_id, host_id):
     assert set(evidence_by_template) == set(RUNTIME_EVIDENCE_TEMPLATES), (
         "Runtime Evidence template coverage", sorted(evidence_by_template)
     )
+    assert_runtime_required_memory_samples(evidence_by_template, host_id)
     return evidence_by_template
+
+
+def assert_runtime_required_memory_samples(evidence_by_template, host_id):
+    required = (
+        ("prometheus.runtime.host.memory_available.v1", "HOST"),
+        ("prometheus.runtime.container.memory.v1", "CONTAINER"),
+    )
+    for template, entity_type in required:
+        item = evidence_by_template[template]
+        observations = item["value_summary"]["measurements"]
+        if entity_type == "HOST":
+            matching = [observation for observation in observations
+                        if isinstance(observation, dict) and observation.get("entity_type") == "HOST"
+                        and observation.get("entity_id") == host_id and observation.get("host_id") == host_id]
+        else:
+            matching = [observation for observation in observations
+                        if isinstance(observation, dict) and observation.get("entity_type") == "CONTAINER"
+                        and observation.get("host_id") == host_id and observation.get("mapping_status") == "raw_cgroup_only"]
+            assert all(not observation.get("service") for observation in matching), "Runtime inferred a service for an unmapped cgroup"
+
+        has_samples = False
+        for observation in matching:
+            measurement = observation.get("measurement")
+            assert isinstance(measurement, dict), f"Runtime {template} measurement is missing"
+            samples = measurement.get("samples")
+            if not isinstance(samples, list) or not samples:
+                continue
+            source_reference = measurement.get("source_reference")
+            assert isinstance(source_reference, str) and source_reference, f"Runtime {template} sample source reference is missing"
+            reference = urllib.parse.urlparse(source_reference)
+            assert (reference.scheme, reference.hostname, reference.port, reference.path) == (
+                "http", "observability-gateway", 9090, "/api/v1/query_range",
+            ), f"Runtime {template} Prometheus source reference"
+            assert reference.username is None and reference.password is None, f"Runtime {template} source reference contains credentials"
+            for sample in samples:
+                assert isinstance(sample, dict) and isinstance(sample.get("timestamp"), str) and sample["timestamp"], (
+                    f"Runtime {template} sample timestamp is missing"
+                )
+                value = sample.get("value")
+                assert isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0, (
+                    f"Runtime {template} sample must be finite and non-negative"
+                )
+            has_samples = True
+        assert has_samples, f"Runtime {template} has no collected sample"
 
 
 def assert_loki_evidence_timeline(timeline, investigation_id, service_id):

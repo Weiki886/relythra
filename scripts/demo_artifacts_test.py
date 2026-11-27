@@ -325,29 +325,49 @@ class DemoLokiEvidenceTests(unittest.TestCase):
 
 
 def runtime_timeline():
+    host_memory_template = "prometheus.runtime.host.memory_available.v1"
+    container_memory_template = "prometheus.runtime.container.memory.v1"
     return {
         "investigation_id": "demo-investigation",
-        "items": [{
-            "id": "runtime-" + template,
-            "source_type": "RUNTIME",
-            "entity_type": "HOST",
-            "entity_id": "demo-host",
-            "completeness": "PARTIAL",
-            "raw_reference": "http://observability-gateway:9090/api/v1/query_range",
-            "query_parameters": {
-                "runtime": "docker-compose",
-                "service": "inventory",
-                "environment": "demo",
-                "host_id": "demo-host",
-                "mapping_version": 1,
-                "template_id": template,
-                "template_version": 1,
-            },
-            "value_summary": {
-                "measurements": [], "events": [], "gaps": ["healthy_peer_evidence_unavailable"],
-                "partial": True, "source_reference_available": True,
-            },
-        } for template in RUNTIME_EVIDENCE_TEMPLATES],
+        "items": [runtime_item(template, host_memory_template, container_memory_template)
+                  for template in RUNTIME_EVIDENCE_TEMPLATES],
+    }
+
+
+def runtime_item(template, host_memory_template, container_memory_template):
+    source_reference = "http://observability-gateway:3100/loki/api/v1/query_range" if template == "loki.container.restarts.v1" else "http://observability-gateway:9090/api/v1/query_range"
+    measurements = []
+    if template == host_memory_template:
+        measurements.append({
+            "entity_type": "HOST", "entity_id": "demo-host", "host_id": "demo-host",
+            "measurement": {"samples": [{"timestamp": "2026-11-27T05:00:00Z", "value": 1024}], "source_reference": source_reference},
+        })
+    if template == container_memory_template:
+        measurements.append({
+            "entity_type": "CONTAINER", "entity_id": "opaque-cgroup-id", "host_id": "demo-host",
+            "mapping_status": "raw_cgroup_only",
+            "measurement": {"samples": [{"timestamp": "2026-11-27T05:00:00Z", "value": 4096}], "source_reference": source_reference},
+        })
+    return {
+        "id": "runtime-" + template,
+        "source_type": "RUNTIME",
+        "entity_type": "HOST",
+        "entity_id": "demo-host",
+        "completeness": "PARTIAL",
+        "raw_reference": source_reference,
+        "query_parameters": {
+            "runtime": "docker-compose",
+            "service": "inventory",
+            "environment": "demo",
+            "host_id": "demo-host",
+            "mapping_version": 1,
+            "template_id": template,
+            "template_version": 1,
+        },
+        "value_summary": {
+            "measurements": measurements, "events": [], "gaps": ["healthy_peer_evidence_unavailable"],
+            "partial": True, "source_reference_available": True,
+        },
     }
 
 
@@ -412,6 +432,27 @@ class DemoRuntimeEvidenceTests(unittest.TestCase):
         timeline = runtime_timeline()
         items = assert_runtime_evidence_timeline(timeline, "demo-investigation", "demo-host")
         self.assertEqual(set(items), set(RUNTIME_EVIDENCE_TEMPLATES))
+
+    def test_runtime_timeline_rejects_all_empty_host_and_cgroup_memory_results(self):
+        timeline = runtime_timeline()
+        required_templates = ("prometheus.runtime.host.memory_available.v1", "prometheus.runtime.container.memory.v1")
+        for item in timeline["items"]:
+            if item["query_parameters"]["template_id"] in required_templates:
+                item["value_summary"]["measurements"] = []
+                item["raw_reference"] = ""
+                item["value_summary"]["source_reference_available"] = False
+        with self.assertRaisesRegex(AssertionError, "sample"):
+            assert_runtime_evidence_timeline(timeline, "demo-investigation", "demo-host")
+
+    def test_runtime_timeline_rejects_invalid_required_memory_samples(self):
+        invalid_values = (True, -1, float("nan"), float("inf"), "1024")
+        for value in invalid_values:
+            with self.subTest(value=value):
+                timeline = runtime_timeline()
+                item = next(item for item in timeline["items"] if item["query_parameters"]["template_id"] == "prometheus.runtime.container.memory.v1")
+                item["value_summary"]["measurements"][0]["measurement"]["samples"][0]["value"] = value
+                with self.assertRaises(AssertionError):
+                    assert_runtime_evidence_timeline(timeline, "demo-investigation", "demo-host")
 
     def test_runtime_timeline_rejects_wrong_scope_missing_templates_and_unbounded_claims(self):
         mutations = [
