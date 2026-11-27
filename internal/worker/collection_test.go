@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	githubconnector "github.com/Weiki886/relythra/internal/connector/github"
 	lokiconnector "github.com/Weiki886/relythra/internal/connector/loki"
 	prometheusconnector "github.com/Weiki886/relythra/internal/connector/prometheus"
 	runtimeconnector "github.com/Weiki886/relythra/internal/connector/runtime"
@@ -30,18 +31,22 @@ const (
 )
 
 type collectionRepositoryFake struct {
-	context             store.InvestigationContext
-	mappings            []store.DataSourceMapping
-	persistedPrometheus []evidence.Record
-	persistedLoki       []evidence.Record
-	persistedGaps       []evidence.Record
-	persistedRuntime    []evidence.Record
-	completeCalls       int
-	retryCalls          int
-	retryCode           string
-	persistErr          error
-	runtimePersistErr   error
-	completedBeforeSave bool
+	context                store.InvestigationContext
+	mappings               []store.DataSourceMapping
+	persistedPrometheus    []evidence.Record
+	persistedLoki          []evidence.Record
+	persistedGaps          []evidence.Record
+	persistedRuntime       []evidence.Record
+	persistedGitHub        []githubconnector.Result
+	persistedGitHubRecords []evidence.Record
+	deploymentCandidates   []store.DeploymentEvent
+	completeCalls          int
+	retryCalls             int
+	retryCode              string
+	retryDelay             time.Duration
+	persistErr             error
+	runtimePersistErr      error
+	completedBeforeSave    bool
 }
 
 func (repository *collectionRepositoryFake) ClaimInvestigationCollectionJobs(context.Context, int, time.Duration) ([]store.InvestigationCollectionJob, error) {
@@ -54,6 +59,23 @@ func (repository *collectionRepositoryFake) GetInvestigationContext(context.Cont
 
 func (repository *collectionRepositoryFake) ListDataSourceMappings(context.Context, string, string, string) ([]store.DataSourceMapping, error) {
 	return repository.mappings, nil
+}
+
+func (repository *collectionRepositoryFake) ListInvestigationDeploymentCandidates(context.Context, string) ([]store.DeploymentEvent, error) {
+	return repository.deploymentCandidates, nil
+}
+
+func (repository *collectionRepositoryFake) PersistGitHubEvidence(_ context.Context, result githubconnector.Result, metadata evidence.GitHubEvidenceContext, filter *redact.Filter) (store.Evidence, bool, error) {
+	if repository.persistErr != nil {
+		return store.Evidence{}, false, repository.persistErr
+	}
+	record, err := evidence.FromGitHubResult(context.Background(), result, metadata, filter)
+	if err != nil {
+		return store.Evidence{}, false, err
+	}
+	repository.persistedGitHub = append(repository.persistedGitHub, result)
+	repository.persistedGitHubRecords = append(repository.persistedGitHubRecords, record)
+	return store.Evidence{ID: "github-evidence"}, true, nil
 }
 
 func (repository *collectionRepositoryFake) PersistPrometheusEvidence(_ context.Context, result prometheusconnector.Result, metadata evidence.PrometheusEvidenceContext, filter *redact.Filter) (store.Evidence, bool, error) {
@@ -110,13 +132,14 @@ func (repository *collectionRepositoryFake) PersistRuntimeEvidence(ctx context.C
 
 func (repository *collectionRepositoryFake) CompleteInvestigationCollectionJob(context.Context, string, string) (bool, error) {
 	repository.completeCalls++
-	repository.completedBeforeSave = len(repository.persistedPrometheus)+len(repository.persistedLoki)+len(repository.persistedGaps)+len(repository.persistedRuntime) == 0
+	repository.completedBeforeSave = len(repository.persistedPrometheus)+len(repository.persistedLoki)+len(repository.persistedGaps)+len(repository.persistedRuntime)+len(repository.persistedGitHub) == 0
 	return true, nil
 }
 
-func (repository *collectionRepositoryFake) RetryInvestigationCollectionJob(_ context.Context, _, _ string, code string, _ time.Duration) (bool, error) {
+func (repository *collectionRepositoryFake) RetryInvestigationCollectionJob(_ context.Context, _, _ string, code string, delay time.Duration) (bool, error) {
 	repository.retryCalls++
 	repository.retryCode = code
+	repository.retryDelay = delay
 	return false, nil
 }
 
@@ -126,10 +149,16 @@ func (collectionSecretResolverFake) Resolve(context.Context, secrets.Reference) 
 	return secrets.Secret{}, errors.New("unexpected secret resolution")
 }
 
-type collectionSecretResolverStatic struct{}
+type collectionSecretResolverStatic struct {
+	secret string
+}
 
-func (collectionSecretResolverStatic) Resolve(context.Context, secrets.Reference) (secrets.Secret, error) {
-	return secrets.New("runtime-test-token")
+func (resolver collectionSecretResolverStatic) Resolve(context.Context, secrets.Reference) (secrets.Secret, error) {
+	secret := resolver.secret
+	if secret == "" {
+		secret = "runtime-test-token"
+	}
+	return secrets.New(secret)
 }
 
 type collectionPrometheusFake struct {

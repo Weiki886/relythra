@@ -29,6 +29,10 @@ func TestPersistGitHubEvidenceValidatesDeploymentOwnershipAndReplays(t *testing.
 	`, fixture.projectID, fixture.incidentID, deployment.ID); err != nil {
 		t.Fatalf("link deployment candidate: %v", err)
 	}
+	candidates, err := repository.ListInvestigationDeploymentCandidates(ctx, fixture.investigationID)
+	if err != nil || len(candidates) != 1 || candidates[0].ID != deployment.ID {
+		t.Fatalf("investigation deployment candidates = %+v, err=%v", candidates, err)
+	}
 	filter, err := redact.NewFilter()
 	if err != nil {
 		t.Fatal(err)
@@ -129,5 +133,59 @@ func githubResultForDeployment(deploymentID, commitSHA string, authorDate time.T
 		DependencyFiles: []github.DependencyFile{},
 		Diff:            &diff,
 		Warnings:        []string{},
+	}
+}
+
+func TestListInvestigationDeploymentCandidatesReturnsOnlyLinkedMatchedCandidates(t *testing.T) {
+	db := openStoreTestDB(t)
+	ctx := context.Background()
+	repository := NewPostgres(db)
+	fixture := insertStoreFixture(t, ctx, db, "github-candidate-list")
+	other := insertStoreFixture(t, ctx, db, "github-candidate-list-other")
+
+	firstInput := fixture.deploymentInput("github-candidate-list-first")
+	firstInput.StartedAt = fixture.startedAt.Add(time.Minute)
+	first, _, err := repository.CreateDeploymentEvent(ctx, firstInput)
+	if err != nil {
+		t.Fatalf("create first deployment: %v", err)
+	}
+	secondInput := fixture.deploymentInput("github-candidate-list-second")
+	secondInput.StartedAt = fixture.startedAt.Add(2 * time.Minute)
+	second, _, err := repository.CreateDeploymentEvent(ctx, secondInput)
+	if err != nil {
+		t.Fatalf("create second deployment: %v", err)
+	}
+	foreignInput := other.deploymentInput("github-candidate-list-foreign")
+	foreign, _, err := repository.CreateDeploymentEvent(ctx, foreignInput)
+	if err != nil {
+		t.Fatalf("create foreign deployment: %v", err)
+	}
+	missingInput := fixture.deploymentInput("github-candidate-list-missing")
+	missing, _, err := repository.CreateDeploymentEvent(ctx, missingInput)
+	if err != nil {
+		t.Fatalf("create missing deployment candidate event: %v", err)
+	}
+	for _, candidate := range []struct {
+		projectID, incidentID, deploymentID, status string
+	}{
+		{fixture.projectID, fixture.incidentID, first.ID, "MATCHED"},
+		{fixture.projectID, fixture.incidentID, second.ID, "AMBIGUOUS"},
+		{fixture.projectID, fixture.incidentID, missing.ID, "MISSING"},
+		{other.projectID, other.incidentID, foreign.ID, "MATCHED"},
+	} {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO deployment_candidates (project_id, incident_id, deployment_event_id, match_status, match_reason)
+			VALUES ($1, $2, $3, $4, 'integration test candidate')
+		`, candidate.projectID, candidate.incidentID, candidate.deploymentID, candidate.status); err != nil {
+			t.Fatalf("link deployment candidate: %v", err)
+		}
+	}
+
+	candidates, err := repository.ListInvestigationDeploymentCandidates(ctx, fixture.investigationID)
+	if err != nil || len(candidates) != 2 {
+		t.Fatalf("deployment candidates = %+v, err=%v; want two investigation-linked candidates", candidates, err)
+	}
+	if candidates[0].ID != first.ID || candidates[1].ID != second.ID {
+		t.Fatalf("candidate order/identity = [%s, %s], want [%s, %s]", candidates[0].ID, candidates[1].ID, first.ID, second.ID)
 	}
 }

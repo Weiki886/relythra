@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
+	githubconnector "github.com/Weiki886/relythra/internal/connector/github"
 	lokiconnector "github.com/Weiki886/relythra/internal/connector/loki"
 	prometheusconnector "github.com/Weiki886/relythra/internal/connector/prometheus"
 	runtimeconnector "github.com/Weiki886/relythra/internal/connector/runtime"
 	"github.com/Weiki886/relythra/internal/datasource"
+	"github.com/Weiki886/relythra/internal/domain"
 	"github.com/Weiki886/relythra/internal/evidence"
 	"github.com/Weiki886/relythra/internal/security/redact"
 	"github.com/Weiki886/relythra/internal/security/secrets"
@@ -19,15 +22,20 @@ import (
 )
 
 const (
-	collectionLease        = 10 * time.Minute
-	collectionRetryBase    = 5 * time.Second
-	collectionLookback     = 5 * time.Minute
-	collectionLookahead    = 5 * time.Minute
-	collectionQueryStep    = 2 * time.Minute
-	collectionMaxSeries    = 2
-	collectionMaxPoints    = int(datasource.MaxQueryWindow/collectionQueryStep) + 1
-	collectionRuntimeLines = 20
-	collectionRuntimeBytes = 32 * 1024
+	collectionLease                 = 10 * time.Minute
+	collectionRetryBase             = 5 * time.Second
+	collectionLookback              = 5 * time.Minute
+	collectionLookahead             = 5 * time.Minute
+	collectionQueryStep             = 2 * time.Minute
+	collectionMaxSeries             = 2
+	collectionMaxPoints             = int(datasource.MaxQueryWindow/collectionQueryStep) + 1
+	collectionRuntimeLines          = 20
+	collectionRuntimeBytes          = 32 * 1024
+	collectionGitHubCandidates      = 4 // Four candidates × seven 10s-bounded requests stays below the 10m lease.
+	collectionGitHubMaxFiles        = 4
+	collectionGitHubDiffBytes       = 8 << 10
+	collectionGitHubPatchBytes      = 2 << 10
+	collectionGitHubDependencyBytes = 4 << 10
 )
 
 var (
@@ -43,6 +51,8 @@ type collectionRepository interface {
 	PersistPrometheusEvidence(context.Context, prometheusconnector.Result, evidence.PrometheusEvidenceContext, *redact.Filter) (store.Evidence, bool, error)
 	PersistLokiEvidence(context.Context, lokiconnector.Result, evidence.LokiEvidenceContext, *redact.Filter) (store.Evidence, bool, error)
 	PersistRuntimeEvidence(context.Context, runtimeconnector.Result, store.RuntimeEvidencePersistenceContext, *redact.Filter) ([]store.Evidence, []bool, error)
+	ListInvestigationDeploymentCandidates(context.Context, string) ([]store.DeploymentEvent, error)
+	PersistGitHubEvidence(context.Context, githubconnector.Result, evidence.GitHubEvidenceContext, *redact.Filter) (store.Evidence, bool, error)
 	PersistEvidence(context.Context, evidence.Record) (store.Evidence, bool, error)
 	CompleteInvestigationCollectionJob(context.Context, string, string) (bool, error)
 	RetryInvestigationCollectionJob(context.Context, string, string, string, time.Duration) (bool, error)
@@ -60,9 +70,14 @@ type runtimeQueryer interface {
 	Query(context.Context, runtimeconnector.Target, runtimeconnector.Request) (runtimeconnector.Result, error)
 }
 
+type githubQueryer interface {
+	Query(context.Context, githubconnector.Target, githubconnector.Query) (githubconnector.Result, error)
+}
+
 type CollectionOptions struct {
 	LokiConnector    lokiQueryer
 	RuntimeConnector runtimeQueryer
+	GitHubConnector  githubQueryer
 	Now              func() time.Time
 	RetryDelay       func(attempt int) time.Duration
 }
@@ -72,6 +87,7 @@ type CollectionProcessor struct {
 	connector        prometheusQueryer
 	lokiConnector    lokiQueryer
 	runtimeConnector runtimeQueryer
+	githubConnector  githubQueryer
 	resolver         prometheusconnector.SecretResolver
 	filter           *redact.Filter
 	now              func() time.Time
@@ -102,6 +118,7 @@ func NewCollectionProcessor(
 		connector:        connector,
 		lokiConnector:    options.LokiConnector,
 		runtimeConnector: options.RuntimeConnector,
+		githubConnector:  options.GitHubConnector,
 		resolver:         resolver,
 		filter:           filter,
 		now:              options.Now,
@@ -136,6 +153,7 @@ func (processor *CollectionProcessor) Process(ctx context.Context, job store.Inv
 
 	prometheusMappings := 0
 	retryCode := ""
+	retryAfter := time.Duration(0)
 	for _, mapping := range mappings {
 		var collectErr error
 		switch mapping.SourceType {
@@ -157,8 +175,12 @@ func (processor *CollectionProcessor) Process(ctx context.Context, job store.Inv
 				collectErr = processor.collectRuntime(ctx, job, investigation, mapping, mappings, windowStart, windowEnd)
 			}
 		case datasource.SourceGitHub:
-			if err := processor.persistUnsupportedGaps(ctx, job, investigation, mapping, windowStart, windowEnd); err != nil {
-				return processor.retry(ctx, job, "gap_persist_failed")
+			if processor.githubConnector == nil {
+				if err := processor.persistUnsupportedGaps(ctx, job, investigation, mapping, windowStart, windowEnd); err != nil {
+					return processor.retry(ctx, job, "gap_persist_failed")
+				}
+			} else {
+				collectErr = processor.collectGitHub(ctx, job, investigation, mapping, windowStart, windowEnd)
 			}
 		case datasource.SourceGrafana:
 			// Grafana mappings describe alert metadata; alert context is already persisted.
@@ -176,6 +198,7 @@ func (processor *CollectionProcessor) Process(ctx context.Context, job store.Inv
 			if retryCode == "" {
 				retryCode = failure.code
 			}
+			retryAfter = max(retryAfter, failure.retryAfter)
 		}
 	}
 	if prometheusMappings == 0 {
@@ -184,7 +207,7 @@ func (processor *CollectionProcessor) Process(ctx context.Context, job store.Inv
 		}
 	}
 	if retryCode != "" {
-		return processor.retry(ctx, job, retryCode)
+		return processor.retryAfter(ctx, job, retryCode, retryAfter)
 	}
 	completed, err := processor.repository.CompleteInvestigationCollectionJob(ctx, job.ID, job.LeaseToken)
 	if err != nil {
@@ -537,6 +560,173 @@ func (processor *CollectionProcessor) collectPrometheus(
 	return nil
 }
 
+var githubBundleTemplates = []string{"github.commits.v1", "github.pull_requests.v1", "github.diff.v1"}
+
+func (processor *CollectionProcessor) collectGitHub(
+	ctx context.Context,
+	job store.InvestigationCollectionJob,
+	investigation store.InvestigationContext,
+	mapping store.DataSourceMapping,
+	start, end time.Time,
+) error {
+	if !hasTemplateBundle(mapping.Templates, datasource.SourceGitHub, githubBundleTemplates) {
+		if err := processor.persistGitHubGaps(ctx, job, investigation, start, end, evidence.CollectionFailureRequestRejected); err != nil {
+			return &collectionFailure{code: "gap_persist_failed"}
+		}
+		return nil
+	}
+	secretReference, err := parseSecretReference(mapping.SecretRef)
+	if err != nil {
+		if gapErr := processor.persistGitHubGaps(ctx, job, investigation, start, end, evidence.CollectionFailureRequestRejected); gapErr != nil {
+			return &collectionFailure{code: "gap_persist_failed"}
+		}
+		return nil
+	}
+	queryFilter := processor.filter
+	var resolvedSecret *secrets.Secret
+	if secretReference != nil {
+		secret, resolveErr := processor.resolver.Resolve(ctx, *secretReference)
+		if resolveErr != nil {
+			if gapErr := processor.persistGitHubGaps(ctx, job, investigation, start, end, evidence.CollectionFailurePermissionDenied); gapErr != nil {
+				return &collectionFailure{code: "gap_persist_failed"}
+			}
+			return &collectionFailure{code: "github_secret_unavailable"}
+		}
+		resolvedSecret = &secret
+		queryFilter, err = processor.filter.WithAdditionalSecrets(secret.Reveal())
+		if err != nil {
+			return &collectionFailure{code: "evidence_persist_failed"}
+		}
+	}
+	candidates, err := processor.repository.ListInvestigationDeploymentCandidates(ctx, job.InvestigationID)
+	if err != nil {
+		return &collectionFailure{code: "deployment_candidate_read_failed"}
+	}
+	if len(candidates) == 0 {
+		if err := processor.persistGitHubGaps(ctx, job, investigation, start, end, evidence.CollectionFailureMissingRevision); err != nil {
+			return &collectionFailure{code: "gap_persist_failed"}
+		}
+		return nil
+	}
+	retryCode := ""
+	if len(candidates) > collectionGitHubCandidates {
+		if err := processor.persistGitHubGaps(ctx, job, investigation, start, end, evidence.CollectionFailureResultLimit); err != nil {
+			return &collectionFailure{code: "gap_persist_failed"}
+		}
+		candidates = candidates[:collectionGitHubCandidates]
+	}
+	for _, candidate := range candidates {
+		if !domain.IsID(candidate.ID) || !commitSHAValid(candidate.CommitSHA) {
+			if err := processor.persistGitHubGaps(ctx, job, investigation, start, end, evidence.CollectionFailureMissingRevision); err != nil {
+				return &collectionFailure{code: "gap_persist_failed"}
+			}
+			continue
+		}
+		result, queryErr := processor.githubConnector.Query(ctx, githubconnector.Target{
+			Endpoint: mapping.PublicSettings.Endpoint, Repository: mapping.PublicSettings.Repository, SecretReference: secretReference, ResolvedSecret: resolvedSecret,
+		}, githubconnector.Query{
+			Revision: githubconnector.Revision{
+				CommitSHA: candidate.CommitSHA, DeploymentEventID: candidate.ID, Source: githubconnector.RevisionSourceDeploymentEvent,
+			},
+			MaxFiles: collectionGitHubMaxFiles, MaxDiffBytes: collectionGitHubDiffBytes,
+			MaxPatchBytes: collectionGitHubPatchBytes, MaxDependencyFileBytes: collectionGitHubDependencyBytes,
+		})
+		if queryErr != nil {
+			retry, reason, retryAfter := githubCollectionFailure(queryErr)
+			if err := processor.persistGitHubGaps(ctx, job, investigation, start, end, reason); err != nil {
+				return &collectionFailure{code: "gap_persist_failed"}
+			}
+			if retryCode == "" {
+				retryCode = retry
+			}
+			if retryAfter > 0 {
+				return &collectionFailure{code: retry, retryAfter: retryAfter}
+			}
+			continue
+		}
+		if result.DeploymentEventID != candidate.ID || !strings.EqualFold(result.CommitSHA, candidate.CommitSHA) {
+			if err := processor.persistGitHubGaps(ctx, job, investigation, start, end, evidence.CollectionFailureInvalidResponse); err != nil {
+				return &collectionFailure{code: "gap_persist_failed"}
+			}
+			if retryCode == "" {
+				retryCode = "github_invalid_response"
+			}
+			continue
+		}
+		_, _, err = processor.repository.PersistGitHubEvidence(ctx, result, evidence.GitHubEvidenceContext{
+			InvestigationID: job.InvestigationID, EntityType: "SERVICE", EntityID: investigation.Service.ID, CollectedAt: processor.now().UTC(),
+		}, queryFilter)
+		if err != nil {
+			if errors.Is(err, evidence.ErrInvalidInput) {
+				if gapErr := processor.persistGitHubGaps(ctx, job, investigation, start, end, evidence.CollectionFailureResultLimit); gapErr != nil {
+					return &collectionFailure{code: "gap_persist_failed"}
+				}
+				continue
+			}
+			return &collectionFailure{code: "evidence_persist_failed"}
+		}
+	}
+	if retryCode != "" {
+		return &collectionFailure{code: retryCode}
+	}
+	return nil
+}
+
+func (processor *CollectionProcessor) persistGitHubGaps(
+	ctx context.Context, job store.InvestigationCollectionJob, investigation store.InvestigationContext,
+	start, end time.Time, reason evidence.CollectionFailureCode,
+) error {
+	for _, templateID := range githubBundleTemplates {
+		if err := processor.persistGap(ctx, job, investigation, string(datasource.SourceGitHub), templateID, 1, reason, start, end); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func commitSHAValid(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, character := range value {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f') || (character >= 'A' && character <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func githubCollectionFailure(err error) (string, evidence.CollectionFailureCode, time.Duration) {
+	var queryError *githubconnector.QueryError
+	if !errors.As(err, &queryError) {
+		return "github_unknown", evidence.CollectionFailureUnknown, 0
+	}
+	code := "github_" + string(queryError.Category)
+	switch queryError.Category {
+	case githubconnector.ErrorTimeout:
+		return code, evidence.CollectionFailureTimeout, 0
+	case githubconnector.ErrorRateLimited:
+		delay := queryError.RetryAfter
+		if queryError.RateLimitReset.After(time.Now()) {
+			resetDelay := time.Until(queryError.RateLimitReset)
+			if resetDelay > delay {
+				delay = resetDelay
+			}
+		}
+		return code, evidence.CollectionFailureRateLimited, delay
+	case githubconnector.ErrorPermissionDenied, githubconnector.ErrorSecretUnavailable:
+		return code, evidence.CollectionFailurePermissionDenied, 0
+	case githubconnector.ErrorInvalidResponse, githubconnector.ErrorResponseTooLarge:
+		return code, evidence.CollectionFailureInvalidResponse, 0
+	case githubconnector.ErrorInvalidQuery, githubconnector.ErrorInvalidRevision, githubconnector.ErrorPolicyRejected:
+		return code, evidence.CollectionFailureRequestRejected, 0
+	case githubconnector.ErrorNetwork, githubconnector.ErrorRevisionUnavailable, githubconnector.ErrorRemoteUnavailable:
+		return code, evidence.CollectionFailureUnavailable, 0
+	default:
+		return "github_unknown", evidence.CollectionFailureUnknown, 0
+	}
+}
+
 func (processor *CollectionProcessor) persistUnsupportedGaps(
 	ctx context.Context,
 	job store.InvestigationCollectionJob,
@@ -596,9 +786,13 @@ func (processor *CollectionProcessor) persistGap(
 }
 
 func (processor *CollectionProcessor) retry(ctx context.Context, job store.InvestigationCollectionJob, code string) error {
-	delay := processor.retryDelay(job.AttemptCount)
-	if delay < 0 || delay > time.Hour {
-		delay = time.Hour
+	return processor.retryAfter(ctx, job, code, 0)
+}
+
+func (processor *CollectionProcessor) retryAfter(ctx context.Context, job store.InvestigationCollectionJob, code string, retryAfter time.Duration) error {
+	delay := max(processor.retryDelay(job.AttemptCount), retryAfter)
+	if delay < 0 || delay > 24*time.Hour {
+		delay = 24 * time.Hour
 	}
 	if _, err := processor.repository.RetryInvestigationCollectionJob(ctx, job.ID, job.LeaseToken, code, delay); err != nil {
 		return errCollectionRetryFailed
@@ -607,7 +801,8 @@ func (processor *CollectionProcessor) retry(ctx context.Context, job store.Inves
 }
 
 type collectionFailure struct {
-	code string
+	code       string
+	retryAfter time.Duration
 }
 
 func (failure *collectionFailure) Error() string { return failure.code }

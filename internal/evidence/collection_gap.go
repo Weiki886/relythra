@@ -24,6 +24,8 @@ const (
 	CollectionFailureUnknown          CollectionFailureCode = "unknown"
 	CollectionFailureMissingMapping   CollectionFailureCode = "missing_mapping"
 	CollectionFailureUnsupported      CollectionFailureCode = "collector_not_implemented"
+	CollectionFailureMissingRevision  CollectionFailureCode = "missing_revision"
+	CollectionFailureResultLimit      CollectionFailureCode = "result_limit"
 )
 
 type CollectionGapInput struct {
@@ -126,7 +128,7 @@ func validCollectionFailureCode(code CollectionFailureCode) bool {
 	switch code {
 	case CollectionFailureTimeout, CollectionFailureRateLimited, CollectionFailurePermissionDenied,
 		CollectionFailureUnavailable, CollectionFailureInvalidResponse, CollectionFailureRequestRejected, CollectionFailureMissingMapping, CollectionFailureUnsupported,
-		CollectionFailureUnknown:
+		CollectionFailureUnknown, CollectionFailureMissingRevision, CollectionFailureResultLimit:
 		return true
 	default:
 		return false

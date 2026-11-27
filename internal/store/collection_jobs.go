@@ -13,7 +13,7 @@ import (
 const (
 	collectionJobMaxBatchSize  = 100
 	collectionJobMaxLease      = time.Hour
-	collectionJobMaxRetryDelay = time.Hour
+	collectionJobMaxRetryDelay = 24 * time.Hour
 	collectionJobMaxAttempts   = 5
 )
 
