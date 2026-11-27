@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,6 +58,101 @@ func TestPersistRuntimeEvidenceValidatesOwnershipReplaysAndReadsTimeline(t *test
 	}
 	if timeline.Total != 8 || len(timeline.Items) != 8 {
 		t.Fatalf("runtime timeline = %d/%d, want 8/8", timeline.Total, len(timeline.Items))
+	}
+}
+
+func TestPersistRuntimeEvidenceKeepsReplacedContainerHistoryFilterable(t *testing.T) {
+	db := openStoreTestDB(t)
+	ctx := context.Background()
+	fixture := insertStoreFixture(t, ctx, db, "runtime-container-replacement-history")
+	repository := NewPostgres(db)
+	filter, err := redact.NewFilter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := storeRuntimeObservation(fixture)
+	first.MappingVersion = 1
+	first.Containers[0].MappingStatus = "explicit_mapping"
+	first.Containers[0].MappingVersion = first.MappingVersion
+	first.Containers[0].Service = first.Service
+	first.Containers[0].PeerContainerIDs = []string{}
+	firstMetadata := runtimeEvidencePersistenceContext(fixture)
+	if _, _, err := repository.PersistRuntimeEvidence(ctx, first, firstMetadata, filter); err != nil {
+		t.Fatalf("persist original container Evidence: %v", err)
+	}
+
+	second := storeRuntimeObservation(fixture)
+	second.Start = first.End.Add(time.Minute)
+	second.End = second.Start.Add(first.End.Sub(first.Start))
+	second.MappingVersion = 2
+	second.Containers[0].ID = "opaque-cgroup-replacement"
+	second.Containers[0].InstanceID = "opaque-incarnation-replacement"
+	second.Containers[0].MappingStatus = "explicit_mapping"
+	second.Containers[0].MappingVersion = second.MappingVersion
+	second.Containers[0].Service = second.Service
+	second.Containers[0].PeerContainerIDs = []string{}
+	second.Containers[0].StartTime = timePointer(second.Start.Add(-time.Hour))
+	retimeRuntimeMeasurements(&second, second.Start.Add(time.Minute))
+	secondMetadata := runtimeEvidencePersistenceContext(fixture)
+	secondMetadata.CollectedAt = second.End.Add(time.Minute)
+	if _, _, err := repository.PersistRuntimeEvidence(ctx, second, secondMetadata, filter); err != nil {
+		t.Fatalf("persist replacement container Evidence: %v", err)
+	}
+
+	for _, expected := range []struct {
+		containerID string
+		start       time.Time
+		end         time.Time
+	}{
+		{containerID: first.Containers[0].ID, start: first.Start, end: first.End},
+		{containerID: second.Containers[0].ID, start: second.Start, end: second.End},
+	} {
+		timeline, err := repository.GetInvestigationTimeline(ctx, fixture.investigationID, InvestigationTimelineFilter{
+			SourceType: evidence.SourceRuntime, ContainerID: expected.containerID,
+		}, 20, 0)
+		if err != nil {
+			t.Fatalf("read container %s history: %v", expected.containerID, err)
+		}
+		if timeline.Total != 4 || len(timeline.Items) != 4 {
+			t.Fatalf("container %s history returned %d/%d Runtime Evidence, want four measurement templates", expected.containerID, timeline.Total, len(timeline.Items))
+		}
+		for _, item := range timeline.Items {
+			if !item.ObservedStart.Equal(expected.start) || !item.ObservedEnd.Equal(expected.end) {
+				t.Errorf("container %s history window = %s..%s, want %s..%s", expected.containerID,
+					item.ObservedStart, item.ObservedEnd, expected.start, expected.end)
+			}
+			if !strings.Contains(string(item.ValueSummary), expected.containerID) {
+				t.Errorf("container %s filter returned Evidence without its identity: %s", expected.containerID, item.ValueSummary)
+			}
+		}
+	}
+}
+
+func timePointer(value time.Time) *time.Time {
+	return &value
+}
+
+func retimeRuntimeMeasurements(result *runtimeconnector.Result, evaluation time.Time) {
+	for index := range result.Hosts {
+		for _, measurement := range []*runtimeconnector.Measurement{
+			&result.Hosts[index].CPU, &result.Hosts[index].MemoryAvailable, &result.Hosts[index].Load,
+		} {
+			for sampleIndex := range measurement.Samples {
+				measurement.Samples[sampleIndex].Timestamp = evaluation
+			}
+		}
+	}
+	container := &result.Containers[0]
+	for _, measurement := range []*runtimeconnector.Measurement{
+		&container.CPU, &container.Memory, &container.OOMEvents, &container.StartEvidence,
+	} {
+		for sampleIndex := range measurement.Samples {
+			measurement.Samples[sampleIndex].Timestamp = evaluation
+		}
+	}
+	if len(container.StartEvidence.Samples) > 0 && container.StartTime != nil {
+		container.StartEvidence.Samples[0].Value = float64(container.StartTime.Unix())
 	}
 }
 
