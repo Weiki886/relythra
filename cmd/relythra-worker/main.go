@@ -15,6 +15,7 @@ import (
 	"github.com/Weiki886/relythra/internal/config"
 	lokiconnector "github.com/Weiki886/relythra/internal/connector/loki"
 	prometheusconnector "github.com/Weiki886/relythra/internal/connector/prometheus"
+	runtimeconnector "github.com/Weiki886/relythra/internal/connector/runtime"
 	securitylogging "github.com/Weiki886/relythra/internal/security/logging"
 	"github.com/Weiki886/relythra/internal/security/outbound"
 	"github.com/Weiki886/relythra/internal/security/redact"
@@ -77,7 +78,13 @@ func run() error {
 	if err != nil {
 		return errors.New("initialize worker Loki connector failed")
 	}
-	processor, err := worker.NewCollectionProcessor(store.NewPostgres(db), connector, resolver, filter, worker.CollectionOptions{LokiConnector: lokiConnector})
+	runtimeCollector, err := runtimeconnector.NewCollector(connector, lokiConnector)
+	if err != nil {
+		return errors.New("initialize worker runtime collector failed")
+	}
+	processor, err := worker.NewCollectionProcessor(store.NewPostgres(db), connector, resolver, filter, worker.CollectionOptions{
+		LokiConnector: lokiConnector, RuntimeConnector: runtimeCollector,
+	})
 	if err != nil {
 		return err
 	}

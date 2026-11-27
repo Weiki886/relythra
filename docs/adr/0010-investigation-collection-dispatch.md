@@ -35,7 +35,8 @@ Issue #16 要求告警到达后自动收集告警窗口附近的证据。当前 
 
 - 已实现：与 Investigation 同事务的任务持久化、幂等约束和 remap 入队。
 - 已实现：`FOR UPDATE SKIP LOCKED` 单任务领取、UUID 租约 token、过期重领、受限退避重试和最大尝试次数终止。
-- 当前切片：Worker 使用固定 Prometheus 模板采集并持久化 Evidence；其他已配置的 Loki/GitHub/Runtime 来源和未配置 Prometheus 映射写入结构化缺口。任务只在结果或缺口成功持久化后完成。
-- 后续仍需实现 Loki/GitHub/Runtime 采集，并完成 Compose 慢 SQL 故障 E2E。完整验收前不得关闭 Issue #16。
+- 已实现：Worker 对精确映射的 Prometheus 与 Loki 固定模板执行只读采集，并在结果或结构化缺口持久化后完成任务。
+- 本 PR 增加 Docker Compose Runtime Worker 集成：Runtime 映射须授权完整的 `runtime.containers.v1`、`runtime.host.v1`、`runtime.events.v1` 模板；同作用域 Prometheus 与 Loki 映射仅提供已经过出站策略验证的 Endpoint 和 SecretRef。完整 Runtime 高层模板包授权 Runtime 连接器的静态底层 Prometheus/Loki 查询，不要求把这些实现细节加入独立来源映射，避免将 Host/cgroup 数据重复归为服务级 Evidence。依赖缺失、作用域错误或 Runtime 模板包不完整时持久化 Runtime 缺口，不发出 Runtime 查询。结果经现有 `PersistRuntimeEvidence` 按 Investigation、Service 和采集时间写入；不把采集任务 ID 伪装成 `tool_call_id`，内容哈希保证重试重放幂等；持久化失败时任务不完成并进入租约重试。
+- 后续仍需 GitHub 自动采集、Compose 中 Runtime 映射和资源故障场景的端到端验证，以及完整慢 SQL 故障 E2E。完整验收前不得关闭 Issue #13/#16。
 
 Issue #16 在完整链路验收前保持开放。

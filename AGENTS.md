@@ -9,7 +9,7 @@ Relythra 面向发布后异常排查，关联发布、代码变更、指标、�
 - 系统以只读诊断为主。不得自动执行回滚、重启、扩容、配置修改或其他外部写操作。
 - Agent 输出是根因假设，不是未经证据支持的绝对结论。无法证明时必须显式返回证据不足或 `inconclusive`。
 - 证据必须能回到原始来源核验；区分事实、推断、反证和未知项。
-- 当前仓库处于 M2 v0 证据链阶段：已有 Go/React/PostgreSQL/Compose 骨架、数据源映射管理、固定查询计划、固定路径连接测试、PostgreSQL 采集任务与租约 Worker；Worker 对精确映射的 Prometheus 与 Loki 固定模板执行只读采集，其他已配置的 GitHub/Runtime 来源目前写入结构化缺口。GitHub/Runtime 自动采集、Agent、慢 SQL 完整 Compose E2E、完整工作台和通知仍未完成。文档和 PR 不得把规划能力写成已交付能力。
+- 当前仓库处于 M2 v0 证据链阶段：已有 Go/React/PostgreSQL/Compose 骨架、数据源映射管理、固定查询计划、固定路径连接测试、PostgreSQL 采集任务与租约 Worker；Worker 对精确映射的 Prometheus 与 Loki 固定模板执行只读采集；Runtime 自动采集仅在 Runtime 映射授权完整固定模板包且同作用域 Prometheus/Loki 映射授权其底层固定模板时启用，缺映射会写入结构化 Evidence 缺口；GitHub 来源仍写入结构化缺口。GitHub 自动采集、Agent、慢 SQL 完整 Compose E2E、完整工作台和通知仍未完成。文档和 PR 不得把规划能力写成已交付能力。
 - 仓库是公开仓库。Issue、PR、Commit、测试夹具、日志、截图和 AI Prompt 都按公开数据处理。
 
 产品范围和阶段目标以 Issue #1 的 Proposal、Milestone 和对应 Issue 为准；已接受的技术边界记录在 `docs/adr/`。
@@ -53,7 +53,7 @@ Relythra 面向发布后异常排查，关联发布、代码变更、指标、�
 
 - API 的 liveness 只表示进程存活，不访问数据库；readiness 才检查 PostgreSQL 等必要依赖。
 - API 与 Worker 是独立生命周期，各自支持信号触发的优雅关闭。
-- Worker 暴露的 Prometheus 指标必须保持可解析、稳定命名，并能被冒烟或监控验证。Worker 使用独立 PostgreSQL 连接和消费循环；只能通过固定模板、出站 allowlist 与 SecretRef 执行只读 Prometheus 与 Loki 查询。Loki 每个模板最多一页、20 条日志和两小时时间窗，原始与脱敏 JSON 均受 32 KiB 预算约束；裁剪、分页与时间偏差必须保留部分采集标记。每个任务的 Evidence 或结构化缺口持久化成功后才能完成；外部失败使用稳定错误码、租约重试，不记录租约 token、SecretRef 或任意远端错误正文。
+- Worker 暴露的 Prometheus 指标必须保持可解析、稳定命名，并能被冒烟或监控验证。Worker 使用独立 PostgreSQL 连接和消费循环；只能通过固定模板、出站 allowlist 与 SecretRef 执行只读 Prometheus 与 Loki 查询。Runtime 采集复用同作用域的 Prometheus/Loki 映射 Endpoint 与 SecretRef，只执行 Runtime 连接器静态固定查询包；Runtime 映射必须授权 `runtime.containers.v1`、`runtime.host.v1`、`runtime.events.v1`。底层 Runtime Prometheus/Loki 查询由该完整 Runtime 模板包授权，不得要求用户把内部查询模板加到独立来源映射，也不得接受任意查询文本。缺少依赖或 Runtime 模板授权时写入结构化缺口，不发出查询。Loki 每个模板最多一页、20 条日志和两小时时间窗，原始与脱敏 JSON 均受 32 KiB 预算约束；裁剪、分页与时间偏差必须保留部分采集标记。每个任务的 Evidence 或结构化缺口持久化成功后才能完成；外部失败使用稳定错误码、租约重试，不记录租约 token、SecretRef 或任意远端错误正文。
 - PostgreSQL 迁移由独立命令执行。Compose 按数据库健康、迁移成功、API 健康的顺序启动。
 - 面向浏览器的错误响应不得泄露连接串、内部地址、堆栈或凭据；详细错误写入脱敏后的服务端日志。
 - 前端通过严格类型、ESLint、Vitest 和生产构建验证；不得用 `any`、禁用 Hook 规则或关闭类型检查来绕过问题。
