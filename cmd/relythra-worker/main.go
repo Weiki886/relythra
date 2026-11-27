@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Weiki886/relythra/internal/config"
+	githubconnector "github.com/Weiki886/relythra/internal/connector/github"
 	lokiconnector "github.com/Weiki886/relythra/internal/connector/loki"
 	prometheusconnector "github.com/Weiki886/relythra/internal/connector/prometheus"
 	runtimeconnector "github.com/Weiki886/relythra/internal/connector/runtime"
@@ -82,8 +83,12 @@ func run() error {
 	if err != nil {
 		return errors.New("initialize worker runtime collector failed")
 	}
+	githubClient, err := githubconnector.NewConnector(policy, resolver, filter)
+	if err != nil {
+		return errors.New("initialize worker GitHub connector failed")
+	}
 	processor, err := worker.NewCollectionProcessor(store.NewPostgres(db), connector, resolver, filter, worker.CollectionOptions{
-		LokiConnector: lokiConnector, RuntimeConnector: runtimeCollector,
+		LokiConnector: lokiConnector, RuntimeConnector: runtimeCollector, GitHubConnector: githubClient,
 	})
 	if err != nil {
 		return err

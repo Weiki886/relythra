@@ -413,6 +413,47 @@ type DeploymentCandidateQuery struct {
 	Limit       int
 }
 
+// ListInvestigationDeploymentCandidates returns only verified candidate deployments linked to the investigation's incident.
+func (repository *Postgres) ListInvestigationDeploymentCandidates(
+	ctx context.Context,
+	investigationID string,
+) ([]DeploymentEvent, error) {
+	if !domain.IsID(investigationID) {
+		return nil, fmt.Errorf("%w: invalid investigation UUID", ErrInvalidInput)
+	}
+	rows, err := repository.db.QueryContext(ctx, `
+		SELECT `+prefixedDeploymentColumns("deployment")+`
+		FROM investigations investigation
+		JOIN incidents incident ON incident.id=investigation.incident_id
+		JOIN deployment_candidates candidate ON candidate.incident_id=incident.id
+		JOIN deployment_events deployment ON deployment.id=candidate.deployment_event_id
+		WHERE investigation.id=$1
+		  AND candidate.project_id=incident.project_id
+		  AND deployment.project_id=incident.project_id
+		  AND deployment.service_id=investigation.service_id
+		  AND deployment.environment=investigation.environment
+		  AND candidate.match_status IN ('MATCHED', 'AMBIGUOUS')
+		ORDER BY deployment.started_at, deployment.id
+		LIMIT 21
+	`, investigationID)
+	if err != nil {
+		return nil, fmt.Errorf("query investigation deployment candidates: %w", err)
+	}
+	defer rows.Close()
+	candidates := make([]DeploymentEvent, 0)
+	for rows.Next() {
+		candidate, scanErr := scanDeploymentEvent(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan investigation deployment candidate: %w", scanErr)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate investigation deployment candidates: %w", err)
+	}
+	return candidates, nil
+}
+
 func (repository *Postgres) FindDeploymentCandidates(
 	ctx context.Context,
 	query DeploymentCandidateQuery,

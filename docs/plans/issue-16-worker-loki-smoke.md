@@ -4,7 +4,7 @@
 
 在现有隔离 Compose 演示中，通过管理 API 为 Inventory 创建 Loki 固定模板映射。Grafana 触发 Investigation 后，验证 Worker 自动采集的日志经 Evidence 持久化进入该调查的时间线，并可通过 Evidence ID 回读。
 
-本切片使用 `Refs #16`。完整慢 SQL 发布、DeploymentEvent、GitHub、Runtime、规则候选，以及三次运行和空卷/已有卷验收仍需后续完成。
+本切片使用 `Refs #16`。Worker GitHub 自动采集现已具备，但其 Compose 端到端验证、完整慢 SQL 发布、Runtime、规则候选，以及三次运行和空卷/已有卷验收仍需后续完成。
 
 ## 实现步骤
 

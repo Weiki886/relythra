@@ -9,7 +9,7 @@ Relythra 面向发布后异常排查，关联发布、代码变更、指标、�
 - 系统以只读诊断为主。不得自动执行回滚、重启、扩容、配置修改或其他外部写操作。
 - Agent 输出是根因假设，不是未经证据支持的绝对结论。无法证明时必须显式返回证据不足或 `inconclusive`。
 - 证据必须能回到原始来源核验；区分事实、推断、反证和未知项。
-- 当前仓库处于 M2 v0 证据链阶段：已有 Go/React/PostgreSQL/Compose 骨架、数据源映射管理、固定查询计划、固定路径连接测试、PostgreSQL 采集任务与租约 Worker；Worker 对精确映射的 Prometheus 与 Loki 固定模板执行只读采集；Runtime 自动采集仅在 Runtime 映射授权完整固定模板包且同作用域 Prometheus/Loki 映射授权其底层固定模板时启用，缺映射会写入结构化 Evidence 缺口；GitHub 来源仍写入结构化缺口。GitHub 自动采集、Agent、慢 SQL 完整 Compose E2E、完整工作台和通知仍未完成。文档和 PR 不得把规划能力写成已交付能力。
+- 当前仓库处于 M2 v0 证据链阶段：已有 Go/React/PostgreSQL/Compose 骨架、数据源映射管理、固定查询计划、固定路径连接测试、PostgreSQL 采集任务与租约 Worker；Worker 对精确映射的 Prometheus、Loki 固定模板执行只读采集；Runtime 自动采集仅在 Runtime 映射授权完整固定模板包且同作用域 Prometheus/Loki 映射授权其底层固定模板时启用，缺映射会写入结构化 Evidence 缺口；GitHub Worker 仅在映射授权完整固定模板包且 Investigation 关联有效 DeploymentEvent 候选时，按候选 Commit SHA 执行有界只读采集并持久化证据，缺候选、查询失败或候选超限会写入结构化 Evidence 缺口。GitHub Compose 端到端验证、Agent、慢 SQL 完整 Compose E2E、完整工作台和通知仍未完成。文档和 PR 不得把规划能力写成已交付能力。
 - 仓库是公开仓库。Issue、PR、Commit、测试夹具、日志、截图和 AI Prompt 都按公开数据处理。
 
 产品范围和阶段目标以 Issue #1 的 Proposal、Milestone 和对应 Issue 为准；已接受的技术边界记录在 `docs/adr/`。

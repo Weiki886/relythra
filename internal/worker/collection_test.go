@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	githubconnector "github.com/Weiki886/relythra/internal/connector/github"
 	lokiconnector "github.com/Weiki886/relythra/internal/connector/loki"
 	prometheusconnector "github.com/Weiki886/relythra/internal/connector/prometheus"
 	runtimeconnector "github.com/Weiki886/relythra/internal/connector/runtime"
@@ -30,18 +31,20 @@ const (
 )
 
 type collectionRepositoryFake struct {
-	context             store.InvestigationContext
-	mappings            []store.DataSourceMapping
-	persistedPrometheus []evidence.Record
-	persistedLoki       []evidence.Record
-	persistedGaps       []evidence.Record
-	persistedRuntime    []evidence.Record
-	completeCalls       int
-	retryCalls          int
-	retryCode           string
-	persistErr          error
-	runtimePersistErr   error
-	completedBeforeSave bool
+	context              store.InvestigationContext
+	mappings             []store.DataSourceMapping
+	persistedPrometheus  []evidence.Record
+	persistedLoki        []evidence.Record
+	persistedGaps        []evidence.Record
+	persistedRuntime     []evidence.Record
+	persistedGitHub      []githubconnector.Result
+	deploymentCandidates []store.DeploymentEvent
+	completeCalls        int
+	retryCalls           int
+	retryCode            string
+	persistErr           error
+	runtimePersistErr    error
+	completedBeforeSave  bool
 }
 
 func (repository *collectionRepositoryFake) ClaimInvestigationCollectionJobs(context.Context, int, time.Duration) ([]store.InvestigationCollectionJob, error) {
@@ -54,6 +57,21 @@ func (repository *collectionRepositoryFake) GetInvestigationContext(context.Cont
 
 func (repository *collectionRepositoryFake) ListDataSourceMappings(context.Context, string, string, string) ([]store.DataSourceMapping, error) {
 	return repository.mappings, nil
+}
+
+func (repository *collectionRepositoryFake) ListInvestigationDeploymentCandidates(context.Context, string) ([]store.DeploymentEvent, error) {
+	return repository.deploymentCandidates, nil
+}
+
+func (repository *collectionRepositoryFake) PersistGitHubEvidence(_ context.Context, result githubconnector.Result, metadata evidence.GitHubEvidenceContext, filter *redact.Filter) (store.Evidence, bool, error) {
+	if repository.persistErr != nil {
+		return store.Evidence{}, false, repository.persistErr
+	}
+	if _, err := evidence.FromGitHubResult(context.Background(), result, metadata, filter); err != nil {
+		return store.Evidence{}, false, err
+	}
+	repository.persistedGitHub = append(repository.persistedGitHub, result)
+	return store.Evidence{ID: "github-evidence"}, true, nil
 }
 
 func (repository *collectionRepositoryFake) PersistPrometheusEvidence(_ context.Context, result prometheusconnector.Result, metadata evidence.PrometheusEvidenceContext, filter *redact.Filter) (store.Evidence, bool, error) {
@@ -110,7 +128,7 @@ func (repository *collectionRepositoryFake) PersistRuntimeEvidence(ctx context.C
 
 func (repository *collectionRepositoryFake) CompleteInvestigationCollectionJob(context.Context, string, string) (bool, error) {
 	repository.completeCalls++
-	repository.completedBeforeSave = len(repository.persistedPrometheus)+len(repository.persistedLoki)+len(repository.persistedGaps)+len(repository.persistedRuntime) == 0
+	repository.completedBeforeSave = len(repository.persistedPrometheus)+len(repository.persistedLoki)+len(repository.persistedGaps)+len(repository.persistedRuntime)+len(repository.persistedGitHub) == 0
 	return true, nil
 }
 
