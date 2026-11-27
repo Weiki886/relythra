@@ -378,7 +378,8 @@ func TestCollectionWorkerPersistsConfiguredRuntimeEvidenceBeforeCompletingLease(
 	loki := &collectionLokiFake{result: validCollectionLokiResult(t)}
 	runtime := &collectionRuntimeFake{result: runtimeconnector.Result{
 		Runtime: datasource.RuntimeDockerCompose, Service: "orders-api", Environment: "prod", HostID: "demo-host", MappingVersion: runtimeMapping.Version,
-		Hosts: []runtimeconnector.Host{}, Containers: []runtimeconnector.Container{}, Events: []runtimeconnector.Event{}, Gaps: []string{}, Failures: []runtimeconnector.CollectionFailure{},
+		Hosts:      []runtimeconnector.Host{{HostID: "demo-host", Instance: "runtime-test-token", CPU: runtimeconnector.Measurement{Empty: true}, MemoryAvailable: runtimeconnector.Measurement{Empty: true}, Load: runtimeconnector.Measurement{Empty: true}}},
+		Containers: []runtimeconnector.Container{}, Events: []runtimeconnector.Event{}, Gaps: []string{}, Failures: []runtimeconnector.CollectionFailure{},
 	}}
 	filter, _ := redact.NewFilter()
 	processor, err := worker.NewCollectionProcessor(repository, prometheus, collectionSecretResolverStatic{}, filter, worker.CollectionOptions{
@@ -401,14 +402,168 @@ func TestCollectionWorkerPersistsConfiguredRuntimeEvidenceBeforeCompletingLease(
 	}
 	if call.request.Runtime != datasource.RuntimeDockerCompose || call.request.Service != "orders-api" || call.request.Environment != "prod" ||
 		call.request.HostID != "demo-host" || call.request.MappingVersion != runtimeMapping.Version || call.request.Step != 2*time.Minute ||
-		call.request.MaxSeries != runtimeconnector.DefaultMaxSeries || call.request.MaxPoints != runtimeconnector.DefaultMaxPoints || call.request.MaxLogLines != 100 {
+		call.request.MaxSeries != runtimeconnector.DefaultMaxSeries || call.request.MaxPoints != runtimeconnector.DefaultMaxPoints || call.request.MaxLogLines != 20 {
 		t.Fatalf("runtime request = %+v", call.request)
 	}
 	for _, record := range repository.persistedRuntime {
 		if record.InvestigationID != collectionInvestigationID || record.SourceType != evidence.SourceRuntime || record.ToolCallID != nil || !record.CollectedAt.Equal(now) {
 			t.Fatalf("runtime evidence metadata = %+v", record)
 		}
+		if strings.Contains(string(record.ValueSummary), "runtime-test-token") {
+			t.Fatalf("Runtime Evidence leaked the resolved telemetry secret: %s", record.ValueSummary)
+		}
 	}
+	if runtime.calls[0].target.Prometheus.ResolvedSecret == nil || runtime.calls[0].target.Prometheus.ResolvedSecret.Reveal() != "runtime-test-token" ||
+		runtime.calls[0].target.Loki.ResolvedSecret == nil || runtime.calls[0].target.Loki.ResolvedSecret.Reveal() != "runtime-test-token" {
+		t.Fatal("Runtime query targets did not receive the resolved mapped secrets")
+	}
+}
+
+func TestCollectionWorkerClipsRuntimeWindowToConnectorLimitAndMarksPartial(t *testing.T) {
+	invContext, prometheusMapping := validCollectionContextAndMapping()
+	now := time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC)
+	invContext.Alert.StartsAt = now.Add(-4 * time.Hour)
+	lokiMapping, runtimeMapping := validWorkerRuntimeMappings()
+	runtime := &collectionRuntimeFake{result: runtimeconnector.Result{
+		Runtime: datasource.RuntimeDockerCompose, Service: "orders-api", Environment: "prod", HostID: "demo-host", MappingVersion: runtimeMapping.Version,
+		Hosts: []runtimeconnector.Host{}, Containers: []runtimeconnector.Container{}, Events: []runtimeconnector.Event{}, Gaps: []string{}, Failures: []runtimeconnector.CollectionFailure{},
+	}}
+	repository := &collectionRepositoryFake{context: invContext, mappings: []store.DataSourceMapping{prometheusMapping, lokiMapping, runtimeMapping}}
+	filter, _ := redact.NewFilter()
+	processor, err := worker.NewCollectionProcessor(repository, &collectionPrometheusFake{result: validCollectionPrometheusResult()}, collectionSecretResolverFake{}, filter, worker.CollectionOptions{
+		LokiConnector: &collectionLokiFake{result: validCollectionLokiResult(t)}, RuntimeConnector: runtime, Now: func() time.Time { return now }, RetryDelay: func(int) time.Duration { return 0 },
+	})
+	if err != nil {
+		t.Fatalf("NewCollectionProcessor: %v", err)
+	}
+	if err := processor.Process(context.Background(), validCollectionJob()); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(runtime.calls) != 1 || runtime.calls[0].request.End.Sub(runtime.calls[0].request.Start) != runtimeconnector.MaxQueryWindow {
+		t.Fatalf("Runtime request window = %+v", runtime.calls)
+	}
+	var summary struct {
+		Partial bool     `json:"partial"`
+		Gaps    []string `json:"gaps"`
+	}
+	if err := jsonUnmarshal(repository.persistedRuntime[0].ValueSummary, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if !summary.Partial || !containsString(summary.Gaps, "runtime_window_clipped") {
+		t.Fatalf("clipped Runtime summary is missing partial coverage: %+v", summary)
+	}
+}
+
+func TestCollectionWorkerBoundsRuntimeLifecyclePayload(t *testing.T) {
+	invContext, prometheusMapping := validCollectionContextAndMapping()
+	now := time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC)
+	invContext.Alert.StartsAt = now.Add(-3 * time.Minute)
+	lokiMapping, runtimeMapping := validWorkerRuntimeMappings()
+	filter, _ := redact.NewFilter()
+	events := make([]runtimeconnector.Event, 25)
+	for index := range events {
+		events[index] = runtimeconnector.Event{
+			Timestamp: now.Add(-time.Duration(index+1) * time.Second), Classification: "unverified_log_match",
+			SourceReference: "https://loki.example.test/loki/api/v1/query_range",
+			Line:            redact.UntrustedData{Trust: "untrusted_data", Source: "loki", Content: strings.Repeat("x", 3000), OriginalBytes: 3000},
+		}
+	}
+	runtime := &collectionRuntimeFake{result: runtimeconnector.Result{
+		Runtime: datasource.RuntimeDockerCompose, Service: "orders-api", Environment: "prod", HostID: "demo-host", MappingVersion: runtimeMapping.Version,
+		Hosts: []runtimeconnector.Host{}, Containers: []runtimeconnector.Container{}, Events: events, Gaps: []string{}, Failures: []runtimeconnector.CollectionFailure{},
+	}}
+	repository := &collectionRepositoryFake{context: invContext, mappings: []store.DataSourceMapping{prometheusMapping, lokiMapping, runtimeMapping}}
+	processor, err := worker.NewCollectionProcessor(repository, &collectionPrometheusFake{result: validCollectionPrometheusResult()}, collectionSecretResolverFake{}, filter, worker.CollectionOptions{
+		LokiConnector: &collectionLokiFake{result: validCollectionLokiResult(t)}, RuntimeConnector: runtime, Now: func() time.Time { return now }, RetryDelay: func(int) time.Duration { return 0 },
+	})
+	if err != nil {
+		t.Fatalf("NewCollectionProcessor: %v", err)
+	}
+	if err := processor.Process(context.Background(), validCollectionJob()); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(repository.persistedRuntime) != 8 {
+		t.Fatalf("Runtime Evidence count=%d, want eight", len(repository.persistedRuntime))
+	}
+	var summary struct {
+		Partial bool                     `json:"partial"`
+		Gaps    []string                 `json:"gaps"`
+		Events  []runtimeconnector.Event `json:"events"`
+	}
+	if err := jsonUnmarshal(repository.persistedRuntime[7].ValueSummary, &summary); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(summary.Events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.Partial || len(summary.Events) >= len(events) || len(encoded) > 32*1024 || !containsString(summary.Gaps, "runtime_events_truncated") {
+		t.Fatalf("Runtime lifecycle payload was not bounded with a partial marker: events=%d bytes=%d summary=%+v", len(summary.Events), len(encoded), summary)
+	}
+}
+
+func TestCollectionWorkerRetriesRuntimePartialResultsWithTransientFailures(t *testing.T) {
+	invContext, prometheusMapping := validCollectionContextAndMapping()
+	now := time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC)
+	invContext.Alert.StartsAt = now.Add(-3 * time.Minute)
+	lokiMapping, runtimeMapping := validWorkerRuntimeMappings()
+	runtime := &collectionRuntimeFake{result: runtimeconnector.Result{
+		Runtime: datasource.RuntimeDockerCompose, Service: "orders-api", Environment: "prod", HostID: "demo-host", MappingVersion: runtimeMapping.Version,
+		Hosts: []runtimeconnector.Host{}, Containers: []runtimeconnector.Container{}, Events: []runtimeconnector.Event{}, Gaps: []string{},
+		Failures: []runtimeconnector.CollectionFailure{
+			{SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.memory_available.v1", TemplateVersion: 1, ReasonCode: runtimeconnector.CollectionFailurePermissionDenied},
+			{SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.cpu.v1", TemplateVersion: 1, ReasonCode: runtimeconnector.CollectionFailureTimeout},
+		},
+	}}
+	repository := &collectionRepositoryFake{context: invContext, mappings: []store.DataSourceMapping{prometheusMapping, lokiMapping, runtimeMapping}}
+	filter, _ := redact.NewFilter()
+	processor, err := worker.NewCollectionProcessor(repository, &collectionPrometheusFake{result: validCollectionPrometheusResult()}, collectionSecretResolverFake{}, filter, worker.CollectionOptions{
+		LokiConnector: &collectionLokiFake{result: validCollectionLokiResult(t)}, RuntimeConnector: runtime, Now: func() time.Time { return now }, RetryDelay: func(int) time.Duration { return 0 },
+	})
+	if err != nil {
+		t.Fatalf("NewCollectionProcessor: %v", err)
+	}
+	if err := processor.Process(context.Background(), validCollectionJob()); err == nil {
+		t.Fatal("Process succeeded despite a retryable Runtime source failure")
+	}
+	if len(repository.persistedRuntime) != 8 || repository.retryCalls != 1 || repository.retryCode != "runtime_prometheus_timeout" || repository.completeCalls != 0 {
+		t.Fatalf("persisted=%d retry=%d code=%q complete=%d", len(repository.persistedRuntime), repository.retryCalls, repository.retryCode, repository.completeCalls)
+	}
+}
+
+func TestCollectionWorkerDoesNotRetryUnknownRuntimeFailureCodes(t *testing.T) {
+	invContext, prometheusMapping := validCollectionContextAndMapping()
+	now := time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC)
+	invContext.Alert.StartsAt = now.Add(-3 * time.Minute)
+	lokiMapping, runtimeMapping := validWorkerRuntimeMappings()
+	runtime := &collectionRuntimeFake{result: runtimeconnector.Result{
+		Runtime: datasource.RuntimeDockerCompose, Service: "orders-api", Environment: "prod", HostID: "demo-host", MappingVersion: runtimeMapping.Version,
+		Hosts: []runtimeconnector.Host{}, Containers: []runtimeconnector.Container{}, Events: []runtimeconnector.Event{}, Gaps: []string{},
+		Failures: []runtimeconnector.CollectionFailure{{SourceType: "PROMETHEUS", TemplateID: "prometheus.runtime.host.cpu.v1", TemplateVersion: 1, ReasonCode: runtimeconnector.CollectionFailureUnknown}},
+	}}
+	repository := &collectionRepositoryFake{context: invContext, mappings: []store.DataSourceMapping{prometheusMapping, lokiMapping, runtimeMapping}}
+	filter, _ := redact.NewFilter()
+	processor, err := worker.NewCollectionProcessor(repository, &collectionPrometheusFake{result: validCollectionPrometheusResult()}, collectionSecretResolverFake{}, filter, worker.CollectionOptions{
+		LokiConnector: &collectionLokiFake{result: validCollectionLokiResult(t)}, RuntimeConnector: runtime, Now: func() time.Time { return now }, RetryDelay: func(int) time.Duration { return 0 },
+	})
+	if err != nil {
+		t.Fatalf("NewCollectionProcessor: %v", err)
+	}
+	if err := processor.Process(context.Background(), validCollectionJob()); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if repository.retryCalls != 0 || repository.completeCalls != 1 {
+		t.Fatalf("retry=%d complete=%d", repository.retryCalls, repository.completeCalls)
+	}
+}
+
+func containsString(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCollectionWorkerPersistsRuntimeGapsWhenBackingTelemetryMappingsAreMissing(t *testing.T) {

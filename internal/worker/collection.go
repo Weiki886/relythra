@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -18,13 +19,15 @@ import (
 )
 
 const (
-	collectionLease     = 10 * time.Minute
-	collectionRetryBase = 5 * time.Second
-	collectionLookback  = 5 * time.Minute
-	collectionLookahead = 5 * time.Minute
-	collectionQueryStep = 2 * time.Minute
-	collectionMaxSeries = 2
-	collectionMaxPoints = int(datasource.MaxQueryWindow/collectionQueryStep) + 1
+	collectionLease        = 10 * time.Minute
+	collectionRetryBase    = 5 * time.Second
+	collectionLookback     = 5 * time.Minute
+	collectionLookahead    = 5 * time.Minute
+	collectionQueryStep    = 2 * time.Minute
+	collectionMaxSeries    = 2
+	collectionMaxPoints    = int(datasource.MaxQueryWindow/collectionQueryStep) + 1
+	collectionRuntimeLines = 20
+	collectionRuntimeBytes = 32 * 1024
 )
 
 var (
@@ -220,24 +223,54 @@ func (processor *CollectionProcessor) collectRuntime(
 	if prometheusCount == 0 || lokiCount == 0 {
 		return processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailureMissingMapping)
 	}
-	prometheusSecret, err := parseSecretReference(prometheusMapping.SecretRef)
+	prometheusSecretReference, err := parseSecretReference(prometheusMapping.SecretRef)
 	if err != nil {
 		return processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailureRequestRejected)
 	}
-	lokiSecret, err := parseSecretReference(lokiMapping.SecretRef)
+	lokiSecretReference, err := parseSecretReference(lokiMapping.SecretRef)
 	if err != nil {
 		return processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailureRequestRejected)
+	}
+	prometheusSecret, err := processor.resolveCollectionSecret(ctx, prometheusSecretReference)
+	if err != nil {
+		if gapErr := processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailurePermissionDenied); gapErr != nil {
+			return gapErr
+		}
+		return &collectionFailure{code: "runtime_prometheus_secret_unavailable"}
+	}
+	lokiSecret, err := processor.resolveCollectionSecret(ctx, lokiSecretReference)
+	if err != nil {
+		if gapErr := processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailurePermissionDenied); gapErr != nil {
+			return gapErr
+		}
+		return &collectionFailure{code: "runtime_loki_secret_unavailable"}
+	}
+	filterSecrets := make([]string, 0, 2)
+	if prometheusSecret != nil {
+		filterSecrets = append(filterSecrets, prometheusSecret.Reveal())
+	}
+	if lokiSecret != nil {
+		filterSecrets = append(filterSecrets, lokiSecret.Reveal())
+	}
+	persistenceFilter, err := processor.filter.WithAdditionalSecrets(filterSecrets...)
+	if err != nil {
+		return &collectionFailure{code: "evidence_persist_failed"}
+	}
+	runtimeStart := start
+	windowClipped := end.Sub(runtimeStart) > runtimeconnector.MaxQueryWindow
+	if windowClipped {
+		runtimeStart = end.Add(-runtimeconnector.MaxQueryWindow)
 	}
 	request := runtimeconnector.Request{
 		Runtime: mapping.RuntimeType, Action: "query", Service: investigation.Service.Slug, Environment: *investigation.Environment,
 		HostID: mapping.PublicSettings.RuntimeLabels["host_id"], MappingVersion: mapping.Version,
 		ContainerMappings: append([]datasource.RuntimeContainerMapping(nil), mapping.PublicSettings.ContainerMappings...),
-		Start:             start, End: end, Step: collectionQueryStep, MaxSeries: runtimeconnector.DefaultMaxSeries,
-		MaxPoints: runtimeconnector.DefaultMaxPoints, MaxLogLines: 100,
+		Start:             runtimeStart, End: end, Step: collectionQueryStep, MaxSeries: runtimeconnector.DefaultMaxSeries,
+		MaxPoints: runtimeconnector.DefaultMaxPoints, MaxLogLines: collectionRuntimeLines,
 	}
 	result, err := processor.runtimeConnector.Query(ctx, runtimeconnector.Target{
-		Prometheus: prometheusconnector.Target{Endpoint: prometheusMapping.PublicSettings.Endpoint, SecretReference: prometheusSecret},
-		Loki:       lokiconnector.Target{Endpoint: lokiMapping.PublicSettings.Endpoint, SecretReference: lokiSecret},
+		Prometheus: prometheusconnector.Target{Endpoint: prometheusMapping.PublicSettings.Endpoint, SecretReference: prometheusSecretReference, ResolvedSecret: prometheusSecret},
+		Loki:       lokiconnector.Target{Endpoint: lokiMapping.PublicSettings.Endpoint, SecretReference: lokiSecretReference, ResolvedSecret: lokiSecret},
 	}, request)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -247,16 +280,102 @@ func (processor *CollectionProcessor) collectRuntime(
 	}
 	if result.Runtime != request.Runtime || result.Service != request.Service || result.Environment != request.Environment ||
 		result.HostID != request.HostID || result.MappingVersion != request.MappingVersion ||
-		!result.Start.Equal(start.UTC()) || !result.End.Equal(end.UTC()) || result.Duration < 0 {
+		!result.Start.Equal(runtimeStart.UTC()) || !result.End.Equal(end.UTC()) || result.Duration < 0 {
 		return processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailureInvalidResponse)
 	}
-	_, _, err = processor.repository.PersistRuntimeEvidence(ctx, result, store.RuntimeEvidencePersistenceContext{
-		InvestigationID: job.InvestigationID, ServiceID: investigation.Service.ID, CollectedAt: processor.now().UTC(),
-	}, processor.filter)
+	if windowClipped {
+		result.Partial = true
+		result.Gaps = append(result.Gaps, "runtime_window_clipped")
+	}
+	result, err = boundRuntimeCollectionEvents(ctx, result, persistenceFilter)
 	if err != nil {
 		return &collectionFailure{code: "evidence_persist_failed"}
 	}
+	_, _, err = processor.repository.PersistRuntimeEvidence(ctx, result, store.RuntimeEvidencePersistenceContext{
+		InvestigationID: job.InvestigationID, ServiceID: investigation.Service.ID, CollectedAt: processor.now().UTC(),
+	}, persistenceFilter)
+	if err != nil {
+		return &collectionFailure{code: "evidence_persist_failed"}
+	}
+	for _, failure := range result.Failures {
+		if code, retryable := runtimeFailureRetryCode(failure); retryable {
+			return &collectionFailure{code: code}
+		}
+	}
 	return nil
+}
+
+func runtimeFailureRetryCode(failure runtimeconnector.CollectionFailure) (string, bool) {
+	var source string
+	switch failure.SourceType {
+	case string(datasource.SourcePrometheus):
+		source = "prometheus"
+	case string(datasource.SourceLoki):
+		source = "loki"
+	default:
+		return "", false
+	}
+	switch failure.ReasonCode {
+	case runtimeconnector.CollectionFailureTimeout,
+		runtimeconnector.CollectionFailureRateLimited,
+		runtimeconnector.CollectionFailureUnavailable:
+		return "runtime_" + source + "_" + string(failure.ReasonCode), true
+	default:
+		return "", false
+	}
+}
+
+func (processor *CollectionProcessor) resolveCollectionSecret(ctx context.Context, reference *secrets.Reference) (*secrets.Secret, error) {
+	if reference == nil {
+		return nil, nil
+	}
+	secret, err := processor.resolver.Resolve(ctx, *reference)
+	if err != nil {
+		return nil, err
+	}
+	return &secret, nil
+}
+
+func boundRuntimeCollectionEvents(ctx context.Context, result runtimeconnector.Result, filter *redact.Filter) (runtimeconnector.Result, error) {
+	trimmed := false
+	if len(result.Events) > collectionRuntimeLines {
+		result.Events = result.Events[:collectionRuntimeLines]
+		trimmed = true
+	}
+	for len(result.Events) > 0 {
+		redacted, err := filter.JSON(ctx, result.Events)
+		if err != nil {
+			return runtimeconnector.Result{}, err
+		}
+		encoded, err := json.Marshal(redacted)
+		if err != nil {
+			return runtimeconnector.Result{}, err
+		}
+		if len(encoded) <= collectionRuntimeBytes {
+			break
+		}
+		result.Events = result.Events[:len(result.Events)-1]
+		trimmed = true
+	}
+	if trimmed {
+		result.Partial = true
+		result.Gaps = append(result.Gaps, "runtime_events_truncated")
+		result.Gaps = uniqueStrings(result.Gaps)
+	}
+	return result, nil
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func (processor *CollectionProcessor) persistRuntimeGaps(
