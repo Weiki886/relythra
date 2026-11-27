@@ -75,6 +75,8 @@ test -n "$project_id" && test -n "$service_id"
 python3 scripts/demo-assert.py configure-prometheus-mapping "$project_id" "$service_id"
 stage="create isolated Inventory Loki mapping"
 python3 scripts/demo-assert.py configure-loki-mapping "$project_id" "$service_id"
+stage="create isolated Inventory Runtime mapping"
+python3 scripts/demo-assert.py configure-runtime-mapping "$project_id" "$service_id"
 stage="baseline telemetry assertions"
 python3 scripts/demo-assert.py healthy
 stage="prime Inventory latency on the Worker range-query grid"
@@ -94,6 +96,8 @@ stage="Worker Prometheus Evidence timeline assertion"
 python3 scripts/demo-assert.py prometheus-evidence "$investigation_id"
 stage="Worker Loki Evidence timeline assertion"
 python3 scripts/demo-assert.py loki-evidence "$investigation_id" "$service_id"
+stage="Worker Runtime Evidence timeline assertion"
+python3 scripts/demo-assert.py runtime-evidence "$investigation_id" demo-host
 "${COMPOSE[@]}" start --wait inventory
 stage="Grafana resolved webhook and evidence assertions"
 python3 scripts/demo-assert.py grafana-delivery "$investigation_id" RESOLVED

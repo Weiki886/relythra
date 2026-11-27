@@ -9,7 +9,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from demo_artifacts import MAX_CAPTURE_BYTES, capture_compose, collect, collect_http, compose_command, read_secrets, redact, remove_partial_secret, safe_compose_output, write_capture
-from demo_assertions import assert_finite_latency_response, assert_loki_evidence_timeline, assert_prometheus_evidence_timeline, loki_mapping_payload, prometheus_mapping_payload
+from demo_assertions import (
+    RUNTIME_EVIDENCE_TEMPLATES,
+    assert_finite_latency_response,
+    assert_loki_evidence_timeline,
+    assert_prometheus_evidence_timeline,
+    assert_runtime_evidence_timeline,
+    loki_mapping_payload,
+    prometheus_mapping_payload,
+    runtime_mapping_payload,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -313,6 +322,155 @@ class DemoLokiEvidenceTests(unittest.TestCase):
             timeline["items"][0]["value_summary"]["entries"][0]["line"]["content"] = content
             with self.subTest(content=content), self.assertRaises(AssertionError):
                 assert_loki_evidence_timeline(timeline, "demo-investigation", "inventory-id")
+
+
+def runtime_timeline():
+    host_memory_template = "prometheus.runtime.host.memory_available.v1"
+    container_memory_template = "prometheus.runtime.container.memory.v1"
+    return {
+        "investigation_id": "demo-investigation",
+        "items": [runtime_item(template, host_memory_template, container_memory_template)
+                  for template in RUNTIME_EVIDENCE_TEMPLATES],
+    }
+
+
+def runtime_item(template, host_memory_template, container_memory_template):
+    source_reference = "http://observability-gateway:3100/loki/api/v1/query_range" if template == "loki.container.restarts.v1" else "http://observability-gateway:9090/api/v1/query_range"
+    measurements = []
+    if template == host_memory_template:
+        measurements.append({
+            "entity_type": "HOST", "entity_id": "demo-host", "host_id": "demo-host",
+            "measurement": {"samples": [{"timestamp": "2026-11-27T05:00:00Z", "value": 1024}], "source_reference": source_reference},
+        })
+    if template == container_memory_template:
+        measurements.append({
+            "entity_type": "CONTAINER", "entity_id": "opaque-cgroup-id", "host_id": "demo-host",
+            "mapping_status": "raw_cgroup_only",
+            "measurement": {"samples": [{"timestamp": "2026-11-27T05:00:00Z", "value": 4096}], "source_reference": source_reference},
+        })
+    return {
+        "id": "runtime-" + template,
+        "source_type": "RUNTIME",
+        "entity_type": "HOST",
+        "entity_id": "demo-host",
+        "completeness": "PARTIAL",
+        "raw_reference": source_reference,
+        "query_parameters": {
+            "runtime": "docker-compose",
+            "service": "inventory",
+            "environment": "demo",
+            "host_id": "demo-host",
+            "mapping_version": 1,
+            "template_id": template,
+            "template_version": 1,
+        },
+        "value_summary": {
+            "measurements": measurements, "events": [], "gaps": ["healthy_peer_evidence_unavailable"],
+            "partial": True, "source_reference_available": True,
+        },
+    }
+
+
+class DemoRuntimeEvidenceTests(unittest.TestCase):
+    def load_smoke(self):
+        spec = importlib.util.spec_from_file_location("demo_runtime_smoke_assert", ROOT / "scripts/demo-assert.py")
+        smoke = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(smoke)
+        return smoke
+
+    def test_runtime_mapping_is_fixed_scoped_and_read_only(self):
+        mapping = runtime_mapping_payload("project-id", "inventory-id")
+        self.assertEqual(mapping["source_type"], "RUNTIME")
+        self.assertEqual(mapping["runtime_type"], "docker-compose")
+        self.assertEqual(mapping["environment"], "demo")
+        self.assertEqual(mapping["public_settings"]["runtime_labels"], {
+            "project": "relythra-demo", "service": "inventory", "env": "demo",
+            "host_id": "demo-host", "container_id": "unmapped",
+        })
+        self.assertEqual(mapping["template_ids"], [
+            "runtime.containers.v1", "runtime.host.v1", "runtime.events.v1",
+        ])
+        self.assertEqual(mapping["public_settings"]["container_mappings"], [])
+        self.assertNotIn("secret_ref", mapping)
+
+    def test_runtime_mapping_is_created_through_authenticated_management_api(self):
+        smoke = self.load_smoke()
+        mapping = runtime_mapping_payload("project-id", "inventory-id")
+        response = FakeResponse(b'{"data":{"secret_status":"not_configured"}}')
+        response.status = 201
+        with tempfile.TemporaryDirectory() as directory:
+            secret_path = Path(directory) / "management_token"
+            secret_path.write_text("demo-management-canary")
+            with patch.dict(os.environ, {"RELYTHRA_MANAGEMENT_TOKEN_FILE": str(secret_path)}), \
+                 patch.object(smoke.urllib.request, "urlopen", return_value=response) as call, \
+                 patch("builtins.print"):
+                smoke.configure_mapping(mapping, "Runtime")
+            request = call.call_args.args[0]
+            self.assertEqual(request.get_method(), "POST")
+            self.assertEqual(request.get_header("Authorization"), "Bearer demo-management-canary")
+            self.assertEqual(json.loads(request.data), mapping)
+            self.assertNotIn("demo-management-canary", request.data.decode())
+
+    def test_runtime_mode_reads_all_eight_records_and_verifies_each_evidence_link(self):
+        smoke = self.load_smoke()
+        timeline = runtime_timeline()
+        responses = {"/api/v1/investigations/demo-investigation/timeline?source_type=RUNTIME&limit=100":
+                     (200, json.dumps({"data": timeline}).encode())}
+        for item in timeline["items"]:
+            evidence = dict(item)
+            evidence["investigation_id"] = "demo-investigation"
+            responses[f"/api/v1/evidence/{item['id']}"] = (200, json.dumps({"data": evidence}).encode())
+
+        with patch.object(smoke, "http", side_effect=lambda port, path: responses[path]) as request, \
+             patch("builtins.print"):
+            smoke.runtime_evidence("demo-investigation", "demo-host")
+
+        self.assertEqual(request.call_count, 9)
+        self.assertEqual(request.call_args_list[0].args, (28080, "/api/v1/investigations/demo-investigation/timeline?source_type=RUNTIME&limit=100"))
+
+    def test_runtime_timeline_requires_all_eight_host_scoped_records(self):
+        timeline = runtime_timeline()
+        items = assert_runtime_evidence_timeline(timeline, "demo-investigation", "demo-host")
+        self.assertEqual(set(items), set(RUNTIME_EVIDENCE_TEMPLATES))
+
+    def test_runtime_timeline_rejects_all_empty_host_and_cgroup_memory_results(self):
+        timeline = runtime_timeline()
+        required_templates = ("prometheus.runtime.host.memory_available.v1", "prometheus.runtime.container.memory.v1")
+        for item in timeline["items"]:
+            if item["query_parameters"]["template_id"] in required_templates:
+                item["value_summary"]["measurements"] = []
+                item["raw_reference"] = ""
+                item["value_summary"]["source_reference_available"] = False
+        with self.assertRaisesRegex(AssertionError, "sample"):
+            assert_runtime_evidence_timeline(timeline, "demo-investigation", "demo-host")
+
+    def test_runtime_timeline_rejects_invalid_required_memory_samples(self):
+        invalid_values = (True, -1, float("nan"), float("inf"), "1024")
+        for value in invalid_values:
+            with self.subTest(value=value):
+                timeline = runtime_timeline()
+                item = next(item for item in timeline["items"] if item["query_parameters"]["template_id"] == "prometheus.runtime.container.memory.v1")
+                item["value_summary"]["measurements"][0]["measurement"]["samples"][0]["value"] = value
+                with self.assertRaises(AssertionError):
+                    assert_runtime_evidence_timeline(timeline, "demo-investigation", "demo-host")
+
+    def test_runtime_timeline_rejects_wrong_scope_missing_templates_and_unbounded_claims(self):
+        mutations = [
+            lambda timeline: timeline.update(investigation_id="another-investigation"),
+            lambda timeline: timeline["items"].pop(),
+            lambda timeline: timeline["items"][0].update(entity_type="SERVICE"),
+            lambda timeline: timeline["items"][0].update(entity_id="orders-host"),
+            lambda timeline: timeline["items"][0]["query_parameters"].update(host_id="orders-host"),
+            lambda timeline: timeline["items"][0]["query_parameters"].update(template_version=2),
+            lambda timeline: timeline["items"][0].update(completeness="COMPLETE"),
+            lambda timeline: timeline["items"][0]["value_summary"]["gaps"].clear(),
+            lambda timeline: timeline["items"][0].update(raw_reference="http://127.0.0.1:1234/private"),
+        ]
+        for mutate in mutations:
+            timeline = runtime_timeline()
+            mutate(timeline)
+            with self.subTest(timeline=timeline), self.assertRaises(AssertionError):
+                assert_runtime_evidence_timeline(timeline, "demo-investigation", "demo-host")
 
 
 class DemoArtifactTests(unittest.TestCase):

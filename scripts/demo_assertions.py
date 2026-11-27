@@ -2,9 +2,20 @@
 
 import json
 import math
+import urllib.parse
 
 PROMETHEUS_LATENCY_TEMPLATE = "prometheus.service.latency.v1"
 LOKI_REQUEST_TEMPLATE = "loki.service.slow_queries.v1"
+RUNTIME_EVIDENCE_TEMPLATES = (
+    "prometheus.runtime.host.cpu.v1",
+    "prometheus.runtime.host.memory_available.v1",
+    "prometheus.runtime.host.load.v1",
+    "prometheus.runtime.container.cpu.v1",
+    "prometheus.runtime.container.memory.v1",
+    "prometheus.runtime.container.oom_events.v1",
+    "prometheus.runtime.container.start_time.v1",
+    "loki.container.restarts.v1",
+)
 
 
 def prometheus_mapping_payload(project_id, service_id):
@@ -83,6 +94,116 @@ def loki_mapping_payload(project_id, service_id):
         "template_ids": [LOKI_REQUEST_TEMPLATE],
         "secret_ref": "file:/run/relythra-secrets/observability_token",
     }
+
+
+def runtime_mapping_payload(project_id, service_id):
+    return {
+        "project_id": project_id,
+        "service_id": service_id,
+        "environment": "demo",
+        "source_type": "RUNTIME",
+        "runtime_type": "docker-compose",
+        "public_settings": {
+            "endpoint": "http://observability-gateway:9090",
+            "runtime_labels": {
+                "project": "relythra-demo",
+                "service": "inventory",
+                "env": "demo",
+                "host_id": "demo-host",
+                "container_id": "unmapped",
+            },
+            "container_mappings": [],
+        },
+        "template_ids": ["runtime.containers.v1", "runtime.host.v1", "runtime.events.v1"],
+    }
+
+
+def assert_runtime_evidence_timeline(timeline, investigation_id, host_id):
+    assert timeline.get("investigation_id") == investigation_id, "Runtime investigation ownership"
+    items = timeline.get("items")
+    assert isinstance(items, list), "Runtime timeline items are missing"
+    evidence_by_template = {}
+    for item in items:
+        if not isinstance(item, dict) or item.get("source_type") != "RUNTIME":
+            continue
+        parameters = item.get("query_parameters")
+        assert isinstance(parameters, dict), "Runtime query parameters are missing"
+        template = parameters.get("template_id")
+        assert template in RUNTIME_EVIDENCE_TEMPLATES, "Runtime Evidence has an unexpected template"
+        assert template not in evidence_by_template, f"duplicate Runtime Evidence for {template}"
+        assert item.get("id"), f"Runtime Evidence ID is missing for {template}"
+        assert item.get("entity_type") == "HOST" and item.get("entity_id") == host_id, "Runtime Evidence host ownership"
+        assert item.get("completeness") in ("PARTIAL", "MISSING"), "Runtime Evidence overstates collection completeness"
+        assert parameters.get("runtime") == "docker-compose", "Runtime type"
+        assert parameters.get("service") == "inventory" and parameters.get("environment") == "demo", "Runtime service scope"
+        assert parameters.get("host_id") == host_id and parameters.get("template_version") == 1, "Runtime host/template version"
+        summary = item.get("value_summary")
+        assert isinstance(summary, dict), "Runtime Evidence summary is missing"
+        assert summary.get("partial") is True, "Runtime Evidence omitted its partial-coverage marker"
+        assert isinstance(summary.get("gaps"), list) and summary["gaps"], "Runtime Evidence omitted collection gaps"
+        assert isinstance(summary.get("measurements"), list), "Runtime measurements are missing"
+        assert isinstance(summary.get("events"), list), "Runtime lifecycle events are missing"
+        reference_available = summary.get("source_reference_available")
+        raw_reference = item.get("raw_reference") or ""
+        assert isinstance(reference_available, bool) and reference_available == bool(raw_reference), "Runtime source reference metadata"
+        if raw_reference:
+            reference = urllib.parse.urlparse(raw_reference)
+            allowed_sources = {
+                ("observability-gateway", 9090, "/api/v1/query_range"),
+                ("observability-gateway", 3100, "/loki/api/v1/query_range"),
+            }
+            assert (reference.hostname, reference.port, reference.path) in allowed_sources, "Runtime original source reference"
+            assert reference.scheme == "http" and reference.username is None and reference.password is None, "Runtime source reference is unsafe"
+        evidence_by_template[template] = item
+    assert set(evidence_by_template) == set(RUNTIME_EVIDENCE_TEMPLATES), (
+        "Runtime Evidence template coverage", sorted(evidence_by_template)
+    )
+    assert_runtime_required_memory_samples(evidence_by_template, host_id)
+    return evidence_by_template
+
+
+def assert_runtime_required_memory_samples(evidence_by_template, host_id):
+    required = (
+        ("prometheus.runtime.host.memory_available.v1", "HOST"),
+        ("prometheus.runtime.container.memory.v1", "CONTAINER"),
+    )
+    for template, entity_type in required:
+        item = evidence_by_template[template]
+        observations = item["value_summary"]["measurements"]
+        if entity_type == "HOST":
+            matching = [observation for observation in observations
+                        if isinstance(observation, dict) and observation.get("entity_type") == "HOST"
+                        and observation.get("entity_id") == host_id and observation.get("host_id") == host_id]
+        else:
+            matching = [observation for observation in observations
+                        if isinstance(observation, dict) and observation.get("entity_type") == "CONTAINER"
+                        and observation.get("host_id") == host_id and observation.get("mapping_status") == "raw_cgroup_only"]
+            assert all(not observation.get("service") for observation in matching), "Runtime inferred a service for an unmapped cgroup"
+
+        has_samples = False
+        for observation in matching:
+            measurement = observation.get("measurement")
+            assert isinstance(measurement, dict), f"Runtime {template} measurement is missing"
+            samples = measurement.get("samples")
+            if not isinstance(samples, list) or not samples:
+                continue
+            source_reference = measurement.get("source_reference")
+            assert isinstance(source_reference, str) and source_reference, f"Runtime {template} sample source reference is missing"
+            reference = urllib.parse.urlparse(source_reference)
+            assert (reference.scheme, reference.hostname, reference.port, reference.path) == (
+                "http", "observability-gateway", 9090, "/api/v1/query_range",
+            ), f"Runtime {template} Prometheus source reference"
+            assert reference.username is None and reference.password is None, f"Runtime {template} source reference contains credentials"
+            for sample in samples:
+                assert isinstance(sample, dict) and isinstance(sample.get("timestamp"), str) and sample["timestamp"], (
+                    f"Runtime {template} sample timestamp is missing"
+                )
+                value = sample.get("value")
+                assert isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0, (
+                    f"Runtime {template} sample must be finite and non-negative"
+                )
+            has_samples = True
+        assert has_samples, f"Runtime {template} has no collected sample"
 
 
 def assert_loki_evidence_timeline(timeline, investigation_id, service_id):

@@ -9,7 +9,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from demo_assertions import assert_finite_latency_response, assert_loki_evidence_timeline, assert_prometheus_evidence_timeline, loki_mapping_payload, prometheus_mapping_payload
+from demo_assertions import (
+    assert_finite_latency_response,
+    assert_loki_evidence_timeline,
+    assert_prometheus_evidence_timeline,
+    assert_runtime_evidence_timeline,
+    loki_mapping_payload,
+    prometheus_mapping_payload,
+    runtime_mapping_payload,
+)
 
 
 def check_config(path):
@@ -161,7 +169,8 @@ def configure_mapping(mapping, source_name):
     assert status == 201, (f"{source_name} mapping create", status)
     assert token.encode() not in raw, "mapping response exposed the management token"
     response = json.loads(raw)
-    assert response.get("data", {}).get("secret_status") == "configured", f"{source_name} SecretRef was not resolved"
+    expected_secret_status = "configured" if mapping.get("secret_ref") else "not_configured"
+    assert response.get("data", {}).get("secret_status") == expected_secret_status, f"{source_name} SecretRef status"
     print(f"Isolated Inventory {source_name} mapping created through the authenticated management API")
 
 
@@ -208,6 +217,33 @@ def loki_evidence(investigation_id, service_id):
 
     eventually(collected, timeout=180)
     print(f"Worker Loki request log Evidence verified for Investigation {investigation_id}")
+
+
+def runtime_evidence(investigation_id, host_id):
+    path = f"/api/v1/investigations/{investigation_id}/timeline?" + urllib.parse.urlencode({
+        "source_type": "RUNTIME",
+        "limit": 100,
+    })
+
+    def collected():
+        status, raw = http(28080, path)
+        assert status == 200, ("Runtime timeline read", status)
+        timeline = json.loads(raw).get("data")
+        assert isinstance(timeline, dict), "Runtime timeline response has no data"
+        items = assert_runtime_evidence_timeline(timeline, investigation_id, host_id)
+        for template, item in items.items():
+            status, raw = http(28080, f"/api/v1/evidence/{item['id']}")
+            evidence = json.loads(raw).get("data") if status == 200 else None
+            assert isinstance(evidence, dict) and evidence.get("id") == item["id"], f"Runtime {template} Evidence deep link"
+            assert evidence.get("investigation_id") == investigation_id, f"Runtime {template} deep link investigation ownership"
+            assert evidence.get("source_type") == "RUNTIME", f"Runtime {template} deep link source"
+            assert evidence.get("entity_type") == "HOST" and evidence.get("entity_id") == host_id, f"Runtime {template} deep link host ownership"
+            assert evidence.get("query_parameters") == item.get("query_parameters"), f"Runtime {template} deep link query metadata"
+            assert evidence.get("value_summary") == item.get("value_summary"), f"Runtime {template} deep link summary"
+            assert evidence.get("raw_reference", "") == item.get("raw_reference", ""), f"Runtime {template} deep link source reference"
+
+    eventually(collected, timeout=180)
+    print(f"Worker Runtime Evidence (8 fixed templates) verified for Investigation {investigation_id}")
 
 
 def prime_prometheus_latency():
@@ -346,10 +382,14 @@ if __name__ == "__main__":
         configure_mapping(prometheus_mapping_payload(sys.argv[2], sys.argv[3]), "Prometheus")
     elif mode == "configure-loki-mapping":
         configure_mapping(loki_mapping_payload(sys.argv[2], sys.argv[3]), "Loki")
+    elif mode == "configure-runtime-mapping":
+        configure_mapping(runtime_mapping_payload(sys.argv[2], sys.argv[3]), "Runtime")
     elif mode == "loki-evidence":
         loki_evidence(sys.argv[2], sys.argv[3])
     elif mode == "prometheus-evidence":
         prometheus_evidence(sys.argv[2])
+    elif mode == "runtime-evidence":
+        runtime_evidence(sys.argv[2], sys.argv[3])
     elif mode == "prime-prometheus-latency":
         prime_prometheus_latency()
     elif mode == "grafana-delivery":
