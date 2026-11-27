@@ -19,8 +19,10 @@ import (
 
 type githubCollectionRepositoryFake struct {
 	*collectionRepositoryFake
-	candidates []store.DeploymentEvent
-	persisted  []githubconnector.Result
+	candidates              []store.DeploymentEvent
+	persisted               []githubconnector.Result
+	persistErr              error
+	failPersistDeploymentID string
 }
 
 func (repository *githubCollectionRepositoryFake) ListInvestigationDeploymentCandidates(context.Context, string) ([]store.DeploymentEvent, error) {
@@ -28,13 +30,17 @@ func (repository *githubCollectionRepositoryFake) ListInvestigationDeploymentCan
 }
 
 func (repository *githubCollectionRepositoryFake) PersistGitHubEvidence(_ context.Context, result githubconnector.Result, metadata evidence.GitHubEvidenceContext, filter *redact.Filter) (store.Evidence, bool, error) {
-	if repository.persistErr != nil {
+	if repository.persistErr != nil && (repository.failPersistDeploymentID == "" || result.DeploymentEventID == repository.failPersistDeploymentID) {
 		return store.Evidence{}, false, repository.persistErr
 	}
-	if _, err := evidence.FromGitHubResult(context.Background(), result, metadata, filter); err != nil {
+	record, err := evidence.FromGitHubResult(context.Background(), result, metadata, filter)
+	if err != nil {
 		return store.Evidence{}, false, err
 	}
 	repository.persisted = append(repository.persisted, result)
+	repository.collectionRepositoryFake.persistedGitHub = append(repository.collectionRepositoryFake.persistedGitHub, result)
+	repository.persistedGitHubRecords = append(repository.persistedGitHubRecords, record)
+	repository.collectionRepositoryFake.persistedGitHubRecords = append(repository.collectionRepositoryFake.persistedGitHubRecords, record)
 	return store.Evidence{ID: "github-evidence"}, true, nil
 }
 
@@ -143,7 +149,7 @@ func TestCollectionWorkerDoesNotCompleteWhenGitHubEvidencePersistenceFails(t *te
 	investigation, _ := validCollectionContextAndMapping()
 	candidate := store.DeploymentEvent{ID: "70000000-0000-4000-8000-000000000001", CommitSHA: strings.Repeat("a", 40)}
 	repository := &githubCollectionRepositoryFake{collectionRepositoryFake: &collectionRepositoryFake{
-		context: investigation, mappings: []store.DataSourceMapping{validCollectionGitHubMapping()}, persistErr: errors.New("database unavailable"),
+		context: investigation, mappings: validCollectionContextMappingForGitHubFailure(), persistErr: errors.New("database unavailable"),
 	}, candidates: []store.DeploymentEvent{candidate}}
 	connector := &githubCollectionFake{results: map[string]githubconnector.Result{candidate.ID: githubCollectionResult(candidate)}}
 	filter, _ := redact.NewFilter()
@@ -205,7 +211,7 @@ func filterGitHubGaps(records []evidence.Record) []evidence.Record {
 
 func TestCollectionWorkerBoundsGitHubDeploymentCandidatesAndPersistsLimitGap(t *testing.T) {
 	investigation, _ := validCollectionContextAndMapping()
-	candidates := make([]store.DeploymentEvent, 20+1)
+	candidates := make([]store.DeploymentEvent, 4+1)
 	results := make(map[string]githubconnector.Result, len(candidates))
 	for index := range candidates {
 		eventID := fmt.Sprintf("70000000-0000-4000-8000-%012d", index+1)
@@ -225,7 +231,7 @@ func TestCollectionWorkerBoundsGitHubDeploymentCandidatesAndPersistsLimitGap(t *
 	if err := processor.Process(context.Background(), validCollectionJob()); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
-	if len(connector.calls) != 20 || len(repository.persisted) != 20 || repository.retryCalls != 0 || repository.completeCalls != 1 {
+	if len(connector.calls) != 4 || len(repository.persisted) != 4 || repository.retryCalls != 0 || repository.completeCalls != 1 {
 		t.Fatalf("calls=%d persisted=%d retries=%d completed=%d", len(connector.calls), len(repository.persisted), repository.retryCalls, repository.completeCalls)
 	}
 	var foundLimitGap bool
@@ -263,4 +269,105 @@ func TestCollectionWorkerRejectsIncompleteGitHubTemplateBundleWithoutQuerying(t 
 			t.Errorf("unexpected incomplete-bundle gap reason: %s", gap.ValueSummary)
 		}
 	}
+}
+
+func TestCollectionWorkerBoundsGitHubSnapshotAndRegistersResolvedSecret(t *testing.T) {
+	investigation, _ := validCollectionContextAndMapping()
+	mapping := validCollectionGitHubMapping()
+	mapping.SecretRef = "env:GITHUB_TOKEN"
+	candidate := store.DeploymentEvent{ID: "70000000-0000-4000-8000-000000000001", CommitSHA: strings.Repeat("a", 40)}
+	result := githubCollectionResult(candidate)
+	secret := "github-opaque-canary"
+	diff := untrustedGitHubText("diff contains " + secret)
+	result.Diff = &diff
+	result.DependencyFiles = []githubconnector.DependencyFile{{Path: "go.mod", Reference: "https://api.github.com/file", Content: untrustedGitHubText("module " + secret)}}
+	repository := &githubCollectionRepositoryFake{collectionRepositoryFake: &collectionRepositoryFake{
+		context: investigation, mappings: []store.DataSourceMapping{mapping},
+	}, candidates: []store.DeploymentEvent{candidate}}
+	connector := &githubCollectionFake{results: map[string]githubconnector.Result{candidate.ID: result}}
+	filter, _ := redact.NewFilter()
+	processor, err := worker.NewCollectionProcessor(repository, &collectionPrometheusFake{result: validCollectionPrometheusResult()}, collectionSecretResolverStatic{secret: "github-opaque-canary"}, filter, worker.CollectionOptions{GitHubConnector: connector})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := processor.Process(context.Background(), validCollectionJob()); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(connector.calls) != 1 {
+		t.Fatalf("GitHub calls=%d", len(connector.calls))
+	}
+	query := connector.calls[0].query
+	if query.MaxFiles <= 0 || query.MaxFiles > 4 || query.MaxDiffBytes <= 0 || query.MaxDiffBytes > 8<<10 || query.MaxPatchBytes <= 0 || query.MaxPatchBytes > 2<<10 || query.MaxDependencyFileBytes <= 0 || query.MaxDependencyFileBytes > 4<<10 {
+		t.Errorf("GitHub query is not bounded to the Evidence snapshot budget: %+v", query)
+	}
+	if len(repository.persistedGitHubRecords) == 0 || strings.Contains(string(repository.persistedGitHubRecords[0].ValueSummary), secret) {
+		t.Fatalf("resolved GitHub credential was not redacted from persisted Evidence: %s", repository.persistedGitHubRecords[0].ValueSummary)
+	}
+	if repository.retryCalls != 0 || repository.completeCalls != 1 {
+		t.Fatalf("retry=%d complete=%d", repository.retryCalls, repository.completeCalls)
+	}
+}
+
+func TestCollectionWorkerPersistsSizeGapAndContinuesAfterOversizedGitHubEvidence(t *testing.T) {
+	investigation, _ := validCollectionContextAndMapping()
+	first := store.DeploymentEvent{ID: "70000000-0000-4000-8000-000000000001", CommitSHA: strings.Repeat("a", 40)}
+	second := store.DeploymentEvent{ID: "70000000-0000-4000-8000-000000000002", CommitSHA: strings.Repeat("b", 40)}
+	tooLarge := githubCollectionResult(first)
+	diff := untrustedGitHubText(strings.Repeat("d", 65<<10))
+	tooLarge.Diff = &diff
+	repository := &githubCollectionRepositoryFake{collectionRepositoryFake: &collectionRepositoryFake{
+		context: investigation, mappings: []store.DataSourceMapping{validCollectionGitHubMapping()},
+	}, candidates: []store.DeploymentEvent{first, second}, persistErr: evidence.ErrInvalidInput, failPersistDeploymentID: first.ID}
+	connector := &githubCollectionFake{results: map[string]githubconnector.Result{first.ID: tooLarge, second.ID: githubCollectionResult(second)}}
+	filter, _ := redact.NewFilter()
+	processor, err := worker.NewCollectionProcessor(repository, &collectionPrometheusFake{result: validCollectionPrometheusResult()}, collectionSecretResolverFake{}, filter, worker.CollectionOptions{GitHubConnector: connector})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := processor.Process(context.Background(), validCollectionJob()); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(repository.persistedGitHub) != 1 || repository.persistedGitHub[0].DeploymentEventID != second.ID || repository.retryCalls != 0 || repository.completeCalls != 1 {
+		t.Fatalf("persisted=%d retry=%d complete=%d", len(repository.persistedGitHub), repository.retryCalls, repository.completeCalls)
+	}
+	found := false
+	for _, gap := range filterGitHubGaps(repository.persistedGaps) {
+		if collectionGapReason(t, gap.ValueSummary) == evidence.CollectionFailureResultLimit {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("oversized GitHub snapshot did not produce a structured result-limit gap")
+	}
+}
+
+func TestCollectionWorkerHonorsGitHubRateLimitRetryMetadata(t *testing.T) {
+	investigation, _ := validCollectionContextAndMapping()
+	candidate := store.DeploymentEvent{ID: "70000000-0000-4000-8000-000000000001", CommitSHA: strings.Repeat("a", 40)}
+	repository := &githubCollectionRepositoryFake{collectionRepositoryFake: &collectionRepositoryFake{
+		context: investigation, mappings: []store.DataSourceMapping{validCollectionGitHubMapping()},
+	}, candidates: []store.DeploymentEvent{candidate}}
+	reset := time.Now().UTC().Add(3 * time.Hour).Truncate(time.Second)
+	connector := &githubCollectionFake{err: &githubconnector.QueryError{Category: githubconnector.ErrorRateLimited, RetryAfter: 2 * time.Hour, RateLimitReset: reset}}
+	filter, _ := redact.NewFilter()
+	processor, err := worker.NewCollectionProcessor(repository, &collectionPrometheusFake{result: validCollectionPrometheusResult()}, collectionSecretResolverFake{}, filter, worker.CollectionOptions{GitHubConnector: connector})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := processor.Process(context.Background(), validCollectionJob()); err == nil {
+		t.Fatal("Process succeeded, want scheduled rate-limit retry")
+	}
+	wantDelay := reset.Sub(time.Now().UTC())
+	if repository.retryDelay < wantDelay-time.Second || repository.retryDelay > wantDelay+time.Second {
+		t.Fatalf("retry delay=%s, want near Retry-After/RateLimitReset %s", repository.retryDelay, wantDelay)
+	}
+}
+
+func untrustedGitHubText(value string) redact.UntrustedData {
+	return redact.UntrustedData{Trust: "untrusted_data", Source: "github", Content: value, OriginalBytes: len(value)}
+}
+
+func validCollectionContextMappingForGitHubFailure() []store.DataSourceMapping {
+	_, prometheus := validCollectionContextAndMapping()
+	return []store.DataSourceMapping{prometheus, validCollectionGitHubMapping()}
 }

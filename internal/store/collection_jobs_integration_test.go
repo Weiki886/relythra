@@ -58,7 +58,7 @@ func TestCollectionJobsClaimLeaseRetryAndCompletion(t *testing.T) {
 		t.Fatalf("complete terminal job done=%v err=%v, want idempotent false", done, err)
 	}
 
-	retried, err := repository.RetryInvestigationCollectionJob(ctx, second[0].ID, second[0].LeaseToken, "source_timeout", 2*time.Minute)
+	retried, err := repository.RetryInvestigationCollectionJob(ctx, second[0].ID, second[0].LeaseToken, "source_timeout", 2*time.Hour)
 	if err != nil || retried {
 		t.Fatalf("retry job terminal=%v err=%v, want scheduled retry", retried, err)
 	}
@@ -71,7 +71,7 @@ func TestCollectionJobsClaimLeaseRetryAndCompletion(t *testing.T) {
 	`, second[0].ID).Scan(&status, &attempt, &errorCode, &availableAt, &lockedUntil); err != nil {
 		t.Fatalf("read retried job: %v", err)
 	}
-	if status != "PENDING" || attempt != 1 || errorCode != "source_timeout" || availableAt == nil || !availableAt.After(time.Now().UTC()) || lockedUntil != nil {
+	if status != "PENDING" || attempt != 1 || errorCode != "source_timeout" || availableAt == nil || availableAt.Before(time.Now().UTC().Add(119*time.Minute)) || lockedUntil != nil {
 		t.Fatalf("retried job status=%s attempt=%d error=%s available=%v locked=%v", status, attempt, errorCode, availableAt, lockedUntil)
 	}
 	if jobs, err := repository.ClaimInvestigationCollectionJobs(ctx, 10, 30*time.Second); err != nil || len(jobs) != 0 {

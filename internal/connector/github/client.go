@@ -120,6 +120,7 @@ type Target struct {
 	Endpoint        string
 	Repository      string
 	SecretReference *secrets.Reference
+	ResolvedSecret  *secrets.Secret
 }
 
 type Query struct {
@@ -250,7 +251,9 @@ func (connector *Connector) Query(ctx context.Context, target Target, query Quer
 		return Result{}, queryError(ErrorPolicyRejected, err)
 	}
 	credential := ""
-	if target.SecretReference != nil {
+	if target.ResolvedSecret != nil {
+		credential = target.ResolvedSecret.Reveal()
+	} else if target.SecretReference != nil {
 		secret, err := connector.resolver.Resolve(ctx, *target.SecretReference)
 		if err != nil {
 			return Result{}, queryError(ErrorSecretUnavailable, err)

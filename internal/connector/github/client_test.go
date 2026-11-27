@@ -303,3 +303,35 @@ func encodedCommitPage(offset, count int) string {
 	encoded, _ := json.Marshal(commit)
 	return string(encoded)
 }
+
+func TestQueryUsesWorkerResolvedSecretWithoutResolvingReferenceAgain(t *testing.T) {
+	secret, err := secrets.New("opaque-worker-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	connector := testConnector(t, roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if request.Header.Get("Authorization") != "Bearer opaque-worker-secret" {
+			t.Fatalf("authorization header did not use resolved worker credential")
+		}
+		switch {
+		case strings.HasSuffix(request.URL.Path, "/pulls"):
+			return jsonResponse(http.StatusOK, `[]`, nil), nil
+		case strings.Contains(request.Header.Get("Accept"), "github.diff"):
+			return jsonResponse(http.StatusOK, "diff", nil), nil
+		default:
+			return jsonResponse(http.StatusOK, encodedCommitPage(0, 1), nil), nil
+		}
+	}))
+	connector.resolver = testSecretResolver{value: "resolver-must-not-be-used"}
+	result, err := connector.Query(context.Background(), Target{
+		Endpoint: "https://api.example.test", Repository: "acme/shop", ResolvedSecret: &secret,
+	}, validQuery())
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if result.CommitSHA != testCommitSHA || calls < 3 {
+		t.Fatalf("result/calls = %s/%d", result.CommitSHA, calls)
+	}
+}
