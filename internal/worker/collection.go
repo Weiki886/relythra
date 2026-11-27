@@ -9,6 +9,7 @@ import (
 
 	lokiconnector "github.com/Weiki886/relythra/internal/connector/loki"
 	prometheusconnector "github.com/Weiki886/relythra/internal/connector/prometheus"
+	runtimeconnector "github.com/Weiki886/relythra/internal/connector/runtime"
 	"github.com/Weiki886/relythra/internal/datasource"
 	"github.com/Weiki886/relythra/internal/evidence"
 	"github.com/Weiki886/relythra/internal/security/redact"
@@ -38,6 +39,7 @@ type collectionRepository interface {
 	ListDataSourceMappings(context.Context, string, string, string) ([]store.DataSourceMapping, error)
 	PersistPrometheusEvidence(context.Context, prometheusconnector.Result, evidence.PrometheusEvidenceContext, *redact.Filter) (store.Evidence, bool, error)
 	PersistLokiEvidence(context.Context, lokiconnector.Result, evidence.LokiEvidenceContext, *redact.Filter) (store.Evidence, bool, error)
+	PersistRuntimeEvidence(context.Context, runtimeconnector.Result, store.RuntimeEvidencePersistenceContext, *redact.Filter) ([]store.Evidence, []bool, error)
 	PersistEvidence(context.Context, evidence.Record) (store.Evidence, bool, error)
 	CompleteInvestigationCollectionJob(context.Context, string, string) (bool, error)
 	RetryInvestigationCollectionJob(context.Context, string, string, string, time.Duration) (bool, error)
@@ -51,20 +53,26 @@ type lokiQueryer interface {
 	Query(context.Context, lokiconnector.Target, datasource.NormalizedQuery) (lokiconnector.Result, error)
 }
 
+type runtimeQueryer interface {
+	Query(context.Context, runtimeconnector.Target, runtimeconnector.Request) (runtimeconnector.Result, error)
+}
+
 type CollectionOptions struct {
-	LokiConnector lokiQueryer
-	Now           func() time.Time
-	RetryDelay    func(attempt int) time.Duration
+	LokiConnector    lokiQueryer
+	RuntimeConnector runtimeQueryer
+	Now              func() time.Time
+	RetryDelay       func(attempt int) time.Duration
 }
 
 type CollectionProcessor struct {
-	repository    collectionRepository
-	connector     prometheusQueryer
-	lokiConnector lokiQueryer
-	resolver      prometheusconnector.SecretResolver
-	filter        *redact.Filter
-	now           func() time.Time
-	retryDelay    func(int) time.Duration
+	repository       collectionRepository
+	connector        prometheusQueryer
+	lokiConnector    lokiQueryer
+	runtimeConnector runtimeQueryer
+	resolver         prometheusconnector.SecretResolver
+	filter           *redact.Filter
+	now              func() time.Time
+	retryDelay       func(int) time.Duration
 }
 
 func NewCollectionProcessor(
@@ -87,13 +95,14 @@ func NewCollectionProcessor(
 		}
 	}
 	return &CollectionProcessor{
-		repository:    repository,
-		connector:     connector,
-		lokiConnector: options.LokiConnector,
-		resolver:      resolver,
-		filter:        filter,
-		now:           options.Now,
-		retryDelay:    options.RetryDelay,
+		repository:       repository,
+		connector:        connector,
+		lokiConnector:    options.LokiConnector,
+		runtimeConnector: options.RuntimeConnector,
+		resolver:         resolver,
+		filter:           filter,
+		now:              options.Now,
+		retryDelay:       options.RetryDelay,
 	}, nil
 }
 
@@ -136,7 +145,15 @@ func (processor *CollectionProcessor) Process(ctx context.Context, job store.Inv
 			} else if err := processor.persistUnsupportedGaps(ctx, job, investigation, mapping, windowStart, windowEnd); err != nil {
 				return processor.retry(ctx, job, "gap_persist_failed")
 			}
-		case datasource.SourceGitHub, datasource.SourceRuntime:
+		case datasource.SourceRuntime:
+			if processor.runtimeConnector == nil {
+				if err := processor.persistUnsupportedGaps(ctx, job, investigation, mapping, windowStart, windowEnd); err != nil {
+					return processor.retry(ctx, job, "gap_persist_failed")
+				}
+			} else {
+				collectErr = processor.collectRuntime(ctx, job, investigation, mapping, mappings, windowStart, windowEnd)
+			}
+		case datasource.SourceGitHub:
 			if err := processor.persistUnsupportedGaps(ctx, job, investigation, mapping, windowStart, windowEnd); err != nil {
 				return processor.retry(ctx, job, "gap_persist_failed")
 			}
@@ -174,6 +191,131 @@ func (processor *CollectionProcessor) Process(ctx context.Context, job store.Inv
 		return errCollectionLeaseLost
 	}
 	return nil
+}
+
+var runtimeBundleTemplates = []string{"runtime.containers.v1", "runtime.host.v1", "runtime.events.v1"}
+
+func (processor *CollectionProcessor) collectRuntime(
+	ctx context.Context,
+	job store.InvestigationCollectionJob,
+	investigation store.InvestigationContext,
+	mapping store.DataSourceMapping,
+	mappings []store.DataSourceMapping,
+	start, end time.Time,
+) error {
+	if mapping.RuntimeType != datasource.RuntimeDockerCompose {
+		return processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailureUnsupported)
+	}
+	if !hasTemplateBundle(mapping.Templates, datasource.SourceRuntime, runtimeBundleTemplates) ||
+		mapping.PublicSettings.RuntimeLabels["project"] != investigation.Project.Slug ||
+		mapping.PublicSettings.RuntimeLabels["service"] != investigation.Service.Slug ||
+		mapping.PublicSettings.RuntimeLabels["env"] != *investigation.Environment {
+		return processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailureRequestRejected)
+	}
+	prometheusMapping, prometheusCount := findMapping(mappings, datasource.SourcePrometheus)
+	lokiMapping, lokiCount := findMapping(mappings, datasource.SourceLoki)
+	if prometheusCount > 1 || lokiCount > 1 {
+		return processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailureRequestRejected)
+	}
+	if prometheusCount == 0 || lokiCount == 0 {
+		return processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailureMissingMapping)
+	}
+	prometheusSecret, err := parseSecretReference(prometheusMapping.SecretRef)
+	if err != nil {
+		return processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailureRequestRejected)
+	}
+	lokiSecret, err := parseSecretReference(lokiMapping.SecretRef)
+	if err != nil {
+		return processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailureRequestRejected)
+	}
+	request := runtimeconnector.Request{
+		Runtime: mapping.RuntimeType, Action: "query", Service: investigation.Service.Slug, Environment: *investigation.Environment,
+		HostID: mapping.PublicSettings.RuntimeLabels["host_id"], MappingVersion: mapping.Version,
+		ContainerMappings: append([]datasource.RuntimeContainerMapping(nil), mapping.PublicSettings.ContainerMappings...),
+		Start:             start, End: end, Step: collectionQueryStep, MaxSeries: runtimeconnector.DefaultMaxSeries,
+		MaxPoints: runtimeconnector.DefaultMaxPoints, MaxLogLines: 100,
+	}
+	result, err := processor.runtimeConnector.Query(ctx, runtimeconnector.Target{
+		Prometheus: prometheusconnector.Target{Endpoint: prometheusMapping.PublicSettings.Endpoint, SecretReference: prometheusSecret},
+		Loki:       lokiconnector.Target{Endpoint: lokiMapping.PublicSettings.Endpoint, SecretReference: lokiSecret},
+	}, request)
+	if err != nil {
+		if ctx.Err() != nil {
+			return &collectionFailure{code: "runtime_collection_cancelled"}
+		}
+		return processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailureUnavailable)
+	}
+	if result.Runtime != request.Runtime || result.Service != request.Service || result.Environment != request.Environment ||
+		result.HostID != request.HostID || result.MappingVersion != request.MappingVersion ||
+		!result.Start.Equal(start.UTC()) || !result.End.Equal(end.UTC()) || result.Duration < 0 {
+		return processor.persistRuntimeGaps(ctx, job, investigation, mapping, start, end, evidence.CollectionFailureInvalidResponse)
+	}
+	_, _, err = processor.repository.PersistRuntimeEvidence(ctx, result, store.RuntimeEvidencePersistenceContext{
+		InvestigationID: job.InvestigationID, ServiceID: investigation.Service.ID, CollectedAt: processor.now().UTC(),
+	}, processor.filter)
+	if err != nil {
+		return &collectionFailure{code: "evidence_persist_failed"}
+	}
+	return nil
+}
+
+func (processor *CollectionProcessor) persistRuntimeGaps(
+	ctx context.Context,
+	job store.InvestigationCollectionJob,
+	investigation store.InvestigationContext,
+	mapping store.DataSourceMapping,
+	start, end time.Time,
+	reason evidence.CollectionFailureCode,
+) error {
+	if len(mapping.Templates) == 0 {
+		return &collectionFailure{code: "runtime_template_missing"}
+	}
+	templates, issues := datasource.ResolveTemplates(datasource.SourceRuntime, templateIDs(mapping.Templates))
+	if len(issues) > 0 || len(templates) != len(mapping.Templates) {
+		return &collectionFailure{code: "runtime_template_invalid"}
+	}
+	for index, template := range templates {
+		if template.Version != mapping.Templates[index].Version {
+			if err := processor.persistGap(ctx, job, investigation, string(datasource.SourceRuntime), template.ID, template.Version, evidence.CollectionFailureRequestRejected, start, end); err != nil {
+				return &collectionFailure{code: "gap_persist_failed"}
+			}
+			continue
+		}
+		if err := processor.persistGap(ctx, job, investigation, string(datasource.SourceRuntime), template.ID, template.Version, reason, start, end); err != nil {
+			return &collectionFailure{code: "gap_persist_failed"}
+		}
+	}
+	return nil
+}
+
+func findMapping(mappings []store.DataSourceMapping, source datasource.SourceType) (store.DataSourceMapping, int) {
+	var selected store.DataSourceMapping
+	count := 0
+	for _, mapping := range mappings {
+		if mapping.SourceType == source {
+			selected = mapping
+			count++
+		}
+	}
+	return selected, count
+}
+
+func hasTemplateBundle(configured []datasource.Template, source datasource.SourceType, required []string) bool {
+	ids := templateIDs(configured)
+	resolved, issues := datasource.ResolveTemplates(source, ids)
+	if len(issues) > 0 || len(resolved) != len(configured) {
+		return false
+	}
+	versions := make(map[string]int, len(configured))
+	for _, template := range configured {
+		versions[template.ID] = template.Version
+	}
+	for _, id := range required {
+		if versions[id] != 1 {
+			return false
+		}
+	}
+	return true
 }
 
 func (processor *CollectionProcessor) collectPrometheus(
